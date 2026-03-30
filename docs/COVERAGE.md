@@ -1,11 +1,54 @@
 # Test coverage
 
-**~91% line coverage** (`cargo-tarpaulin`, `src/main.rs` excluded — see
-below), across 596 in-crate unit tests + 8 integration test binaries +
-doctests. The remaining lines are the deliberately-uncovered set
-documented at the bottom (dead status arms, corruption guards,
-`#[cfg(not(unix))]` fallbacks, macro-attributed lines, invariant
-guards) plus a few deep protocol/error branches.
+**91.6% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
+excluded), across **654 in-crate unit tests + 9 integration test
+binaries + doctests**. Reconciled across both coverage engines (see
+"two engines" below) the true line coverage is **≈92.3%**.
+
+The path from the 51.6% baseline to here: the dominant lever was moving
+server execution *in-process* (the `e2e_*` binaries) so it's
+instrumented at all; then unit tests for every store/parser/validator,
+corruption-injection tests for the defensive guards, and SIGTERM/TLS
+drain tests for `serve()`'s shutdown paths.
+
+## Why not higher
+
+The remaining ~8% is, in order of size:
+
+1. **Deep malformed-input defensive guards** — branches that only fire
+   on corrupt/impossible inputs (a `git ls-tree` emitting a malformed
+   record, a decompression-bomb zlib stream, a loose object with a
+   non-UTF-8 header). Real `git` and the validated newtypes never
+   produce these; they're guarded for safety. This is the domain of the
+   `cargo-fuzz` targets (see `fuzz/`), not unit tests.
+2. **Genuinely-dead code** — most notably the `webhooks::dispatch_row`
+   HTTP-status `Ok`-arm: with `ureq` 2.x every status ≥ 400 comes back
+   as `Err(Status)`, so the `Ok`-arm's 4xx/5xx handling is unreachable
+   (a guard for a future client swap). Plus the infallible `Vec`-write
+   / `Response::builder()` `.map_err` arms and the install-once metrics
+   recorder `.map_err`.
+3. **`Oid`/`RepoId` newtype-precluded guards** — e.g. the
+   `ObjectStore::read_object` hex-parse-failure arm: the `Oid` newtype
+   already guarantees 40 lowercase hex, so the parse never fails.
+4. **ptrace macro mis-attribution** — `error.rs` reads as 68% under the
+   ptrace engine but **97% under the LLVM engine**: ptrace doesn't
+   credit the lines inside multi-line `json!{}` / `format!` arms even
+   though the unit tests execute every one of them.
+
+## Two engines
+
+`cargo-tarpaulin` has two coverage engines, each with a blind spot here:
+
+- **ptrace** (default) — accurate for the async handler/server code
+  (it follows the in-process `e2e_*` server threads), but under-credits
+  multi-line macro arms. Reports **91.6%**.
+- **`--engine llvm`** — accurate for macros (`error.rs` → 97%) but
+  counts async state-machine expansion lines that never execute,
+  deflating the handler modules. Reports **71%**.
+
+Taking each engine where it's accurate (per-file max) gives the
+reconciled **≈92.3%**. Neither single number is "the truth"; ptrace is
+the better headline for this async-heavy code.
 
 ## How it's measured
 
