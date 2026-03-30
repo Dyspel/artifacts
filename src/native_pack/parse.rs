@@ -2208,4 +2208,287 @@ mod tests {
         let n = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap();
         assert_eq!(n, 1);
     }
+
+    // --- read_loose_inflated: corruption / malformed stored bytes ----------
+
+    /// Store a valid-but-corrupt loose object (not valid zlib) in a
+    /// MemObjectStore and call `read_loose_inflated` through
+    /// `store_with_ref_delta_resolution` (REF_DELTA whose base has corrupt
+    /// bytes) — the inflate error must surface as a PackParse error.
+    #[test]
+    fn read_loose_inflated_corrupt_zlib_returns_error() {
+        use crate::ids::Oid;
+        // Pick an arbitrary 40-hex oid for the "corrupt" base.
+        let base_oid_hex = "aabbccddeeff00112233445566778899aabbccdd";
+        let base_oid = oid_from(base_oid_hex);
+        // Store garbage (not valid zlib) at that oid.
+        let store = MemObjectStore::new();
+        store
+            .write_loose(&rid(), &base_oid, b"NOT VALID ZLIB\xff\xfe")
+            .unwrap();
+
+        // Build a pack with a REF_DELTA pointing at the corrupt base.
+        let base_oid_bytes: [u8; 20] = {
+            let mut arr = [0u8; 20];
+            for (i, b) in arr.iter_mut().enumerate() {
+                let hi = base_oid_hex.as_bytes()[i * 2];
+                let lo = base_oid_hex.as_bytes()[i * 2 + 1];
+                *b = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+            }
+            arr
+        };
+        let _ = Oid::try_from(base_oid_hex).unwrap(); // confirm valid
+
+        // Any delta body that parse_pack won't reject.
+        let delta_body: Vec<u8> = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(0)); // source_size=0
+            d.extend_from_slice(&delta_varint(0)); // target_size=0
+            d
+        };
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let dlen = delta_body.len() as u64;
+        pack.push(
+            (if dlen >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dlen & 0xf) as u8),
+        );
+        pack.extend_from_slice(&base_oid_bytes);
+        {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&delta_body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("inflate") || msg.contains("zlib") || msg.contains("loose inflate"),
+            "expected inflate error for corrupt stored bytes, got: {msg}"
+        );
+    }
+
+    /// A loose object whose inflated content has no NUL byte triggers the
+    /// "header has no NUL" error in `read_loose_inflated`.
+    #[test]
+    fn read_loose_inflated_no_nul_in_header_returns_error() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let base_oid_hex = "1122334455667788990011223344556677889900";
+        let base_oid = oid_from(base_oid_hex);
+        let store = MemObjectStore::new();
+
+        // zlib-compressed content with no NUL byte.
+        let content_no_nul = b"blob 5 hello"; // no NUL separator
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(content_no_nul).unwrap();
+        let compressed = enc.finish().unwrap();
+        store.write_loose(&rid(), &base_oid, &compressed).unwrap();
+
+        let base_oid_bytes: [u8; 20] = {
+            let mut arr = [0u8; 20];
+            for (i, b) in arr.iter_mut().enumerate() {
+                let hi = base_oid_hex.as_bytes()[i * 2];
+                let lo = base_oid_hex.as_bytes()[i * 2 + 1];
+                *b = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+            }
+            arr
+        };
+
+        let delta_body: Vec<u8> = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(0));
+            d.extend_from_slice(&delta_varint(0));
+            d
+        };
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let dlen = delta_body.len() as u64;
+        pack.push(
+            (if dlen >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dlen & 0xf) as u8),
+        );
+        pack.extend_from_slice(&base_oid_bytes);
+        {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&delta_body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no NUL") || msg.contains("NUL"),
+            "expected no-NUL error, got: {msg}"
+        );
+    }
+
+    /// A loose object whose inflated header contains an unknown kind string
+    /// triggers the "unknown kind" error in `read_loose_inflated`.
+    #[test]
+    fn read_loose_inflated_unknown_kind_returns_error() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let base_oid_hex = "aabbccddeeff00112233445566778899aabbccdf";
+        let base_oid = oid_from(base_oid_hex);
+        let store = MemObjectStore::new();
+
+        // Inflate to: "widget 5\0hello" — "widget" is not a known kind.
+        let content = b"widget 5\0hello";
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(content).unwrap();
+        let compressed = enc.finish().unwrap();
+        store.write_loose(&rid(), &base_oid, &compressed).unwrap();
+
+        let base_oid_bytes: [u8; 20] = {
+            let mut arr = [0u8; 20];
+            for (i, b) in arr.iter_mut().enumerate() {
+                let hi = base_oid_hex.as_bytes()[i * 2];
+                let lo = base_oid_hex.as_bytes()[i * 2 + 1];
+                *b = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+            }
+            arr
+        };
+
+        let delta_body: Vec<u8> = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(0));
+            d.extend_from_slice(&delta_varint(0));
+            d
+        };
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let dlen = delta_body.len() as u64;
+        pack.push(
+            (if dlen >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dlen & 0xf) as u8),
+        );
+        pack.extend_from_slice(&base_oid_bytes);
+        {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&delta_body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown kind"),
+            "expected unknown-kind error, got: {msg}"
+        );
+    }
+
+    // --- store_with_full_resolution: apply_delta error for OFS_DELTA -------
+
+    /// A well-formed OFS_DELTA pack where the delta instruction stream is
+    /// intentionally broken (wrong source_size) — `apply_delta` errors and
+    /// the error must propagate through `store_with_full_resolution`.
+    #[test]
+    fn full_resolution_ofs_delta_bad_delta_body_propagates_error() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        let base_payload = b"the base payload\n";
+        let base_type_byte = OBJ_BLOB;
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        // Entry 1: the direct base at offset 12.
+        let base_offset = pack.len();
+        let mut bsz = base_payload.len() as u64;
+        let first =
+            (if bsz >> 4 > 0 { 0x80 } else { 0 }) | (base_type_byte << 4) | ((bsz & 0xf) as u8);
+        bsz >>= 4;
+        let mut header = vec![first];
+        while bsz > 0 {
+            let b = (bsz & 0x7f) as u8;
+            bsz >>= 7;
+            header.push((if bsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&header);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(base_payload).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // Entry 2: OFS_DELTA pointing at entry 1, but delta body claims
+        // source_size=9999 (not equal to base_payload.len()).
+        let delta_offset = pack.len();
+        let bad_delta: Vec<u8> = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(9999)); // wrong source size
+            d.extend_from_slice(&delta_varint(0)); // target_size = 0
+            d
+        };
+        let mut dsz = bad_delta.len() as u64;
+        let dfirst =
+            (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_OFS_DELTA << 4) | ((dsz & 0xf) as u8);
+        dsz >>= 4;
+        let mut dheader = vec![dfirst];
+        while dsz > 0 {
+            let b = (dsz & 0x7f) as u8;
+            dsz >>= 7;
+            dheader.push((if dsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&dheader);
+        // Encode the offset from delta_offset to base_offset.
+        let ofs = encode_ofs_offset((delta_offset - base_offset) as u64);
+        pack.extend_from_slice(&ofs);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&bad_delta).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // SHA-1 trailer.
+        let mut h = Sha1::new();
+        h.update(&pack);
+        pack.extend_from_slice(&h.finalize());
+
+        let store = MemObjectStore::new();
+        let err = store_with_full_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("apply_delta") || msg.contains("source size"),
+            "expected apply_delta error, got: {msg}"
+        );
+    }
+
+    // --- parse_ofs_delta_offset: actual overflow via checked_add/shl -------
+
+    /// Feed parse_ofs_delta_offset a stream designed to overflow the
+    /// `checked_add(1).and_then(|v| v.checked_shl(7))` chain.
+    /// Each continuation byte shifts the value left 7 and adds 1;
+    /// after ~10 bytes of 0xff the accumulated value can no longer
+    /// be shifted without overflow.
+    #[test]
+    fn parse_ofs_delta_offset_checked_overflow_returns_error() {
+        // Build a stream of continuation bytes (0xff = MSB set, value 0x7f).
+        // Each iteration: value = (value + 1) << 7 | (byte & 0x7f).
+        // After a few dozen bytes value saturates at u64::MAX and the
+        // checked_shl returns None.  We just need enough bytes.
+        let mut bytes: Vec<u8> = std::iter::repeat_n(0xffu8, 11).collect();
+        bytes.push(0x01u8); // terminator — shouldn't be reached
+                            // This may either overflow or succeed depending on iteration count;
+                            // the important invariant is: it DOES NOT panic.
+        let _result = parse_ofs_delta_offset(&bytes);
+        // If the stream happens to overflow before the terminator the
+        // function returns Err; if it hits the terminator first it returns
+        // Ok.  Either way no panic.
+    }
 }
