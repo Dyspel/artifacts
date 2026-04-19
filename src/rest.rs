@@ -7,6 +7,7 @@ use crate::{
     auth::authorize_admin,
     config::Config,
     error::{Error, Result},
+    refs::RefStore,
     storage::{new_repo_id, Storage},
     tokens::{Scope, TokenStore},
 };
@@ -23,6 +24,9 @@ pub struct RestState {
     pub cfg: Arc<Config>,
     pub storage: Storage,
     pub tokens: TokenStore,
+    /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
+    /// distributed impl without touching any handler.
+    pub refs: Arc<dyn RefStore>,
 }
 
 #[derive(Debug, Deserialize, Default)]

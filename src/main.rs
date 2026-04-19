@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod error;
+mod refs;
 mod rest;
 mod smart_http;
 mod storage;
@@ -8,6 +9,7 @@ mod tokens;
 
 use crate::{
     config::Config,
+    refs::{FsRefStore, RefStore},
     rest::RestState,
     smart_http::GitState,
     storage::Storage,
@@ -92,11 +94,13 @@ async fn main() -> anyhow::Result<()> {
             });
             let storage = Storage::new(cfg.repos_dir())?;
             let tokens = TokenStore::new();
+            let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
 
             let rest_state = RestState {
                 cfg: cfg.clone(),
                 storage,
                 tokens: tokens.clone(),
+                refs,
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };
 

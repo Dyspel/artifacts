@@ -29,6 +29,7 @@ bytes = "1"
 http-body-util = "0.1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
 
 [profile.release]
 lto = "thin"
