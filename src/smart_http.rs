@@ -33,7 +33,7 @@ use tokio::process::Command;
 #[derive(Clone)]
 pub struct GitState {
     pub cfg: Arc<Config>,
-    pub tokens: TokenStore,
+    pub tokens: std::sync::Arc<dyn TokenStore>,
 }
 
 /// Route handler for every path under /git/:id.git/*rest. We dispatch on the
@@ -59,7 +59,7 @@ pub async fn git_handler(
     }
 
     let required_scope = required_scope(&request.method(), &rest, request.uri().query());
-    authorize_git(&state.tokens, request.headers(), &repo_id, required_scope)?;
+    authorize_git(&*state.tokens, request.headers(), &repo_id, required_scope)?;
 
     run_cgi(&state.cfg, &repo_id, &rest, request).await
 }

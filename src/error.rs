@@ -57,6 +57,12 @@ impl From<std::string::FromUtf8Error> for Error {
     }
 }
 
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Other(anyhow::Error::from(e))
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code) = match &self {

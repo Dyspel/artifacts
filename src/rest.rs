@@ -25,7 +25,7 @@ pub struct RestState {
     /// Repo lifecycle backend. M0 ships `FsStorage`; future impls
     /// (chunked KV, object-store-backed) drop in behind the same trait.
     pub storage: Arc<dyn Storage>,
-    pub tokens: TokenStore,
+    pub tokens: Arc<dyn TokenStore>,
     /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
     /// distributed impl without touching any handler.
     pub refs: Arc<dyn RefStore>,
@@ -69,7 +69,7 @@ pub async fn create_repo(
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
     state.storage.create(&id)?;
-    let token = state.tokens.mint(&id, Scope::Write);
+    let token = state.tokens.mint(&id, Scope::Write, None)?;
     let remote = remote_url(&state.cfg, &id, &token);
     Ok(Json(RepoHandle { id, remote, token }))
 }
@@ -99,7 +99,7 @@ pub async fn fork_repo(
     let fork_id = fork_id.unwrap_or_else(new_repo_id);
     state.storage.fork(&source_id, &fork_id)?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
-    let token = state.tokens.mint(&fork_id, scope);
+    let token = state.tokens.mint(&fork_id, scope, None)?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
@@ -107,12 +107,18 @@ pub async fn fork_repo(
 #[derive(Debug, Deserialize)]
 pub struct MintTokenBody {
     pub scope: Scope,
+    /// Optional lifetime in seconds. `None` means never expires.
+    #[serde(default, rename = "ttlSeconds")]
+    pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TokenMinted {
     pub token: String,
     pub remote: String,
+    /// Unix epoch seconds. `null` if the token doesn't expire.
+    #[serde(rename = "expiresAt")]
+    pub expires_at: Option<u64>,
 }
 
 /// POST /v1/repos/:id/tokens
@@ -126,9 +132,40 @@ pub async fn mint_token(
     if !state.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    let token = state.tokens.mint(&id, body.scope);
+    let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
+    let token = state.tokens.mint(&id, body.scope, ttl)?;
     let remote = remote_url(&state.cfg, &id, &token);
-    Ok(Json(TokenMinted { token, remote }))
+    let expires_at = ttl.map(|d| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|now| now.as_secs() + d.as_secs())
+            .unwrap_or(0)
+    });
+    Ok(Json(TokenMinted { token, remote, expires_at }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeBody {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeResponse {
+    pub revoked: bool,
+}
+
+/// POST /v1/tokens/revoke
+///
+/// Takes the token in the request body so it doesn't get captured in
+/// access logs, URL history, or any other place URL paths usually land.
+pub async fn revoke_token(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeBody>,
+) -> Result<Json<RevokeResponse>> {
+    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let revoked = state.tokens.revoke(&body.token)?;
+    Ok(Json(RevokeResponse { revoked }))
 }
 
 /// DELETE /v1/repos/:id

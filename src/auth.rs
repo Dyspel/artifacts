@@ -32,13 +32,15 @@ pub fn basic_token(headers: &HeaderMap) -> Result<String> {
 
 /// Authorize a git request for `repo_id` at `required` scope.
 pub fn authorize_git(
-    tokens: &TokenStore,
+    tokens: &dyn TokenStore,
     headers: &HeaderMap,
     repo_id: &str,
     required: Scope,
 ) -> Result<TokenRecord> {
     let token = basic_token(headers)?;
-    let record = tokens.lookup(&token).ok_or(Error::UnauthorizedBasic)?;
+    let record = tokens
+        .lookup(&token)?
+        .ok_or(Error::UnauthorizedBasic)?;
     if record.repo_id != repo_id {
         return Err(Error::Forbidden("token not valid for this repo"));
     }

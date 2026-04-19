@@ -14,7 +14,7 @@ use crate::{
     rest::RestState,
     smart_http::GitState,
     storage::{FsStorage, Storage},
-    tokens::TokenStore,
+    tokens::{SqliteTokenStore, TokenStore},
 };
 use axum::{
     routing::{delete, get, post},
@@ -54,6 +54,12 @@ enum Cmd {
         /// Path to git-http-backend.
         #[arg(long, default_value = "/usr/lib/git-core/git-http-backend")]
         git_http_backend: PathBuf,
+
+        /// Path to the SQLite file that stores minted tokens. Defaults to
+        /// `<data-dir>/tokens.db` so the token table lives next to the
+        /// repos it authorizes.
+        #[arg(long)]
+        token_db: Option<PathBuf>,
     },
 }
 
@@ -74,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             public_base_url,
             admin_token,
             git_http_backend,
+            token_db,
         } => {
             let admin_token = admin_token.unwrap_or_else(|| {
                 let t = random_admin_token();
@@ -93,8 +100,11 @@ async fn main() -> anyhow::Result<()> {
                 admin_token,
                 git_http_backend,
             });
+            std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
-            let tokens = TokenStore::new();
+            let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
+            tracing::info!(path = %token_db_path.display(), "opening token db");
+            let tokens: Arc<dyn TokenStore> = Arc::new(SqliteTokenStore::open(&token_db_path)?);
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
 
             let rest_state = RestState {
@@ -113,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
                 .route("/v1/repos/:id/commits", post(commits::create_commit))
+                .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .with_state(rest_state)
                 // Git smart-HTTP. A single catch-all route under /git/:id.git/
                 // dispatches to the backend based on the method + path.

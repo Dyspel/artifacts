@@ -9,6 +9,10 @@
 #   5. git clone the fork                 -> pulls objects via alternates
 #   6. readOnly fork rejects a push
 #   7. POST /v1/repos/:id/tokens          -> mints a scoped token
+#   8. POST /v1/repos/:id/commits         -> REST-side commit (no git client),
+#                                            with CAS conflict + path validation
+#   9. POST /v1/tokens/revoke             -> revoked token no longer clones
+#  10. token persists across a server restart (SQLite durability)
 #
 # Exits 0 on success. Tears down the server in a trap so the test is
 # idempotent.
@@ -50,23 +54,40 @@ trap cleanup EXIT INT TERM
 echo "==> building"
 cargo build --quiet
 
-echo "==> starting server on $BIND"
-ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
-    ./target/debug/artifacts serve \
-        --data-dir "$DATA_DIR" \
-        --bind "$BIND" \
-        --public-base-url "$BASE_URL" \
-    >"$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
+start_server() {
+    ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
+        ./target/debug/artifacts serve \
+            --data-dir "$DATA_DIR" \
+            --bind "$BIND" \
+            --public-base-url "$BASE_URL" \
+        >>"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    for _ in $(seq 1 50); do
+        if curl -fsS "$BASE_URL/v1/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    curl -fsS "$BASE_URL/v1/health" >/dev/null
+}
 
-# Wait for the server to come up.
-for _ in $(seq 1 50); do
-    if curl -fsS "$BASE_URL/v1/health" >/dev/null 2>&1; then
-        break
+stop_server() {
+    if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
-    sleep 0.1
-done
-curl -fsS "$BASE_URL/v1/health" >/dev/null
+    SERVER_PID=
+    # Wait until the port is free before we start a new server on it.
+    for _ in $(seq 1 50); do
+        if ! curl -fsS "$BASE_URL/v1/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+}
+
+echo "==> starting server on $BIND"
+start_server
 
 auth=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
 
@@ -233,6 +254,55 @@ bad_code=$(curl -sS -o /dev/null -w '%{http_code}' \
 [[ "$bad_code" == "400" ]] \
     || { echo "FAIL: bad path expected 400, got $bad_code"; exit 1; }
 echo "    path validation rejects '..' with 400"
+
+# Token revocation. Mint a read-only token, prove it works for a clone,
+# revoke it, prove the clone now fails with auth. Revoke is an admin-only
+# endpoint that takes the token in the request body (not the URL, which
+# would leak into access logs).
+echo "==> [9] revoke a token"
+mint_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"scope":"read"}' "$BASE_URL/v1/repos/${repo_id}/tokens")
+revokable_token=$(echo "$mint_resp" | json token)
+revokable_remote=$(echo "$mint_resp" | json remote)
+# Clone with the token — should succeed.
+rm -rf "${WORK_DIR}/rev" && GIT_TERMINAL_PROMPT=0 git clone --quiet "$revokable_remote" "${WORK_DIR}/rev"
+# Revoke.
+rv=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d "{\"token\":\"${revokable_token}\"}" "$BASE_URL/v1/tokens/revoke" \
+    | json revoked)
+[[ "$rv" == "True" ]] \
+    || { echo "FAIL: revoke response expected True, got $rv"; exit 1; }
+# Clone again with the same URL — should fail with auth.
+rm -rf "${WORK_DIR}/rev2"
+if GIT_TERMINAL_PROMPT=0 git clone --quiet "$revokable_remote" "${WORK_DIR}/rev2" 2>/dev/null; then
+    echo "FAIL: clone with revoked token unexpectedly succeeded"
+    exit 1
+fi
+# Double-revoke should be idempotent (returns revoked=False).
+rv2=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d "{\"token\":\"${revokable_token}\"}" "$BASE_URL/v1/tokens/revoke" \
+    | json revoked)
+[[ "$rv2" == "False" ]] \
+    || { echo "FAIL: second revoke expected False, got $rv2"; exit 1; }
+echo "    revoked token rejected on clone; double-revoke is a no-op"
+
+# Token persistence across restart. Mint a token, stop the server, start
+# it again on the same data dir (same tokens.db), and verify the token
+# still clones. This is the entire reason to back tokens with SQLite
+# instead of a HashMap.
+echo "==> [10] tokens persist across server restart"
+persist_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"scope":"read"}' "$BASE_URL/v1/repos/${repo_id}/tokens")
+persist_remote=$(echo "$persist_resp" | json remote)
+stop_server
+echo "    server stopped; data_dir=$DATA_DIR"
+start_server
+echo "    server restarted; cloning with pre-restart token..."
+rm -rf "${WORK_DIR}/persist"
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$persist_remote" "${WORK_DIR}/persist"
+[[ -f "${WORK_DIR}/persist/README.md" ]] \
+    || { echo "FAIL: restart-then-clone missing README.md"; exit 1; }
+echo "    pre-restart token still authorizes after restart"
 
 echo
 echo "==> all checks passed"
