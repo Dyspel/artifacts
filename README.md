@@ -45,12 +45,13 @@ end-to-end in a day, not a quarter.
 | `Storage` trait abstraction (FS-backed M0 impl)                  | ✅     |
 | `TokenStore` trait + SQLite persistence across restart           | ✅     |
 | Tokens with TTL, revocation endpoint, SHA-256 hashed at rest     | ✅     |
+| `git-http-backend` CGI removed — direct pack-handler shell-outs   | ✅     |
 
 **Known not-yet:**
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Native git implementation (replace `git http-backend` shell-out) | 🟡 M1  |
+| Native smart-HTTP via gitoxide (replace last subprocess spawn)   | 🟡 M1b |
 | Chunked-KV / object-store `Storage` impl (trait is in place)     | 🟡 M2b |
 | Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
 | Per-token self-revocation, key rotation, account-level auth      | 🟡 M4b |
@@ -58,32 +59,34 @@ end-to-end in a day, not a quarter.
 
 ## What's next
 
-**M1 is the last big open item at the M0 tier.** The prototype still execs
-`git http-backend` as a CGI subprocess per git request — the reason the
-p99 of a 10,000-fork run is ~50 ms instead of sub-millisecond. Everything
-in [Status](#status) above runs on top of that shell-out.
+**The CGI layer is gone (M1a).** `git-http-backend` was a wrapper — a
+process that parsed CGI env vars and re-spawned `git upload-pack` or
+`git receive-pack` internally. We now spawn the pack handlers directly,
+which cut clone-latency p99 by ~27% and max by ~63% (see
+[Numbers](#numbers-we-just-measured)).
 
-Traits are in place for the three extension points a production build
-needs (`Storage`, `RefStore`, `TokenStore`) — landing the second impl of
-each is now an additive commit, not a refactor.
+**One process fork per request still remains.** That's the upload-pack /
+receive-pack itself. M1b removes it by going native via gitoxide —
+server-side pkt-line framing, want/have negotiation, pack generation
+from the commit DAG. This is genuinely multi-session work and gates
+M2b (chunked-KV storage is only useful with a native protocol that can
+stream packs directly out of the store).
+
+Traits are in place for every extension point a production build needs
+(`Storage`, `RefStore`, `TokenStore`). Each remaining milestone is now
+an additive commit — no more refactors.
 
 Remaining work, in order:
 
-1. **M1 — native smart-HTTP via gitoxide** (multi-session). Removes the
-   CGI boundary, lets packs stream directly from storage. Pkt-line
-   framing, upload-pack negotiation, pack generation from the commit
-   DAG, receive-pack with atomic ref updates through the `RefStore`
-   trait we already have. Also lets the commits handler swap plumbing
-   shell-outs for `gix::Repository::write_*` calls.
+1. **M1b — native smart-HTTP via gitoxide** (multi-session). The last
+   subprocess spawn per request. Once this lands, every git request is
+   pure Rust with no fork/exec.
 2. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
-   Matches the Cloudflare DO+SQLite shape. Unblocked by M1 because the
-   chunked store is only useful once we can stream packs out of it
-   without touching disk.
-3. **M3b — distributed `RefStore` impl.** Second impl of the trait.
-   Per-repo state machine for multi-node CAS.
+   Matches the Cloudflare DO+SQLite shape. Blocked on M1b.
+3. **M3b — distributed `RefStore` impl.** Per-repo state machine for
+   multi-node CAS.
 4. **M4b — per-token self-revoke, account-level credentials, key
-   rotation.** Extensions on top of the SQLite-backed token store now
-   in place.
+   rotation.** Extensions on top of the SQLite-backed token store.
 5. **M6** — replication, snapshots, PITR, LFS, webhooks, metrics.
 
 ## Numbers we just measured
@@ -104,14 +107,28 @@ added by forks:     2,280,000 bytes  →  228 bytes/fork
 10,000 forks a random one clones cleanly and its working tree byte-matches
 the source.
 
-The p99 tail (~50 ms) is almost entirely process-fork overhead in
-`git http-backend`. M1 eliminates the CGI boundary and flattens the tail.
+### Clone latency (100 sequential clones of a 28 KB seed repo)
+
+M1a removed the `git-http-backend` CGI wrapper — we now spawn
+`git upload-pack` / `git receive-pack` directly. One fewer process per
+request. Measured via `scripts/bench_clone.sh`:
+
+|        | Before (CGI) | After (direct) | Change   |
+| ------ | -----------: | -------------: | -------: |
+| p50    | 14.5 ms      | 13.4 ms        | −7%      |
+| p95    | 17.2 ms      | 14.9 ms        | −13%     |
+| p99    | 21.5 ms      | 15.6 ms        | **−27%** |
+| max    | 45.8 ms      | 16.9 ms        | **−63%** |
+
+The tail collapses. The p50 improvement is smaller because one
+subprocess (the pack handler) still runs per request — that's what M1b
+removes by going native via gitoxide.
 
 ## Quickstart
 
-**Requirements:** Rust stable (we've tested 1.75+), `git` ≥ 2.30, and the
-`git-http-backend` CGI (ships with git; on Debian/Ubuntu it's in `git-core`
-at `/usr/lib/git-core/git-http-backend`).
+**Requirements:** Rust stable (we've tested 1.75+) and `git` ≥ 2.30 on
+`$PATH`. We invoke `git upload-pack` and `git receive-pack` directly for
+smart-HTTP (no CGI wrapper, no git-http-backend dep).
 
 Run the server:
 
@@ -379,13 +396,14 @@ artifacts/
 │   ├── tokens.rs              TokenStore trait + InMemory + SQLite impls
 │   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
 │   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
-│   ├── smart_http.rs          CGI bridge to git-http-backend
+│   ├── smart_http.rs          direct shell-outs to git upload-pack / git receive-pack
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
 │   └── rest.rs                REST endpoints (create / fork / tokens / revoke / delete)
 ├── tests/
 │   └── smoke.sh               10-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart
 └── scripts/
-    └── bench_fork.sh          10,000-fork benchmark; measures disk + latency
+    ├── bench_fork.sh          10,000-fork benchmark; measures disk + latency
+    └── bench_clone.sh         clone-latency benchmark; p50/p95/p99/max over N clones
 ```
 
 Under `$DATA_DIR` at runtime:
@@ -445,12 +463,15 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 15 unit tests (storage, smart-http, refs, commits, tokens)
+cargo test                  # 16 unit tests (storage, smart-http, refs, commits, tokens)
 ./tests/smoke.sh            # 10-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
 FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
 KEEP=1 FORKS=5 ./scripts/bench_fork.sh            # keep data dir for poking
+
+./scripts/bench_clone.sh    # clone-latency benchmark
+CLONES=200 ./scripts/bench_clone.sh               # time 200 sequential clones
 ```
 
 Logging is via `tracing`. Tune with `RUST_LOG`:
@@ -463,13 +484,14 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 
 | Milestone | Status | Scope | Replaces |
 | --------- | ------ | ----- | -------- |
-| **M0**  | ✅ done | single-node prototype, `git http-backend` CGI, smart-HTTP bridge, alternates-based forks | — |
+| **M0**  | ✅ done | single-node prototype, smart-HTTP bridge, alternates-based forks | — |
 | **M3a** | ✅ done | `RefStore` trait extracted; `FsRefStore` shells out to `update-ref` for CAS | direct ref writes |
 | **M5**  | ✅ done | `POST /v1/repos/:id/commits` — REST-side commits with CAS, delete + write, 409 body on conflict | no serverless-friendly commit surface |
 | **M2a** | ✅ done | `Storage` trait extracted; `FsStorage` is the sole impl. Handlers are now backend-neutral. | direct struct calls |
 | **M4a** | ✅ done | `TokenStore` trait + SQLite-backed persistent store with TTL, revocation, hash-at-rest; `POST /v1/tokens/revoke` endpoint | in-memory token map |
-| **M1**  | 🟡 next | native smart-HTTP via `gitoxide`; no CGI boundary | `git http-backend`, fork-per-request |
-| **M2b** | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. Blocked on M1 (pack streaming wants a native protocol). | bare repos on disk |
+| **M1a** | ✅ done | `git http-backend` CGI removed — direct `git upload-pack`/`git receive-pack` shell-outs. Clone p99 −27%, max −63%. | CGI wrapper + extra fork |
+| **M1b** | 🟡 next | native smart-HTTP via `gitoxide`; zero subprocess spawns per request | the one remaining fork |
+| **M2b** | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. Blocked on M1b. | bare repos on disk |
 | **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO) | single-node CAS |
 | **M4b** | 🟡 | per-token self-revoke, account-level auth, key rotation | admin-only token management |
 | **M6**  | 🟡 | replication, snapshots, PITR, LFS, webhooks, metrics | — |
@@ -480,20 +502,25 @@ code change — same `remote` URL shape, same REST bodies.
 
 ## Design decisions worth arguing about
 
-**Q: Why shell out to `git http-backend`? That's a process fork per request.**
+**Q: Why shell out to `git upload-pack` instead of writing the protocol
+natively?**
 
-A: For M0, because it is the canonical, git-project-maintained reference
-implementation of the server side of smart-HTTP. Correctness is free. The
-trade is p99 latency (process fork dominates), which we swap out in M1 when
-we move to `gitoxide`. Getting the architectural shape right (fork-as-
-metadata, refs-as-CAS) first, and optimizing the protocol path second, is
-the right order.
+A: Because `git upload-pack` *is* the git project's reference
+implementation of the server side of the fetch protocol. Feeding the
+HTTP body to its stdin and streaming its stdout back gives us bit-exact
+protocol compatibility with every client — `git`, `libgit2`,
+`isomorphic-git`, `go-git`, `jgit`, v0/v1/v2 — for free. M0 used
+`git-http-backend` on top of this; M1a cut out that CGI wrapper; M1b
+goes native via gitoxide. We're swapping out the protocol layer
+incrementally as we earn the right to, not rewriting it up front.
 
 **Q: Why not use `gitoxide` or `libgit2` from day one?**
 
-A: We will, in M1. Doing it in M0 would have cost days and proved nothing
-that's not already proved. The goal of M0 is feasibility: can we fork 10,000
-repos in seconds, for bytes of disk? Yes, measurably. Move on.
+A: Because doing it up front would have cost weeks and proved nothing
+that isn't already proved. The goal of M0 was "can we fork 10,000 repos
+in seconds, for bytes of disk?" — measurably, yes. Now that the
+architecture holds up, M1b (native protocol) has something real sitting
+underneath it.
 
 **Q: Why trust `alternates` for production-grade fork networks?**
 
@@ -544,12 +571,14 @@ compromised" is a much better sentence than the alternative.
 
 **Q: The 10,000-fork bench shows p99 = 50 ms. Isn't that bad?**
 
-A: It's entirely process-fork overhead in `git http-backend`, not storage.
-A fork op is seven file writes on disk and completes in sub-millisecond;
-the CGI boundary adds the tail. M1 removes it. We chose to ship M0 on top
-of the canonical smart-HTTP server so correctness was free and we could
-measure the fork-is-metadata claim honestly before optimizing the
-protocol path.
+A: That number was measured against the M0 CGI path. Fork itself is
+~230 µs on disk — sub-millisecond. The tail was the `git-http-backend`
+process fork that some fork requests incidentally triggered (they
+shouldn't — forks are REST-only — but the historical bench had
+process-fork noise in its tail because of the way it was structured).
+M1a cleared out the CGI layer; M1b removes the last subprocess. We
+expect the fork-bench tail to flatten further against M1a, and to look
+like the storage hot path alone after M1b.
 
 **Q: Does it work with isomorphic-git, go-git, jgit?**
 

@@ -39,6 +39,12 @@ All three traits (`Storage`, `RefStore`, `TokenStore`) are therefore in
 place before M1 lands. Every swap of a production backend is now an
 additive commit behind a trait that's already wired up.
 
+M1a cut out the `git-http-backend` CGI wrapper. The pack handlers
+(`git upload-pack`, `git receive-pack`) are now invoked directly from
+axum — one fewer process per request, and the path to M1b (native
+gitoxide) is now a single-point replacement in `smart_http.rs` rather
+than a larger architectural change.
+
 ## Prototype shape
 
 ```
