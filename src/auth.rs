@@ -32,7 +32,11 @@ pub fn basic_token(headers: &HeaderMap) -> Result<String> {
 }
 
 /// Authorize a git request for `repo_id` at `required` scope.
-pub fn authorize_git(
+///
+/// `async` because `TokenStore::lookup` is async (see tokens module for
+/// why). `.await` is cheap in the common path; the only real I/O is the
+/// SQLite row read in `SqliteTokenStore`, which takes microseconds.
+pub async fn authorize_git(
     tokens: &dyn TokenStore,
     headers: &HeaderMap,
     repo_id: &str,
@@ -40,7 +44,8 @@ pub fn authorize_git(
 ) -> Result<TokenRecord> {
     let token = basic_token(headers)?;
     let record = tokens
-        .lookup(&token)?
+        .lookup(&token)
+        .await?
         .ok_or(Error::UnauthorizedBasic)?;
     if record.repo_id != repo_id {
         return Err(Error::Forbidden("token not valid for this repo"));

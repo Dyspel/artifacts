@@ -25,6 +25,7 @@
 //! migrations; for now the tokens table is the only state.
 
 use crate::error::{Error, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use dashmap::DashMap;
 use rand::Rng;
@@ -32,8 +33,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,20 +70,28 @@ pub struct TokenRecord {
     pub expires_at: Option<u64>,
 }
 
+/// The token-store contract.
+///
+/// Methods are `async` because any production backend worth having is going
+/// to do I/O (SQLite, network KV, secret-manager lookups). Making the
+/// in-memory impl async is a trivial wrapper; it costs us nothing and
+/// prevents the "the trait is sync but one impl needs to block" tension
+/// that hit us at review.
+#[async_trait]
 pub trait TokenStore: Send + Sync {
     /// Mint a new token authorizing `scope` on `repo_id`, optionally
     /// expiring after `ttl`. Returns the raw token (clients get this once
     /// and only once — the store holds only the hash).
-    fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String>;
+    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String>;
 
     /// Resolve a token. `Ok(None)` means unknown, revoked, or expired —
     /// no distinction is made, since from the caller's perspective all
     /// three should fail closed as 401.
-    fn lookup(&self, token: &str) -> Result<Option<TokenRecord>>;
+    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>>;
 
     /// Revoke a token. Returns `Ok(true)` if the token existed and wasn't
     /// already revoked, `Ok(false)` otherwise. Idempotent.
-    fn revoke(&self, token: &str) -> Result<bool>;
+    async fn revoke(&self, token: &str) -> Result<bool>;
 }
 
 /// In-memory `TokenStore` for tests. State evaporates on drop.
@@ -102,8 +112,9 @@ impl InMemoryTokenStore {
     }
 }
 
+#[async_trait]
 impl TokenStore for InMemoryTokenStore {
-    fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
+    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
         let token = random_token();
         let expires_at = ttl.map(|d| now_secs() + d.as_secs());
         self.inner.insert(
@@ -120,7 +131,7 @@ impl TokenStore for InMemoryTokenStore {
         Ok(token)
     }
 
-    fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
+    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
         let Some(entry) = self.inner.get(&sha256_hex(token)) else {
             return Ok(None);
         };
@@ -135,7 +146,7 @@ impl TokenStore for InMemoryTokenStore {
         Ok(Some(entry.record.clone()))
     }
 
-    fn revoke(&self, token: &str) -> Result<bool> {
+    async fn revoke(&self, token: &str) -> Result<bool> {
         let key = sha256_hex(token);
         match self.inner.get_mut(&key) {
             Some(mut entry) if !entry.revoked => {
@@ -147,15 +158,25 @@ impl TokenStore for InMemoryTokenStore {
     }
 }
 
-/// SQLite-backed `TokenStore`. Single writer; multiple readers can proceed
-/// under WAL. The mutex around the connection keeps SQLite's "one writer
-/// at a time" invariant honest across tokio tasks.
+/// SQLite-backed `TokenStore`.
+///
+/// SQLite is single-writer-multi-reader under WAL, and the C API isn't
+/// `Send + Sync` to begin with, so we serialize access with a mutex. This
+/// used to be a `std::sync::Mutex`, which blocked the *tokio worker
+/// thread* while held — fine for a prototype at low qps, wrong under
+/// load. We now use `tokio::sync::Mutex`: holding it suspends only the
+/// single task awaiting the lock, not a worker.
+///
+/// The SQLite operations themselves are sync + fast (microseconds for the
+/// hashed-key lookup). If we later see contention at thousands of qps,
+/// the right next step is `deadpool-sqlite` with a connection pool — but
+/// the `TokenStore` trait doesn't change.
 ///
 /// Tokens are stored as SHA-256 hashes. If the DB file leaks, a reader
 /// cannot present any of the stored rows as a token — they'd have to
 /// preimage the hash.
 pub struct SqliteTokenStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<TokioMutex<Connection>>,
 }
 
 impl SqliteTokenStore {
@@ -175,18 +196,19 @@ impl SqliteTokenStore {
              CREATE INDEX IF NOT EXISTS idx_tokens_repo_id ON tokens(repo_id);",
         )?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(TokioMutex::new(conn)),
         })
     }
 }
 
+#[async_trait]
 impl TokenStore for SqliteTokenStore {
-    fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
+    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
         let token = random_token();
         let hash = sha256_hex(&token);
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
-        let conn = self.conn.lock().expect("tokens mutex poisoned");
+        let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -195,10 +217,10 @@ impl TokenStore for SqliteTokenStore {
         Ok(token)
     }
 
-    fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
+    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = self.conn.lock().expect("tokens mutex poisoned");
+        let conn = self.conn.lock().await;
         let mut stmt = conn.prepare_cached(
             "SELECT repo_id, scope, expires_at FROM tokens
              WHERE token_hash = ?1
@@ -219,10 +241,10 @@ impl TokenStore for SqliteTokenStore {
         }))
     }
 
-    fn revoke(&self, token: &str) -> Result<bool> {
+    async fn revoke(&self, token: &str) -> Result<bool> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = self.conn.lock().expect("tokens mutex poisoned");
+        let conn = self.conn.lock().await;
         let affected = conn.execute(
             "UPDATE tokens SET revoked_at = ?1
              WHERE token_hash = ?2 AND revoked_at IS NULL",
@@ -267,67 +289,67 @@ mod tests {
         (dir, store)
     }
 
-    #[test]
-    fn mint_then_lookup_roundtrip() {
+    #[tokio::test]
+    async fn mint_then_lookup_roundtrip() {
         let (_d, store) = open_store();
-        let t = store.mint("repo-a", Scope::Write, None).unwrap();
-        let rec = store.lookup(&t).unwrap().unwrap();
+        let t = store.mint("repo-a", Scope::Write, None).await.unwrap();
+        let rec = store.lookup(&t).await.unwrap().unwrap();
         assert_eq!(rec.repo_id, "repo-a");
         assert_eq!(rec.scope, Scope::Write);
         assert!(rec.expires_at.is_none());
     }
 
-    #[test]
-    fn lookup_of_unknown_is_none() {
+    #[tokio::test]
+    async fn lookup_of_unknown_is_none() {
         let (_d, store) = open_store();
-        assert!(store.lookup("never-minted").unwrap().is_none());
+        assert!(store.lookup("never-minted").await.unwrap().is_none());
     }
 
-    #[test]
-    fn revoke_makes_lookup_return_none() {
+    #[tokio::test]
+    async fn revoke_makes_lookup_return_none() {
         let (_d, store) = open_store();
-        let t = store.mint("r", Scope::Read, None).unwrap();
-        assert!(store.lookup(&t).unwrap().is_some());
-        assert!(store.revoke(&t).unwrap());
-        assert!(store.lookup(&t).unwrap().is_none());
+        let t = store.mint("r", Scope::Read, None).await.unwrap();
+        assert!(store.lookup(&t).await.unwrap().is_some());
+        assert!(store.revoke(&t).await.unwrap());
+        assert!(store.lookup(&t).await.unwrap().is_none());
         // Second revoke is a no-op (idempotent).
-        assert!(!store.revoke(&t).unwrap());
+        assert!(!store.revoke(&t).await.unwrap());
     }
 
-    #[test]
-    fn expired_tokens_do_not_resolve() {
+    #[tokio::test]
+    async fn expired_tokens_do_not_resolve() {
         let (_d, store) = open_store();
         // TTL of zero seconds means "expires_at = created_at", and the
         // lookup predicate is `expires_at > now`, so it's immediately dead.
-        let t = store.mint("r", Scope::Read, Some(Duration::from_secs(0))).unwrap();
+        let t = store.mint("r", Scope::Read, Some(Duration::from_secs(0))).await.unwrap();
         assert!(
-            store.lookup(&t).unwrap().is_none(),
+            store.lookup(&t).await.unwrap().is_none(),
             "expected TTL=0 token to be unresolvable"
         );
     }
 
-    #[test]
-    fn persistence_across_reopen() {
+    #[tokio::test]
+    async fn persistence_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let t = {
             let s = SqliteTokenStore::open(&path).unwrap();
-            s.mint("persistent", Scope::Write, None).unwrap()
+            s.mint("persistent", Scope::Write, None).await.unwrap()
         };
         // Drop the first store, reopen on the same path.
         let s2 = SqliteTokenStore::open(&path).unwrap();
-        let rec = s2.lookup(&t).unwrap().expect("token survived reopen");
+        let rec = s2.lookup(&t).await.unwrap().expect("token survived reopen");
         assert_eq!(rec.repo_id, "persistent");
     }
 
-    #[test]
-    fn stored_value_is_not_the_raw_token() {
+    #[tokio::test]
+    async fn stored_value_is_not_the_raw_token() {
         // Belt-and-suspenders: verify we never write the raw token into
         // the db, only its hash.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let t = store.mint("r", Scope::Read, None).unwrap();
+        let t = store.mint("r", Scope::Read, None).await.unwrap();
 
         let conn = Connection::open(&path).unwrap();
         let mut stmt = conn

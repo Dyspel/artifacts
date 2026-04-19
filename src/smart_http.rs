@@ -73,7 +73,7 @@ pub async fn git_handler(
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or("").to_string();
     let scope = required_scope(&method, &rest, Some(&query));
-    authorize_git(&*state.tokens, request.headers(), &repo_id, scope)?;
+    authorize_git(&*state.tokens, request.headers(), &repo_id, scope).await?;
 
     match (method.as_str(), rest.as_str()) {
         ("GET", "info/refs") => {

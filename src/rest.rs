@@ -69,7 +69,7 @@ pub async fn create_repo(
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
     state.storage.create(&id)?;
-    let token = state.tokens.mint(&id, Scope::Write, None)?;
+    let token = state.tokens.mint(&id, Scope::Write, None).await?;
     let remote = remote_url(&state.cfg, &id, &token);
     Ok(Json(RepoHandle { id, remote, token }))
 }
@@ -99,7 +99,7 @@ pub async fn fork_repo(
     let fork_id = fork_id.unwrap_or_else(new_repo_id);
     state.storage.fork(&source_id, &fork_id)?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
-    let token = state.tokens.mint(&fork_id, scope, None)?;
+    let token = state.tokens.mint(&fork_id, scope, None).await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
@@ -133,7 +133,7 @@ pub async fn mint_token(
         return Err(Error::RepoNotFound(id));
     }
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state.tokens.mint(&id, body.scope, ttl)?;
+    let token = state.tokens.mint(&id, body.scope, ttl).await?;
     let remote = remote_url(&state.cfg, &id, &token);
     let expires_at = ttl.map(|d| {
         std::time::SystemTime::now()
@@ -164,7 +164,7 @@ pub async fn revoke_token(
     Json(body): Json<RevokeBody>,
 ) -> Result<Json<RevokeResponse>> {
     authorize_admin(&headers, &state.cfg.admin_token)?;
-    let revoked = state.tokens.revoke(&body.token)?;
+    let revoked = state.tokens.revoke(&body.token).await?;
     Ok(Json(RevokeResponse { revoked }))
 }
 
