@@ -139,12 +139,12 @@ async fn run_git(git_dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{new_repo_id, Storage};
+    use crate::storage::{new_repo_id, FsStorage, Storage};
 
     fn setup_repo() -> (PathBuf, String, FsRefStore) {
         let tmp = std::env::temp_dir().join(format!("refs-test-{}", new_repo_id()));
         let repos_dir = tmp.join("repos");
-        let storage = Storage::new(&repos_dir).unwrap();
+        let storage = FsStorage::new(&repos_dir).unwrap();
         let repo_id = new_repo_id();
         storage.create(&repo_id).unwrap();
         let refs = FsRefStore::new(repos_dir);

@@ -13,7 +13,7 @@ use crate::{
     refs::{FsRefStore, RefStore},
     rest::RestState,
     smart_http::GitState,
-    storage::Storage,
+    storage::{FsStorage, Storage},
     tokens::TokenStore,
 };
 use axum::{
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                 admin_token,
                 git_http_backend,
             });
-            let storage = Storage::new(cfg.repos_dir())?;
+            let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let tokens = TokenStore::new();
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
 

@@ -22,7 +22,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct RestState {
     pub cfg: Arc<Config>,
-    pub storage: Storage,
+    /// Repo lifecycle backend. M0 ships `FsStorage`; future impls
+    /// (chunked KV, object-store-backed) drop in behind the same trait.
+    pub storage: Arc<dyn Storage>,
     pub tokens: TokenStore,
     /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
     /// distributed impl without touching any handler.

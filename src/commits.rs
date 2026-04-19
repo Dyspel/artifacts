@@ -147,7 +147,12 @@ pub async fn create_commit(
         }
     }
 
-    let git_dir = state.storage.repo_path(&repo_id);
+    // Storage trait deliberately doesn't expose on-disk paths (a chunked-KV
+    // backend wouldn't have one). The commit plumbing is FS-specific because
+    // it shells out to git — so we derive the path from config here. When M1
+    // lands and this shell-out is replaced with native gitoxide calls, this
+    // coupling goes away.
+    let git_dir = state.cfg.repos_dir().join(format!("{repo_id}.git"));
     let ref_name = format!("refs/heads/{}", body.branch);
 
     // 1. Resolve the base tree. If parent was specified, pin to its tree and
