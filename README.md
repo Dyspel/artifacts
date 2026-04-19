@@ -46,12 +46,14 @@ end-to-end in a day, not a quarter.
 | `TokenStore` trait + SQLite persistence across restart           | ✅     |
 | Tokens with TTL, revocation endpoint, SHA-256 hashed at rest     | ✅     |
 | `git-http-backend` CGI removed — direct pack-handler shell-outs   | ✅     |
+| Native v2 `info/refs` — no subprocess for the discovery request  | ✅     |
 
 **Known not-yet:**
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Native smart-HTTP via gitoxide (replace last subprocess spawn)   | 🟡 M1b |
+| Native v2 `command=ls-refs` + `command=fetch` (pack generation)  | 🟡 M1b-next |
+| Native `git-receive-pack` equivalent (pack parsing + ref CAS)    | 🟡 M1b-next |
 | Chunked-KV / object-store `Storage` impl (trait is in place)     | 🟡 M2b |
 | Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
 | Per-token self-revocation, key rotation, account-level auth      | 🟡 M4b |
@@ -62,32 +64,40 @@ end-to-end in a day, not a quarter.
 **The CGI layer is gone (M1a).** `git-http-backend` was a wrapper — a
 process that parsed CGI env vars and re-spawned `git upload-pack` or
 `git receive-pack` internally. We now spawn the pack handlers directly,
-which cut clone-latency p99 by ~27% and max by ~63% (see
-[Numbers](#numbers-we-just-measured)).
+which cut clone-latency p99 by ~27% and max by ~63%.
 
-**One process fork per request still remains.** That's the upload-pack /
-receive-pack itself. M1b removes it by going native via gitoxide —
-server-side pkt-line framing, want/have negotiation, pack generation
-from the commit DAG. This is genuinely multi-session work and gates
-M2b (chunked-KV storage is only useful with a native protocol that can
-stream packs directly out of the store).
+**Native v2 `info/refs` is in (M1b step 1).** Modern git clients default
+to v2, and the v2 capability advertisement is static text — no refs
+appear in the discovery response, clients fetch them via a subsequent
+`command=ls-refs` POST. We now build that advertisement in-process
+instead of forking to `git upload-pack --advertise-refs`. Modest perf
+win (info/refs is the cheap half of the roundtrip), but structurally
+important: we have a working native-protocol path that handles *part*
+of a real git operation.
 
-Traits are in place for every extension point a production build needs
-(`Storage`, `RefStore`, `TokenStore`). Each remaining milestone is now
-an additive commit — no more refactors.
+**The upload-pack / receive-pack POST still shells out.** That's where
+most of the remaining subprocess cost lives — walking the commit DAG,
+building the pack, parsing the incoming pack. Going native here is
+genuinely multi-session work.
 
-Remaining work, in order:
+Remaining, in order:
 
-1. **M1b — native smart-HTTP via gitoxide** (multi-session). The last
-   subprocess spawn per request. Once this lands, every git request is
-   pure Rust with no fork/exec.
-2. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
-   Matches the Cloudflare DO+SQLite shape. Blocked on M1b.
-3. **M3b — distributed `RefStore` impl.** Per-repo state machine for
-   multi-node CAS.
-4. **M4b — per-token self-revoke, account-level credentials, key
+1. **M1b-next — native v2 `command=ls-refs` + `command=fetch`.** The
+   hard part of the fetch path. `ls-refs` is short (format refs in
+   v2 syntax); `fetch` is the real work: want/have negotiation, DAG
+   traversal, pack generation. This is where `gix-pack` /
+   `gix-traverse` earn their keep.
+2. **M1b-next — native `git-receive-pack`.** Parse incoming pack
+   (via `gix-pack`), write objects, CAS ref update through the
+   existing `RefStore` trait.
+3. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
+   Blocked on M1b completion (chunked store is only useful with
+   native pack streaming).
+4. **M3b — distributed `RefStore` impl.** Per-repo state machine
+   for multi-node CAS.
+5. **M4b — per-token self-revoke, account-level credentials, key
    rotation.** Extensions on top of the SQLite-backed token store.
-5. **M6** — replication, snapshots, PITR, LFS, webhooks, metrics.
+6. **M6** — replication, snapshots, PITR, LFS, webhooks, metrics.
 
 ## Numbers we just measured
 
@@ -107,22 +117,22 @@ added by forks:     2,280,000 bytes  →  228 bytes/fork
 10,000 forks a random one clones cleanly and its working tree byte-matches
 the source.
 
-### Clone latency (100 sequential clones of a 28 KB seed repo)
+### Clone latency (sequential clones of a 28 KB seed repo)
 
-M1a removed the `git-http-backend` CGI wrapper — we now spawn
-`git upload-pack` / `git receive-pack` directly. One fewer process per
-request. Measured via `scripts/bench_clone.sh`:
+Measured via `scripts/bench_clone.sh`:
 
-|        | Before (CGI) | After (direct) | Change   |
-| ------ | -----------: | -------------: | -------: |
-| p50    | 14.5 ms      | 13.4 ms        | −7%      |
-| p95    | 17.2 ms      | 14.9 ms        | −13%     |
-| p99    | 21.5 ms      | 15.6 ms        | **−27%** |
-| max    | 45.8 ms      | 16.9 ms        | **−63%** |
+|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) |
+| ------ | -------: | -----------: | ----------------------------: |
+| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       |
+| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       |
+| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       |
+| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       |
 
-The tail collapses. The p50 improvement is smaller because one
-subprocess (the pack handler) still runs per request — that's what M1b
-removes by going native via gitoxide.
+M1a killed the CGI wrapper — that's where the big tail-latency win lives
+(p99 −27%, max −63%). M1b-1 went native on the discovery response; a
+small p50 nudge because that endpoint was the cheaper of the two git
+subprocesses. The remaining M1b steps (native fetch / receive-pack via
+gitoxide) hit the expensive half.
 
 ## Quickstart
 
@@ -463,7 +473,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 16 unit tests (storage, smart-http, refs, commits, tokens)
+cargo test                  # 18 unit tests (storage, smart-http, refs, commits, tokens)
 ./tests/smoke.sh            # 10-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
@@ -490,7 +500,9 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M2a** | ✅ done | `Storage` trait extracted; `FsStorage` is the sole impl. Handlers are now backend-neutral. | direct struct calls |
 | **M4a** | ✅ done | `TokenStore` trait + SQLite-backed persistent store with TTL, revocation, hash-at-rest; `POST /v1/tokens/revoke` endpoint | in-memory token map |
 | **M1a** | ✅ done | `git http-backend` CGI removed — direct `git upload-pack`/`git receive-pack` shell-outs. Clone p99 −27%, max −63%. | CGI wrapper + extra fork |
-| **M1b** | 🟡 next | native smart-HTTP via `gitoxide`; zero subprocess spawns per request | the one remaining fork |
+| **M1b-1** | ✅ done | Native v2 `info/refs` advertisement — discovery endpoint no longer spawns a subprocess when the client uses protocol v2 (almost all modern clients). | upload-pack `--advertise-refs` fork |
+| **M1b-2** | 🟡 next | Native v2 `command=fetch` + `command=ls-refs` on POST; pack generation via gitoxide | upload-pack fetch fork |
+| **M1b-3** | 🟡 next | Native receive-pack: parse incoming pack, CAS ref via `RefStore` | receive-pack fork |
 | **M2b** | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. Blocked on M1b. | bare repos on disk |
 | **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO) | single-node CAS |
 | **M4b** | 🟡 | per-token self-revoke, account-level auth, key rotation | admin-only token management |

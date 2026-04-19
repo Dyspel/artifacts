@@ -1,4 +1,5 @@
-//! Smart-HTTP: dispatches directly to `git upload-pack` / `git receive-pack`.
+//! Smart-HTTP: dispatches directly to `git upload-pack` / `git receive-pack`,
+//! with a native in-process path for the v2 `info/refs` advertisement.
 //!
 //! ## What changed at M1a
 //!
