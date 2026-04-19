@@ -69,6 +69,12 @@ curl -fsS "$BASE_URL/v1/health" >/dev/null
 auth=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
 json() { python3 -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])'; }
 
+# High-resolution wall-clock seconds. `date +%s.%N` is GNU-only (BSD
+# date emits literal `%N`, which produces `nan` timings on macOS without
+# surfacing an error). python3 is already required for this script, so
+# it's the portable option.
+now_secs() { python3 -c 'import time; print(f"{time.time():.6f}")'; }
+
 echo "==> seeding source repo"
 src_resp=$(curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/repos")
 src_id=$(echo "$src_resp" | json id)
@@ -110,7 +116,7 @@ echo "==> timing ${CLONES} sequential clones"
 latency_file="${WORK_DIR}/clone-ms.txt"
 : > "$latency_file"
 
-t_start=$(date +%s.%N)
+t_start=$(now_secs)
 for i in $(seq 1 "$CLONES"); do
     d="${WORK_DIR}/c-${i}"
     # Use python's perf_counter for microsecond-precision timing.
@@ -125,7 +131,7 @@ print(f"{(t1 - t0) * 1000:.3f}")
 PY
     rm -rf "$d"
 done
-t_end=$(date +%s.%N)
+t_end=$(now_secs)
 
 elapsed=$(awk -v a="$t_start" -v b="$t_end" 'BEGIN { printf("%.3f\n", b - a) }')
 tput=$(awk -v n="$CLONES" -v t="$elapsed" 'BEGIN { printf("%.1f\n", n / t) }')

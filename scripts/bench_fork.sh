@@ -72,6 +72,11 @@ curl -fsS "$BASE_URL/v1/health" >/dev/null
 auth=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
 json() { python3 -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])'; }
 
+# High-resolution wall-clock seconds. `date +%s.%N` would be shorter but
+# it's GNU-only — BSD date (macOS) emits literal `%N`, which later breaks
+# `awk` silently. Going through python makes the bench portable.
+now_secs() { python3 -c 'import time; print(f"{time.time():.6f}")'; }
+
 echo "==> seeding source repo with a real working tree"
 src_resp=$(curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/repos")
 src_id=$(echo "$src_resp" | json id)
@@ -125,11 +130,11 @@ fork_one() {
 }
 export -f fork_one
 
-t_start=$(date +%s.%N)
+t_start=$(now_secs)
 seq 1 "$FORKS" \
     | xargs -n1 -P"$PARALLEL" -I {} bash -c "fork_one {} $ADMIN_TOKEN $BASE_URL $src_id" \
     >> "$work_latency_file"
-t_end=$(date +%s.%N)
+t_end=$(now_secs)
 
 elapsed=$(awk -v a="$t_start" -v b="$t_end" 'BEGIN { printf("%.3f\n", b - a) }')
 throughput=$(awk -v n="$FORKS" -v t="$elapsed" 'BEGIN { printf("%.1f\n", n / t) }')
