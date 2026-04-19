@@ -22,6 +22,13 @@ Artifacts interesting are:
 If these three are right, a production system is a matter of scaling and
 polish. If any one is wrong, no amount of scaling saves it.
 
+M0 answered #1 (shell out to `git http-backend`, guaranteed correct) and
+#2 (fork-via-alternates, measured). M3a extracts the CAS boundary — #3 —
+into a trait so the swap to a distributed ref store is a drop-in later.
+The single-node `FsRefStore` delegates to `git update-ref`, which gives us
+file-system CAS today; a future multi-node impl backed by a state machine
+per repo is a local code change that doesn't reach out to the handlers.
+
 ## Prototype shape
 
 ```

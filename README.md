@@ -38,6 +38,9 @@ end-to-end in a day, not a quarter.
 | Per-repo token scoping (`read` vs `write`, enforced on push)     | ✅     |
 | `readOnly: true` forks that reject pushes                        | ✅     |
 | v1 + v2 git protocol (inherited from `git http-backend`)         | ✅     |
+| `POST /v1/repos/:id/commits` — REST-side commits (no git client) | ✅     |
+| CAS refs: 409 `ref_conflict` with `expected` + `current` fields  | ✅     |
+| `RefStore` trait abstraction (FS-backed M0 impl)                 | ✅     |
 
 **Known not-yet:**
 
@@ -45,9 +48,8 @@ end-to-end in a day, not a quarter.
 | ---------------------------------------------------------------- | ------ |
 | Native git implementation (replace `git http-backend` shell-out) | 🟡 M1  |
 | Pluggable object store (chunked KV / S3)                         | 🟡 M2  |
-| Strongly-consistent multi-node refs store with CAS               | 🟡 M3  |
+| Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
 | Production-grade auth (short-lived creds, revocation)            | 🟡 M4  |
-| REST-side commits (for serverless, no git client)                | 🟡 M5  |
 | LFS, replication, PITR, webhooks, metrics                        | 🟡 M6  |
 
 ## Numbers we just measured
@@ -218,6 +220,69 @@ Response: `{"ok":true}`. In the prototype this is a raw `rm -rf` on the
 repo directory. Production needs soft-delete + alternates-aware GC so you
 can't tombstone a repo that's still the object source for a live fork.
 
+### Create a commit (no git client required)
+
+```
+POST /v1/repos/:id/commits
+Authorization: Bearer <admin>
+Content-Type: application/json
+
+{
+  "branch": "main",
+  "parent": null,                        // or "abc123..." — CAS predicate
+  "message": "update README",
+  "author": { "name": "Agent", "email": "agent@example.com" },
+  "changes": [
+    { "op": "write",  "path": "README.md", "content": "# Hello\n" },
+    { "op": "write",  "path": "img/logo.png", "contentBase64": "iVBORw0…", "mode": "100644" },
+    { "op": "delete", "path": "old/thing.txt" }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "commit": "a1b2c3…",
+  "tree":   "d4e5f6…",
+  "branch": "main"
+}
+```
+
+Semantics:
+
+- `parent` is the **compare-and-swap predicate.** The commit is only
+  applied if the branch currently points at `parent`. `null` means the
+  branch must not yet exist (i.e. this is the initial commit / new branch).
+- Changes are applied **in order** on top of `parent`'s tree. If the same
+  path appears twice, the later write wins.
+- `content` is UTF-8. `contentBase64` is arbitrary bytes. One or the other,
+  not both. If neither is set, the file is written as empty.
+- `mode` defaults to `100644` (regular file); `100755` is also accepted
+  (executable).
+- Paths must be relative, have no `..` or `.` components, and no empty
+  path segments.
+
+On CAS miss:
+
+```
+HTTP 409 Conflict
+
+{
+  "error": {
+    "code": "ref_conflict",
+    "message": "ref conflict on branch main",
+    "branch": "main",
+    "expected": "a1b2c3…",     // the SHA the caller thought was current
+    "current":  "9f8e7d…"      // the SHA actually on the branch right now
+  }
+}
+```
+
+Clients should re-read, rebase their change set, and retry. The `current`
+field lets them do that without a second round trip.
+
 ### Git endpoints
 
 The standard smart-HTTP surface, exposed under `/git/:id.git/`:
@@ -246,8 +311,10 @@ artifacts/
 │   ├── error.rs               error type + IntoResponse + WWW-Authenticate
 │   ├── tokens.rs              in-memory token store, scopes
 │   ├── auth.rs                Basic/Bearer extraction + authorization helpers
+│   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
 │   ├── storage.rs             bare-repo storage, fork-via-alternates (THE CORE)
 │   ├── smart_http.rs          CGI bridge to git-http-backend
+│   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
 │   └── rest.rs                REST endpoints (create / fork / tokens / delete)
 ├── tests/
 │   └── smoke.sh               7-step end-to-end: create → clone → push → fork → scopes
@@ -327,15 +394,16 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 
 ## Roadmap
 
-| Milestone | Scope | Replaces |
-| --------- | ----- | -------- |
-| **M0** (this) | single-node prototype, `git http-backend` CGI, in-memory tokens | — |
-| **M1** | native smart-HTTP via `gitoxide`; no CGI boundary | `git http-backend`, fork-per-request |
-| **M2** | pluggable `Storage` trait: `FsStorage` + `ChunkedStorage` (objects in KV/S3, matching DO+SQLite shape) | bare repos on disk |
-| **M3** | first-class refs store with CAS semantics, per-repo state machine | git's filesystem refs |
-| **M4** | real auth: short-lived, scoped, revocable tokens; issuer separate from the data plane | in-memory token map |
-| **M5** | REST-side commits (`POST /v1/repos/:id/commits`) so serverless callers don't need a git client | — |
-| **M6** | replication, snapshots, PITR, LFS, webhooks, metrics | — |
+| Milestone | Status | Scope | Replaces |
+| --------- | ------ | ----- | -------- |
+| **M0** | ✅ done | single-node prototype, `git http-backend` CGI, in-memory tokens | — |
+| **M3a** | ✅ done | `RefStore` trait extracted; `FsRefStore` shells out to `update-ref` for CAS | direct ref writes |
+| **M5** | ✅ done | `POST /v1/repos/:id/commits` — REST-side commits with CAS, delete + write, CAS-conflict 409 | no serverless-friendly commit surface |
+| **M1** | 🟡 next | native smart-HTTP via `gitoxide`; no CGI boundary | `git http-backend`, fork-per-request |
+| **M2** | 🟡 | pluggable `Storage` trait: `FsStorage` + `ChunkedStorage` (objects in KV/S3, matching DO+SQLite shape) | bare repos on disk |
+| **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). Trait + callers already in place. | single-node CAS |
+| **M4** | 🟡 | real auth: short-lived, scoped, revocable tokens; issuer separate from the data plane | in-memory token map |
+| **M6** | 🟡 | replication, snapshots, PITR, LFS, webhooks, metrics | — |
 
 Each milestone is designed to land without breaking the API surface at the
 edge. A caller written against M0 should keep working against M6 with no
