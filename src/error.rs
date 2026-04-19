@@ -39,9 +39,6 @@ pub enum Error {
         current: Option<String>,
     },
 
-    #[error("git-http-backend exited with status {0}")]
-    GitBackend(i32),
-
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -88,7 +85,6 @@ impl IntoResponse for Error {
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
             }
-            Error::GitBackend(_) => (StatusCode::BAD_GATEWAY, "git_backend_error"),
             Error::Io(_) | Error::Other(_) => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
