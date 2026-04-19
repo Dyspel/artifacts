@@ -51,10 +51,6 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_ADMIN_TOKEN")]
         admin_token: Option<String>,
 
-        /// Path to git-http-backend.
-        #[arg(long, default_value = "/usr/lib/git-core/git-http-backend")]
-        git_http_backend: PathBuf,
-
         /// Path to the SQLite file that stores minted tokens. Defaults to
         /// `<data-dir>/tokens.db` so the token table lives next to the
         /// repos it authorizes.
@@ -79,7 +75,6 @@ async fn main() -> anyhow::Result<()> {
             bind,
             public_base_url,
             admin_token,
-            git_http_backend,
             token_db,
         } => {
             let admin_token = admin_token.unwrap_or_else(|| {
@@ -88,17 +83,10 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[artifacts] export ARTIFACTS_ADMIN_TOKEN={t} to persist across restarts");
                 t
             });
-            if !git_http_backend.exists() {
-                anyhow::bail!(
-                    "git-http-backend not found at {}. Install git or pass --git-http-backend.",
-                    git_http_backend.display()
-                );
-            }
             let cfg = Arc::new(Config {
                 data_dir: data_dir.clone(),
                 public_base_url,
                 admin_token,
-                git_http_backend,
             });
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
