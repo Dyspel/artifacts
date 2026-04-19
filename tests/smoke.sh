@@ -147,5 +147,92 @@ clone_tok="${WORK_DIR}/tok"
 GIT_TERMINAL_PROMPT=0 git clone --quiet "$tok_remote" "$clone_tok"
 test "$(cat "$clone_tok/README.md")" = "hello from artifacts"
 
+# The next block exercises the REST-side commit endpoint (M5) — the
+# headline "agent-first" path: a caller with no git client writes a
+# commit via plain JSON, and the resulting state is observable via git.
+echo "==> [8] create-then-commit via REST (no git client)"
+rest_resp=$(curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/repos")
+rest_id=$(echo "$rest_resp" | json id)
+rest_remote=$(echo "$rest_resp" | json remote)
+
+# Commit 1: orphan — seed README + src/a.txt
+c1_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{
+      "branch": "main",
+      "parent": null,
+      "message": "rest-initial",
+      "changes": [
+        {"op":"write","path":"README.md","content":"# rest-initial\n"},
+        {"op":"write","path":"src/a.txt","content":"a"}
+      ]
+    }' \
+    "$BASE_URL/v1/repos/${rest_id}/commits")
+c1_sha=$(echo "$c1_resp" | json commit)
+test -n "$c1_sha" && [[ ${#c1_sha} -eq 40 ]] \
+    || { echo "FAIL: bad c1 sha: $c1_sha"; exit 1; }
+echo "    c1 = $c1_sha"
+
+# Commit 2: delete src/a.txt, add src/b.txt, with CAS parent=c1
+c2_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d "{
+      \"branch\": \"main\",
+      \"parent\": \"${c1_sha}\",
+      \"message\": \"rest-delete-and-add\",
+      \"changes\": [
+        {\"op\":\"delete\",\"path\":\"src/a.txt\"},
+        {\"op\":\"write\",\"path\":\"src/b.txt\",\"content\":\"b\"}
+      ]
+    }" \
+    "$BASE_URL/v1/repos/${rest_id}/commits")
+c2_sha=$(echo "$c2_resp" | json commit)
+test -n "$c2_sha" && [[ ${#c2_sha} -eq 40 ]] \
+    || { echo "FAIL: bad c2 sha: $c2_sha"; exit 1; }
+echo "    c2 = $c2_sha"
+
+# Commit 3: reuse parent=c1 (stale). Should 409 with ref_conflict.
+ec3_file="${WORK_DIR}/c3_body.json"
+ec3_code=$(curl -sS -o "$ec3_file" -w '%{http_code}' \
+    -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d "{
+      \"branch\": \"main\",
+      \"parent\": \"${c1_sha}\",
+      \"message\": \"stale\",
+      \"changes\": [{\"op\":\"write\",\"path\":\"x\",\"content\":\"x\"}]
+    }" \
+    "$BASE_URL/v1/repos/${rest_id}/commits")
+[[ "$ec3_code" == "409" ]] \
+    || { echo "FAIL: stale-parent expected 409, got $ec3_code; body:"; cat "$ec3_file"; exit 1; }
+ec3_code_field=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["code"])' < "$ec3_file")
+ec3_current=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["current"])' < "$ec3_file")
+[[ "$ec3_code_field" == "ref_conflict" ]] \
+    || { echo "FAIL: wanted code ref_conflict, got $ec3_code_field"; exit 1; }
+[[ "$ec3_current" == "$c2_sha" ]] \
+    || { echo "FAIL: wanted current=$c2_sha, got $ec3_current"; exit 1; }
+echo "    stale-parent rejected with 409 ref_conflict, current=$c2_sha"
+
+# Clone and verify we see c2's state: README present, src/a.txt gone,
+# src/b.txt present.
+rest_clone="${WORK_DIR}/rest"
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$rest_remote" "$rest_clone"
+[[ -f "$rest_clone/README.md" ]] || { echo "FAIL: README.md missing"; exit 1; }
+[[ ! -f "$rest_clone/src/a.txt" ]] || { echo "FAIL: src/a.txt should have been deleted"; exit 1; }
+[[ -f "$rest_clone/src/b.txt" ]] || { echo "FAIL: src/b.txt missing"; exit 1; }
+[[ "$(cat "$rest_clone/src/b.txt")" == "b" ]] || { echo "FAIL: src/b.txt content wrong"; exit 1; }
+echo "    clone shows c2 state: README + src/b.txt, no src/a.txt"
+
+# Bad-request sanity: invalid path should 400, not 500.
+bad_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d "{
+      \"branch\": \"main\",
+      \"parent\": \"${c2_sha}\",
+      \"message\": \"bad path\",
+      \"changes\": [{\"op\":\"write\",\"path\":\"../escape\",\"content\":\"x\"}]
+    }" \
+    "$BASE_URL/v1/repos/${rest_id}/commits")
+[[ "$bad_code" == "400" ]] \
+    || { echo "FAIL: bad path expected 400, got $bad_code"; exit 1; }
+echo "    path validation rejects '..' with 400"
+
 echo
 echo "==> all checks passed"

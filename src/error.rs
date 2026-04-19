@@ -29,6 +29,16 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
 
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    #[error("ref conflict on branch {branch}")]
+    RefConflict {
+        branch: String,
+        expected: Option<String>,
+        current: Option<String>,
+    },
+
     #[error("git-http-backend exited with status {0}")]
     GitBackend(i32),
 
@@ -41,6 +51,12 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Error::Other(anyhow::Error::from(e))
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
@@ -51,6 +67,21 @@ impl IntoResponse for Error {
                 (StatusCode::UNAUTHORIZED, "unauthorized")
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            Error::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            Error::RefConflict { branch, expected, current } => {
+                // Dedicated 409 with the current + expected SHAs so callers
+                // can re-read and retry without a second round trip.
+                let body = Json(json!({
+                    "error": {
+                        "code": "ref_conflict",
+                        "message": format!("ref conflict on branch {branch}"),
+                        "branch": branch,
+                        "expected": expected,
+                        "current": current,
+                    }
+                }));
+                return (StatusCode::CONFLICT, body).into_response();
+            }
             Error::GitBackend(_) => (StatusCode::BAD_GATEWAY, "git_backend_error"),
             Error::Io(_) | Error::Other(_) => {
                 tracing::error!(error = %self, "internal error");

@@ -1,4 +1,5 @@
 mod auth;
+mod commits;
 mod config;
 mod error;
 mod refs;
@@ -111,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id", delete(rest::delete_repo))
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
+                .route("/v1/repos/:id/commits", post(commits::create_commit))
                 .with_state(rest_state)
                 // Git smart-HTTP. A single catch-all route under /git/:id.git/
                 // dispatches to the backend based on the method + path.
