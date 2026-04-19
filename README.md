@@ -13,6 +13,7 @@ end-to-end in a day, not a quarter.
 ## Table of contents
 
 - [Status](#status)
+- [What's next](#whats-next)
 - [Numbers we just measured](#numbers-we-just-measured)
 - [Quickstart](#quickstart)
 - [API reference](#api-reference)
@@ -51,6 +52,31 @@ end-to-end in a day, not a quarter.
 | Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
 | Production-grade auth (short-lived creds, revocation)            | 🟡 M4  |
 | LFS, replication, PITR, webhooks, metrics                        | 🟡 M6  |
+
+## What's next
+
+**M1 is not done.** The prototype still execs `git http-backend` as a CGI
+subprocess per git request. This is why the p99 of a 10,000-fork run is
+~50 ms instead of sub-millisecond — the process fork dominates, not the
+storage. Everything in [Status](#status) above runs on top of that shell-out.
+
+The ordering I'd recommend from here:
+
+1. **M2 — `Storage` trait** (half session). Mechanical refactor. Extracts
+   a trait from `src/storage.rs`, keeps `FsStorage` as the only impl.
+   Unblocks the chunked-KV story without changing a single handler.
+2. **M4 — persistent + scoped token store** (one session). Tokens survive
+   restart, carry expiry, can be revoked. The current in-memory map is
+   fine for the smoke test and a crime in a real deployment.
+3. **M1 — native smart-HTTP via gitoxide** (multi-session). The big push.
+   Removes the CGI boundary, lets packs stream directly from storage,
+   makes M2's chunked store actually useful. Pkt-line framing, upload-pack
+   negotiation, pack generation from the commit DAG, receive-pack with
+   atomic ref updates. Done right, this is weeks; done wrong, it's
+   endless.
+
+M3b (distributed refs) and M6 (replication/LFS/PITR) sit after M1 because
+they assume a real protocol implementation underneath.
 
 ## Numbers we just measured
 
@@ -302,7 +328,7 @@ Basic with the repo token; scope is enforced (`receive-pack` requires
 
 ```
 artifacts/
-├── Cargo.toml                 cargo manifest (single binary crate, M0)
+├── Cargo.toml                 cargo manifest (single binary crate)
 ├── README.md                  this file
 ├── ARCHITECTURE.md            the three hard problems, prototype vs production
 ├── src/
@@ -317,7 +343,7 @@ artifacts/
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
 │   └── rest.rs                REST endpoints (create / fork / tokens / delete)
 ├── tests/
-│   └── smoke.sh               7-step end-to-end: create → clone → push → fork → scopes
+│   └── smoke.sh               8-step end-to-end: create → clone → push → fork → scopes → REST commits
 └── scripts/
     └── bench_fork.sh          10,000-fork benchmark; measures disk + latency
 ```
@@ -378,8 +404,8 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # unit tests (4 currently: storage + smart-http)
-./tests/smoke.sh            # end-to-end integration test
+cargo test                  # 9 unit tests (storage, smart-http, refs, commits)
+./tests/smoke.sh            # 8-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
 FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
@@ -440,13 +466,27 @@ A: Because M0 is a single-node prototype. Multi-tenant auth is its own
 meaningful design problem — short-lived creds, per-session scopes, key
 rotation — and belongs in M4, not M0.
 
-**Q: Why isn't there a `POST /v1/repos/:id/commits` endpoint (server-side
-commits for no-git-client callers)?**
+**Q: `POST /v1/repos/:id/commits` exists — how does it build commits without
+a native git object writer?**
 
-A: That's listed as M5. It requires writing blob/tree/commit objects directly
-into the object store, which in turn requires a first-class git object
-writer. We're waiting on the `gitoxide` swap (M1) to avoid writing one from
-scratch just to throw it away.
+A: It shells out to git plumbing (`hash-object`, `update-index`,
+`write-tree`, `commit-tree`, `update-ref`) against a per-request temp
+index file. Ugly and slow compared to gitoxide, but it inherits git's own
+semantics exactly — correct tree entry ordering, empty-tree convention,
+delta-over-large-trees — in ~150 lines instead of ~1500. When M1 lands,
+these subprocess calls become `gix::Repository::write_blob()` /
+`write_object()` with no change to the REST surface. This was the right
+tradeoff: deliver the agent-first story now, swap the implementation
+later.
+
+**Q: The 10,000-fork bench shows p99 = 50 ms. Isn't that bad?**
+
+A: It's entirely process-fork overhead in `git http-backend`, not storage.
+A fork op is seven file writes on disk and completes in sub-millisecond;
+the CGI boundary adds the tail. M1 removes it. We chose to ship M0 on top
+of the canonical smart-HTTP server so correctness was free and we could
+measure the fork-is-metadata claim honestly before optimizing the
+protocol path.
 
 **Q: Does it work with isomorphic-git, go-git, jgit?**
 
