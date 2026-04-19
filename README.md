@@ -10,6 +10,28 @@ end-to-end in a day, not a quarter.
 > If you want the *why*, read [ARCHITECTURE.md](./ARCHITECTURE.md). This file
 > is the *what* — the surface, the numbers, and the commands.
 
+## What this is *not*, plainly
+
+- **Not secure out of the box.** HTTP only, no TLS. Tokens travel in the
+  URL (as git clients do) — if you run this over the public internet
+  without TLS in front, you're broadcasting credentials. Put nginx /
+  caddy / cloudflare-tunnel / any TLS terminator in front of the
+  listener before exposing it. See [Security](#security-in-one-paragraph).
+- **Not rate-limited.** The admin token has unlimited create / fork /
+  delete. An insider with it can fill the disk and burn inodes. No
+  quotas, no per-token caps, no audit log.
+- **Not a drop-in for a multi-backend storage story.** `Storage` and
+  `RefStore` are traits with one filesystem impl each. They're trait
+  boundaries, not Spring-style pluggable backends — any real second impl
+  of either depends on the git protocol layer going native (M1b-next),
+  which hasn't happened yet. See [Design decisions](#design-decisions-worth-arguing-about).
+- **Not tested against non-`git` clients.** The protocol work is
+  delegated to `git upload-pack` / `git receive-pack` (for the
+  expensive half) and to a small native pkt-line writer (for the v2
+  capability advertisement). It should work with `libgit2`,
+  `isomorphic-git`, `go-git`, `jgit` — all of them speak the same wire
+  protocol — but the smoke test only exercises CLI `git`.
+
 ## Table of contents
 
 - [Status](#status)
@@ -54,8 +76,8 @@ end-to-end in a day, not a quarter.
 | ---------------------------------------------------------------- | ------ |
 | Native v2 `command=ls-refs` + `command=fetch` (pack generation)  | 🟡 M1b-next |
 | Native `git-receive-pack` equivalent (pack parsing + ref CAS)    | 🟡 M1b-next |
-| Chunked-KV / object-store `Storage` impl (trait is in place)     | 🟡 M2b |
-| Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
+| Chunked-KV / object-store `Storage` impl (trait exists but impl needs native protocol) | 🟡 M2b |
+| Multi-node distributed `RefStore` impl (trait exists; impl needs consensus layer)      | 🟡 M3b |
 | Per-token self-revocation, key rotation, account-level auth      | 🟡 M4b |
 | LFS, replication, PITR, webhooks, metrics                        | 🟡 M6  |
 
@@ -462,6 +484,30 @@ This is how GitHub implements internal fork networks and has since ~2009.
 `.git/objects/info/alternates` is built into git; we're not inventing new
 semantics here.
 
+## Security in one paragraph
+
+Authentication is token-based. Per-repo tokens are minted by the admin
+(via `Authorization: Bearer <admin>`), presented by clients as HTTP
+Basic with username `x`, and stored as SHA-256 hashes in SQLite. The
+admin-token compare is constant-time (`subtle::ConstantTimeEq`) to
+prevent byte-at-a-time timing recovery. **That's the entire model.**
+What's *missing*:
+
+- **TLS.** The server listens HTTP. Run a TLS terminator in front.
+- **Rate limiting.** None. The admin token can mint/delete unbounded.
+- **Account-level auth.** One shared admin token. No revocation of
+  the admin token except restarting the process with a new value.
+- **Token introspection / audit.** Tokens can be revoked but there's
+  no log of who revoked what when. No `GET /v1/tokens` listing.
+- **Path-traversal hardening.** `repo_id` validation rejects slashes
+  and path-escape characters; if a future change loosens the ruleset
+  without updating `FsStorage::repo_path`, traversal becomes
+  reachable. A `Path::components()` defensive check belongs on the
+  repo_path helper.
+
+A prototype for agents you trust talking to a backend you trust over
+an internal / TLS-terminated link. Not a public service.
+
 ## Development
 
 ```sh
@@ -473,7 +519,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 18 unit tests (storage, smart-http, refs, commits, tokens)
+cargo test                  # 23 unit tests (storage, smart-http, refs, commits, tokens, auth)
 ./tests/smoke.sh            # 10-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
@@ -513,6 +559,22 @@ edge. A caller written against M0 should keep working against M6 with no
 code change — same `remote` URL shape, same REST bodies.
 
 ## Design decisions worth arguing about
+
+**Q: The `Storage` / `RefStore` / `TokenStore` traits each have one impl.
+How "abstract" are they, really?**
+
+A: Honestly — for `Storage` and `RefStore`, less than earlier versions
+of this README implied. `TokenStore` has genuine trait value (the
+SQLite vs in-memory split matters for tests and for a future
+account-service backend). For `Storage` and `RefStore`, the four
+trait methods (create / fork / delete / exists) and the two trait
+methods (read / cas_update) *are* clean boundaries — but the expensive
+work (pack generation, object writes, ref-file updates) still goes
+through `cfg.repos_dir().join("…git")` and/or shells out to `git`.
+A non-FS impl of those traits would have to also replace the smart-HTTP
+bridge and the commits plumbing, which means M1b-native is a hard
+prerequisite for M2b/M3b, not an independent axis. The traits are
+*a start*, not a drop-in boundary.
 
 **Q: Why shell out to `git upload-pack` instead of writing the protocol
 natively?**

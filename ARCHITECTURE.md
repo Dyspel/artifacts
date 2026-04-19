@@ -23,21 +23,36 @@ If these three are right, a production system is a matter of scaling and
 polish. If any one is wrong, no amount of scaling saves it.
 
 M0 answered #1 (shell out to `git http-backend`, guaranteed correct) and
-#2 (fork-via-alternates, measured). M3a extracts the CAS boundary — #3 —
-into a trait so the swap to a distributed ref store is a drop-in later.
-The single-node `FsRefStore` delegates to `git update-ref`, which gives us
-file-system CAS today; a future multi-node impl backed by a state machine
-per repo is a local code change that doesn't reach out to the handlers.
+#2 (fork-via-alternates, measured). M3a extracts the ref CAS boundary —
+#3 — into a trait. The single-node `FsRefStore` delegates to
+`git update-ref`, which gives us file-system CAS today.
 
-M2a carves `Storage` out the same way — trait plus one FS impl — so a
-chunked-KV backend drops in once M1 gives us native pack streaming.
-M4a replaces the in-memory token map with a SQLite-backed `TokenStore`
-impl that hashes tokens at rest, supports TTL + revocation as column
-predicates, and survives a server restart.
+M2a carves `Storage` out the same way (four-method trait over the repo
+lifecycle ops) and M4a replaces the in-memory token map with a
+SQLite-backed `TokenStore` impl that hashes tokens at rest.
 
-All three traits (`Storage`, `RefStore`, `TokenStore`) are therefore in
-place before M1 lands. Every swap of a production backend is now an
-additive commit behind a trait that's already wired up.
+### What the traits actually buy us
+
+`TokenStore` is a genuine abstraction: the SQLite impl can be swapped for
+an account-service HTTP client, and neither REST handlers nor git-auth
+code cares. The in-memory impl is real too (tests).
+
+`Storage` and `RefStore` are *partial* abstractions. Their trait methods
+cover create / fork / delete / exists and read / cas_update — correct
+surfaces as far as they go. But the expensive operations — pack
+generation in upload-pack, object writes in the commits plumbing, ref
+file updates inside `git update-ref` — reach around the trait and
+depend on a real on-disk git repo. A non-FS impl of either trait can't
+stand alone; it needs M1b-native (the server-side git protocol written
+in Rust) landing first so pack/object I/O can also go through a
+storage abstraction. Until then, swapping either trait's impl is a
+partial win at best.
+
+In other words: the traits are a down payment on a multi-backend story,
+not the whole thing. They'll earn their keep when M1b-native replaces
+the last subprocess boundaries; until then, they're useful for
+readability and testability rather than as a genuine pluggable-backend
+extension point.
 
 M1a cut out the `git-http-backend` CGI wrapper. The pack handlers
 (`git upload-pack`, `git receive-pack`) are now invoked directly from
@@ -51,7 +66,7 @@ than a larger architectural change.
 git clone https://x:$TOKEN@host/git/:id.git
        │
        ▼
-  axum  ── auth middleware ──► basic/bearer, in-memory token map
+  axum  ── auth middleware ──► basic/bearer, SQLite-backed token store
        │
        │  GET  /git/:id.git/info/refs?service=git-upload-pack
        │  POST /git/:id.git/git-upload-pack
