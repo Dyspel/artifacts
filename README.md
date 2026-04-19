@@ -42,41 +42,49 @@ end-to-end in a day, not a quarter.
 | `POST /v1/repos/:id/commits` — REST-side commits (no git client) | ✅     |
 | CAS refs: 409 `ref_conflict` with `expected` + `current` fields  | ✅     |
 | `RefStore` trait abstraction (FS-backed M0 impl)                 | ✅     |
+| `Storage` trait abstraction (FS-backed M0 impl)                  | ✅     |
+| `TokenStore` trait + SQLite persistence across restart           | ✅     |
+| Tokens with TTL, revocation endpoint, SHA-256 hashed at rest     | ✅     |
 
 **Known not-yet:**
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
 | Native git implementation (replace `git http-backend` shell-out) | 🟡 M1  |
-| Pluggable object store (chunked KV / S3)                         | 🟡 M2  |
+| Chunked-KV / object-store `Storage` impl (trait is in place)     | 🟡 M2b |
 | Multi-node distributed `RefStore` impl (trait is in place)       | 🟡 M3b |
-| Production-grade auth (short-lived creds, revocation)            | 🟡 M4  |
+| Per-token self-revocation, key rotation, account-level auth      | 🟡 M4b |
 | LFS, replication, PITR, webhooks, metrics                        | 🟡 M6  |
 
 ## What's next
 
-**M1 is not done.** The prototype still execs `git http-backend` as a CGI
-subprocess per git request. This is why the p99 of a 10,000-fork run is
-~50 ms instead of sub-millisecond — the process fork dominates, not the
-storage. Everything in [Status](#status) above runs on top of that shell-out.
+**M1 is the last big open item at the M0 tier.** The prototype still execs
+`git http-backend` as a CGI subprocess per git request — the reason the
+p99 of a 10,000-fork run is ~50 ms instead of sub-millisecond. Everything
+in [Status](#status) above runs on top of that shell-out.
 
-The ordering I'd recommend from here:
+Traits are in place for the three extension points a production build
+needs (`Storage`, `RefStore`, `TokenStore`) — landing the second impl of
+each is now an additive commit, not a refactor.
 
-1. **M2 — `Storage` trait** (half session). Mechanical refactor. Extracts
-   a trait from `src/storage.rs`, keeps `FsStorage` as the only impl.
-   Unblocks the chunked-KV story without changing a single handler.
-2. **M4 — persistent + scoped token store** (one session). Tokens survive
-   restart, carry expiry, can be revoked. The current in-memory map is
-   fine for the smoke test and a crime in a real deployment.
-3. **M1 — native smart-HTTP via gitoxide** (multi-session). The big push.
-   Removes the CGI boundary, lets packs stream directly from storage,
-   makes M2's chunked store actually useful. Pkt-line framing, upload-pack
-   negotiation, pack generation from the commit DAG, receive-pack with
-   atomic ref updates. Done right, this is weeks; done wrong, it's
-   endless.
+Remaining work, in order:
 
-M3b (distributed refs) and M6 (replication/LFS/PITR) sit after M1 because
-they assume a real protocol implementation underneath.
+1. **M1 — native smart-HTTP via gitoxide** (multi-session). Removes the
+   CGI boundary, lets packs stream directly from storage. Pkt-line
+   framing, upload-pack negotiation, pack generation from the commit
+   DAG, receive-pack with atomic ref updates through the `RefStore`
+   trait we already have. Also lets the commits handler swap plumbing
+   shell-outs for `gix::Repository::write_*` calls.
+2. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
+   Matches the Cloudflare DO+SQLite shape. Unblocked by M1 because the
+   chunked store is only useful once we can stream packs out of it
+   without touching disk.
+3. **M3b — distributed `RefStore` impl.** Second impl of the trait.
+   Per-repo state machine for multi-node CAS.
+4. **M4b — per-token self-revoke, account-level credentials, key
+   rotation.** Extensions on top of the SQLite-backed token store now
+   in place.
+5. **M6** — replication, snapshots, PITR, LFS, webhooks, metrics.
 
 ## Numbers we just measured
 
@@ -223,17 +231,48 @@ POST /v1/repos/:id/tokens
 Authorization: Bearer <admin>
 Content-Type: application/json
 
-{ "scope": "read" }
+{
+  "scope": "read",
+  "ttlSeconds": 3600          // optional; omit for no expiry
+}
 ```
 
 Scope is `"read"` or `"write"`. Response:
 
 ```json
 {
-  "token": "...",
-  "remote": "http://x:...@host/git/...git"
+  "token":    "...",
+  "remote":   "http://x:...@host/git/...git",
+  "expiresAt": 1734567890     // unix epoch seconds, null if no TTL
 }
 ```
+
+Tokens are stored as SHA-256 hashes in `<data-dir>/tokens.db` (SQLite).
+A restart of the server does *not* invalidate them — this is the
+whole point of M4's persistence layer.
+
+### Revoke a token
+
+```
+POST /v1/tokens/revoke
+Authorization: Bearer <admin>
+Content-Type: application/json
+
+{ "token": "<the raw token>" }
+```
+
+Response:
+
+```json
+{ "revoked": true }           // false = already revoked or unknown
+```
+
+Why POST with the token in the body instead of `DELETE /tokens/:token`?
+Because paths land in access logs. Bodies don't. This keeps revoked
+tokens out of log archives.
+
+Revocation is idempotent. A second revoke of the same token returns
+`{ "revoked": false }`.
 
 ### Delete a repo
 
@@ -337,13 +376,14 @@ artifacts/
 │   ├── error.rs               error type + IntoResponse + WWW-Authenticate
 │   ├── tokens.rs              in-memory token store, scopes
 │   ├── auth.rs                Basic/Bearer extraction + authorization helpers
+│   ├── tokens.rs              TokenStore trait + InMemory + SQLite impls
 │   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
-│   ├── storage.rs             bare-repo storage, fork-via-alternates (THE CORE)
+│   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
 │   ├── smart_http.rs          CGI bridge to git-http-backend
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
-│   └── rest.rs                REST endpoints (create / fork / tokens / delete)
+│   └── rest.rs                REST endpoints (create / fork / tokens / revoke / delete)
 ├── tests/
-│   └── smoke.sh               8-step end-to-end: create → clone → push → fork → scopes → REST commits
+│   └── smoke.sh               10-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart
 └── scripts/
     └── bench_fork.sh          10,000-fork benchmark; measures disk + latency
 ```
@@ -352,6 +392,7 @@ Under `$DATA_DIR` at runtime:
 
 ```
 data/
+├── tokens.db                  SQLite — minted tokens (hashed), expiry, revocation
 └── repos/
     ├── abc12...xy.git/        bare git repo (source)
     │   ├── HEAD
@@ -404,8 +445,8 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 9 unit tests (storage, smart-http, refs, commits)
-./tests/smoke.sh            # 8-step end-to-end integration test
+cargo test                  # 15 unit tests (storage, smart-http, refs, commits, tokens)
+./tests/smoke.sh            # 10-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
 FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
@@ -422,14 +463,16 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 
 | Milestone | Status | Scope | Replaces |
 | --------- | ------ | ----- | -------- |
-| **M0** | ✅ done | single-node prototype, `git http-backend` CGI, in-memory tokens | — |
+| **M0**  | ✅ done | single-node prototype, `git http-backend` CGI, smart-HTTP bridge, alternates-based forks | — |
 | **M3a** | ✅ done | `RefStore` trait extracted; `FsRefStore` shells out to `update-ref` for CAS | direct ref writes |
-| **M5** | ✅ done | `POST /v1/repos/:id/commits` — REST-side commits with CAS, delete + write, CAS-conflict 409 | no serverless-friendly commit surface |
-| **M1** | 🟡 next | native smart-HTTP via `gitoxide`; no CGI boundary | `git http-backend`, fork-per-request |
-| **M2** | 🟡 | pluggable `Storage` trait: `FsStorage` + `ChunkedStorage` (objects in KV/S3, matching DO+SQLite shape) | bare repos on disk |
-| **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). Trait + callers already in place. | single-node CAS |
-| **M4** | 🟡 | real auth: short-lived, scoped, revocable tokens; issuer separate from the data plane | in-memory token map |
-| **M6** | 🟡 | replication, snapshots, PITR, LFS, webhooks, metrics | — |
+| **M5**  | ✅ done | `POST /v1/repos/:id/commits` — REST-side commits with CAS, delete + write, 409 body on conflict | no serverless-friendly commit surface |
+| **M2a** | ✅ done | `Storage` trait extracted; `FsStorage` is the sole impl. Handlers are now backend-neutral. | direct struct calls |
+| **M4a** | ✅ done | `TokenStore` trait + SQLite-backed persistent store with TTL, revocation, hash-at-rest; `POST /v1/tokens/revoke` endpoint | in-memory token map |
+| **M1**  | 🟡 next | native smart-HTTP via `gitoxide`; no CGI boundary | `git http-backend`, fork-per-request |
+| **M2b** | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. Blocked on M1 (pack streaming wants a native protocol). | bare repos on disk |
+| **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO) | single-node CAS |
+| **M4b** | 🟡 | per-token self-revoke, account-level auth, key rotation | admin-only token management |
+| **M6**  | 🟡 | replication, snapshots, PITR, LFS, webhooks, metrics | — |
 
 Each milestone is designed to land without breaking the API surface at the
 edge. A caller written against M0 should keep working against M6 with no
@@ -478,6 +521,26 @@ these subprocess calls become `gix::Repository::write_blob()` /
 `write_object()` with no change to the REST surface. This was the right
 tradeoff: deliver the agent-first story now, swap the implementation
 later.
+
+**Q: Tokens live in SQLite — why not a HashMap or Redis?**
+
+A: SQLite is the smallest thing that gives us durability + WAL concurrency
++ column-level predicates (expiry and revocation are a `WHERE` clause, not
+a sweep) with zero operational cost. A HashMap evaporates on restart,
+which is genuinely broken UX for agent sessions that outlive a deploy.
+Redis would add a network hop and an external daemon for a prototype
+that's happy with file-backed durability. When multi-node arrives, this
+moves to a real issuer service — which is M4b and already has the trait
+carved out.
+
+**Q: Why SHA-256 the tokens in the db when the server is already behind
+HTTPS and admin auth?**
+
+A: Defense in depth. Anyone who exfiltrates `tokens.db` (backup tape, a
+dev laptop, an accidental git check-in) gets hashes, not tokens. The hash
+is two lines and zero runtime cost — free belt-and-suspenders. If we ever
+add a breach-notification path, "the DB leaked but no tokens were
+compromised" is a much better sentence than the alternative.
 
 **Q: The 10,000-fork bench shows p99 = 50 ms. Isn't that bad?**
 

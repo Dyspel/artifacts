@@ -29,6 +29,16 @@ The single-node `FsRefStore` delegates to `git update-ref`, which gives us
 file-system CAS today; a future multi-node impl backed by a state machine
 per repo is a local code change that doesn't reach out to the handlers.
 
+M2a carves `Storage` out the same way — trait plus one FS impl — so a
+chunked-KV backend drops in once M1 gives us native pack streaming.
+M4a replaces the in-memory token map with a SQLite-backed `TokenStore`
+impl that hashes tokens at rest, supports TTL + revocation as column
+predicates, and survives a server restart.
+
+All three traits (`Storage`, `RefStore`, `TokenStore`) are therefore in
+place before M1 lands. Every swap of a production backend is now an
+additive commit behind a trait that's already wired up.
+
 ## Prototype shape
 
 ```
