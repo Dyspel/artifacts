@@ -129,19 +129,82 @@ fn service_from_query(query: &str) -> Result<&'static str> {
     ))
 }
 
-/// Handle `GET /info/refs?service=...`. Runs
-/// `git {subcommand} --stateless-rpc --advertise-refs <dir>` and prepends
-/// the smart-HTTP service preamble expected by git clients:
+/// Detect the "I want v2" header from a git client. Git sends it as
+/// `Git-Protocol: version=2`, sometimes as a colon-joined list like
+/// `version=2:agent=git/2.43`, so we scan for the `version=2` token.
+fn wants_v2(headers: &HeaderMap) -> bool {
+    headers
+        .get("git-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(|c: char| c == ':' || c == ',')
+                .any(|s| s.trim() == "version=2")
+        })
+        .unwrap_or(false)
+}
+
+/// Native v2 capability advertisement for `info/refs`.
 ///
-///   0018# service=git-upload-pack\n0000<raw --advertise-refs output>
+/// For protocol v2, the `info/refs` response is a fixed list of capability
+/// pkt-lines — *no refs yet*. The client fetches refs in a subsequent
+/// `POST /git-upload-pack` with `command=ls-refs`. Since the advertisement
+/// is static (it doesn't depend on the repo), we build it in-process
+/// instead of forking to `git upload-pack --advertise-refs`.
 ///
-/// The 4-hex prefix on the first line is a standard pkt-line length; the
-/// `0000` immediately after is a flush-pkt marking the end of the preamble.
+/// The capability set we advertise is a conservative subset of what modern
+/// `git upload-pack` publishes — enough for clone/fetch/push, nothing that
+/// would promise behavior the fall-through shell-out to upload-pack
+/// doesn't already provide. When the POST lands it still goes through
+/// `git upload-pack`, which handles the commands for real.
+fn native_v2_info_refs(service: &'static str) -> Result<Response<Body>> {
+    let mut body = Vec::with_capacity(256);
+    // Smart-HTTP service preamble — same as the shell-out path emits.
+    body.extend_from_slice(pkt_line(&format!("# service={service}\n")).as_bytes());
+    body.extend_from_slice(b"0000");
+    // v2 capability pkt-lines. Each terminates with '\n' per the spec.
+    body.extend_from_slice(pkt_line("version 2\n").as_bytes());
+    body.extend_from_slice(pkt_line("agent=artifacts/0.0.1\n").as_bytes());
+    body.extend_from_slice(pkt_line("ls-refs=unborn\n").as_bytes());
+    body.extend_from_slice(pkt_line("fetch=shallow\n").as_bytes());
+    body.extend_from_slice(pkt_line("object-format=sha1\n").as_bytes());
+    // Flush-pkt ending the advertisement.
+    body.extend_from_slice(b"0000");
+
+    let content_type = format!("application/x-{service}-advertisement");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+}
+
+/// Handle `GET /info/refs?service=...`.
+///
+/// Fast path: if the client signaled `Git-Protocol: version=2`, we emit
+/// the v2 capability advertisement natively — no subprocess. Nearly every
+/// modern git client (≥2.26) uses v2 by default, so this covers the
+/// common case.
+///
+/// Fallback: for v0/v1 (no header, or an older client that explicitly
+/// opts out of v2), we shell out to `git {sub} --advertise-refs`, which
+/// produces the ref-listing response v1 clients expect. The v1
+/// advertisement depends on current refs + capabilities of the server's
+/// git binary, so doing it natively would need its own implementation;
+/// the v1 path is rare enough that the shell-out is acceptable.
+///
+/// In both cases we prepend the smart-HTTP preamble:
+///
+///   001e# service=git-upload-pack\n0000<body>
 async fn info_refs(
     repo_path: &Path,
     service: &'static str,
     headers: &HeaderMap,
 ) -> Result<Response<Body>> {
+    if wants_v2(headers) {
+        return native_v2_info_refs(service);
+    }
+
     let sub = service
         .strip_prefix("git-")
         .expect("service validated by service_from_query");
@@ -305,6 +368,53 @@ mod tests {
             pkt_line("# service=git-upload-pack\n"),
             "001e# service=git-upload-pack\n"
         );
+    }
+
+    #[test]
+    fn wants_v2_parses_header_formats() {
+        use axum::http::HeaderValue;
+
+        let mk = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("git-protocol", HeaderValue::from_str(v).unwrap());
+            h
+        };
+        assert!(wants_v2(&mk("version=2")));
+        assert!(wants_v2(&mk("version=2:agent=git/2.43")));
+        assert!(wants_v2(&mk("agent=git/2.43,version=2")));
+        assert!(!wants_v2(&mk("version=1")));
+        assert!(!wants_v2(&mk("")));
+        assert!(!wants_v2(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn native_v2_info_refs_has_expected_shape() {
+        let resp = native_v2_info_refs("git-upload-pack").unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-advertisement"
+        );
+        // Extract the body synchronously; response was built from a Vec<u8>
+        // so we know it's fully in memory.
+        let body = futures::executor::block_on(axum::body::to_bytes(
+            resp.into_body(),
+            1024 * 1024,
+        ))
+        .unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        // Preamble.
+        assert!(s.starts_with("001e# service=git-upload-pack\n0000"),
+            "unexpected preamble, got: {:?}", &s[..40.min(s.len())]);
+        // Version line + terminating flush-pkt.
+        assert!(s.contains("000eversion 2\n"),
+            "missing v2 version line in {s:?}");
+        assert!(s.ends_with("0000"),
+            "missing trailing flush-pkt in {s:?}");
+        // Fetch capability must be present so clients actually negotiate
+        // a fetch with us (without this the client errors out).
+        assert!(s.contains("fetch=shallow\n"));
+        assert!(s.contains("ls-refs=unborn\n"));
     }
 
     #[test]
