@@ -59,8 +59,12 @@ echo "==> building"
 cargo build --quiet
 
 start_server() {
+    # Tight quota + blob cap so the steps below that exercise them
+    # don't have to burn through production-sized limits.
     ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
     ARTIFACTS_JWT_SECRET="$JWT_SECRET" \
+    ARTIFACTS_MAX_REPOS_PER_USER=3 \
+    ARTIFACTS_MAX_COMMIT_BLOB_BYTES=1024 \
         ./target/debug/artifacts serve \
             --data-dir "$DATA_DIR" \
             --bind "$BIND" \
@@ -378,6 +382,72 @@ alice_revoke_code=$(curl -sS -o /dev/null -w '%{http_code}' \
 [[ "$alice_revoke_code" == "403" ]] \
     || { echo "FAIL: alice revoke expected 403 (admin-only), got $alice_revoke_code"; exit 1; }
 echo "    non-admin JWT → /v1/tokens/revoke → 403 (admin-only)"
+
+# Per-user repo-count quota. Server was started with limit=3; alice
+# already owns one (from step 11). Create two more, then expect 429
+# quota_exceeded on the fourth.
+echo "==> [12] per-user repo-count quota"
+for i in 2 3; do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        -X POST "${alice_auth[@]}" "$BASE_URL/v1/repos")
+    [[ "$code" == "200" ]] \
+        || { echo "FAIL: alice create #$i expected 200, got $code"; exit 1; }
+done
+quota_body="${WORK_DIR}/quota_body.json"
+quota_code=$(curl -sS -o "$quota_body" -w '%{http_code}' \
+    -X POST "${alice_auth[@]}" "$BASE_URL/v1/repos")
+[[ "$quota_code" == "429" ]] \
+    || { echo "FAIL: alice create over-quota expected 429, got $quota_code"; cat "$quota_body"; exit 1; }
+quota_code_field=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["code"])' < "$quota_body")
+[[ "$quota_code_field" == "quota_exceeded" ]] \
+    || { echo "FAIL: wanted code quota_exceeded, got $quota_code_field"; exit 1; }
+echo "    alice 4th repo → 429 quota_exceeded (limit: 3)"
+
+# Different user: bob has 0 repos, should succeed and consume 1 of his 3.
+# Capture the id too — step 13 commits to this repo.
+bob_create_body="${WORK_DIR}/bob_create.json"
+bob_create_code=$(curl -sS -o "$bob_create_body" -w '%{http_code}' \
+    -X POST "${bob_auth[@]}" "$BASE_URL/v1/repos")
+[[ "$bob_create_code" == "200" ]] \
+    || { echo "FAIL: bob's first repo expected 200 (separate quota), got $bob_create_code"; exit 1; }
+bob_repo=$(json id < "$bob_create_body")
+echo "    bob first repo → 200 (quotas are per-user); id=$bob_repo"
+
+# Admin bypasses quota — creating via admin still works even after
+# alice is over limit and bob has burned some of his.
+admin_unlimited=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${auth[@]}" "$BASE_URL/v1/repos")
+[[ "$admin_unlimited" == "200" ]] \
+    || { echo "FAIL: admin create should bypass quota, got $admin_unlimited"; exit 1; }
+echo "    admin create → 200 (bypasses quota)"
+
+# Per-blob size cap. Server was started with max_commit_blob_bytes=1024.
+# Reuse the repo bob created above; commit a blob larger than the cap.
+echo "==> [13] per-blob size cap on REST commits"
+# Build a 2KB blob in python (over the 1KB cap).
+big_content=$(python3 -c 'print("x" * 2000)')
+big_body=$(python3 -c 'import json,sys; print(json.dumps({
+    "branch":"main","parent":None,"message":"too big",
+    "changes":[{"op":"write","path":"big.txt","content":"'"$big_content"'"}]
+}))')
+blob_body="${WORK_DIR}/blob_body.json"
+blob_code=$(curl -sS -o "$blob_body" -w '%{http_code}' \
+    -X POST "${bob_auth[@]}" -H 'Content-Type: application/json' \
+    -d "$big_body" "$BASE_URL/v1/repos/${bob_repo}/commits")
+[[ "$blob_code" == "400" ]] \
+    || { echo "FAIL: oversized blob expected 400, got $blob_code"; cat "$blob_body"; exit 1; }
+grep -q 'over limit of' "$blob_body" \
+    || { echo "FAIL: error body should mention the blob-size limit; got:"; cat "$blob_body"; exit 1; }
+echo "    2 KB blob with 1 KB cap → 400 (bad_request)"
+
+# Under-cap commit works on the same repo.
+small_body='{"branch":"main","parent":null,"message":"ok","changes":[{"op":"write","path":"ok.txt","content":"small"}]}'
+ok_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${bob_auth[@]}" -H 'Content-Type: application/json' \
+    -d "$small_body" "$BASE_URL/v1/repos/${bob_repo}/commits")
+[[ "$ok_code" == "200" ]] \
+    || { echo "FAIL: under-cap commit expected 200, got $ok_code"; exit 1; }
+echo "    under-cap commit on same repo → 200"
 
 echo
 echo "==> all checks passed"

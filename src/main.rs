@@ -76,8 +76,16 @@ enum Cmd {
         /// enough that a legitimate heavy user doesn't hit it; low
         /// enough that a misbehaving one can't fill the disk before
         /// someone notices.
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, env = "ARTIFACTS_MAX_REPOS_PER_USER", default_value_t = 100)]
         max_repos_per_user: u64,
+
+        /// Maximum size in bytes of any single file in a REST-side
+        /// commit. Default 8 MB. Applies to both `content` (UTF-8) and
+        /// `contentBase64` after decoding. Files larger than this
+        /// should go through `git push` (the smart-HTTP endpoints
+        /// stream; this one doesn't) or, eventually, LFS.
+        #[arg(long, env = "ARTIFACTS_MAX_COMMIT_BLOB_BYTES", default_value_t = 8 * 1024 * 1024)]
+        max_commit_blob_bytes: usize,
 
         /// Opt-in to binding a non-loopback address with `http://`.
         /// Without this flag we refuse to start in that combination,
@@ -112,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             jwt_secret,
             token_db,
             max_repos_per_user,
+            max_commit_blob_bytes,
             allow_insecure,
         } => {
             // Refuse to start in the "non-loopback bind + plaintext HTTP"
@@ -137,8 +146,13 @@ async fn main() -> anyhow::Result<()> {
                 admin_token,
                 jwt_secret,
                 max_repos_per_user,
+                max_commit_blob_bytes,
             });
-            tracing::info!(limit = max_repos_per_user, "max repos per non-admin user");
+            tracing::info!(
+                max_repos_per_user,
+                max_commit_blob_bytes,
+                "non-admin quotas"
+            );
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));

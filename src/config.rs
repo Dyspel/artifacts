@@ -14,6 +14,14 @@ pub struct Config {
     /// to both `create_repo` and `fork_repo`. Admin bypasses. Set via
     /// `--max-repos-per-user`.
     pub max_repos_per_user: u64,
+
+    /// Maximum size in bytes of any single file in a REST-side commit.
+    /// Applies to both `content` and `contentBase64` bodies (the cap is
+    /// on the decoded bytes). Big-blob uploads through this endpoint
+    /// are always a red flag — the commits handler spawns `git
+    /// hash-object` per file, which pins memory proportional to blob
+    /// size during its run.
+    pub max_commit_blob_bytes: usize,
 }
 
 impl Config {

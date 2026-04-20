@@ -240,6 +240,19 @@ pub async fn create_commit(
                         Error::BadRequest(format!("change for {path}: bad base64: {e}"))
                     })?,
                 };
+                // Size cap. REST-side commits are not appropriate for big
+                // binary blobs — each one goes through `git hash-object`
+                // as a buffered subprocess call, and the bytes sit in
+                // memory twice (the JSON buffer, the Vec<u8>). Push
+                // via git (smart-HTTP streams) for anything bigger.
+                let max = state.cfg.max_commit_blob_bytes;
+                if bytes.len() > max {
+                    return Err(Error::BadRequest(format!(
+                        "change for {path}: blob is {} bytes, over limit of {} bytes",
+                        bytes.len(),
+                        max
+                    )));
+                }
                 // hash-object writes the blob into the object database and
                 // prints the SHA.
                 let (rc, stdout, stderr) = run_git(
