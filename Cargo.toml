@@ -37,6 +37,19 @@ jsonwebtoken = "9"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
+# GUI-only deps; opt-in via `--features gui` so the server binary stays lean.
+eframe = { version = "0.27", optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:ureq"]
+
+[[bin]]
+name = "artifacts-gui"
+path = "src/bin/artifacts-gui.rs"
+required-features = ["gui"]
+
 [dev-dependencies]
 tempfile = "3"
 
