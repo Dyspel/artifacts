@@ -7,6 +7,7 @@ mod metrics;
 mod ownership;
 mod rate_limit;
 mod refs;
+mod request_id;
 mod rest;
 mod smart_http;
 mod storage;
@@ -29,7 +30,6 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tower_http::trace::TraceLayer;
 
 #[derive(Parser)]
 #[command(name = "artifacts", version, about = "Versioned filesystem that speaks Git")]
@@ -225,7 +225,11 @@ async fn main() -> anyhow::Result<()> {
                         .route("/:id/*rest", get(smart_http::git_handler).post(smart_http::git_handler))
                         .with_state(git_state),
                 )
-                .layer(TraceLayer::new_for_http());
+                // Request-ID middleware wraps *everything* (including
+                // /metrics and /git) so every served request gets an
+                // id and a one-line structured log. Runs outermost so
+                // the span covers the full request lifecycle.
+                .layer(axum_middleware::from_fn(request_id::instrument));
 
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!(%bind, data_dir = %data_dir.display(), "artifacts listening");
