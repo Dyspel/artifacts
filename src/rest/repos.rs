@@ -385,3 +385,425 @@ pub async fn list_repos(
     );
     Ok(Response::from_parts(parts, body))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        create_repo, delete_repo, fork_repo, list_repos, AuthnState, DataState, ObservState,
+        RestState, RuntimeState,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::{delete, post},
+        Router,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    use tower::ServiceExt;
+
+    const ADMIN: &str = "admin-token-for-rest-router-tests-01234567";
+    const JWT_SECRET: &str = "rest-router-test-secret";
+
+    fn build_state(dir: &std::path::Path) -> RestState {
+        let data_dir = dir.to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        RestState {
+            cfg: Arc::new(cfg),
+            data: DataState {
+                storage: Arc::new(storage),
+                ownership: Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: Arc::new(crate::refs::MemRefStore::new()),
+                objects: Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: Arc::new(crate::alternates_cache::AlternatesCache::new()),
+            },
+            authn: AuthnState {
+                tokens: Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .route("/v1/repos", post(create_repo).get(list_repos))
+            .route("/v1/repos/:id", delete(delete_repo))
+            .route("/v1/repos/:id/forks", post(fork_repo))
+            .with_state(build_state(dir))
+    }
+
+    fn user_jwt(subject: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: String,
+            exp: usize,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        encode(
+            &Header::default(),
+            &Claims {
+                sub: subject.to_string(),
+                exp,
+            },
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap()
+    }
+
+    async fn send(app: &Router, r: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(r).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    // ── create_repo ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_repo_as_admin_records_null_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["id"].as_str().unwrap().to_string();
+        // List as admin → owner should be null (admin-owned).
+        let (_, list) = send(&a, req("GET", "/v1/repos", Some(ADMIN), None)).await;
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone();
+        assert!(entry["owner"].is_null());
+    }
+
+    #[tokio::test]
+    async fn create_repo_as_jwt_user_records_subject_as_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, body) = send(&a, req("POST", "/v1/repos", Some(&jwt), Some("{}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["id"].as_str().unwrap().to_string();
+        // Listing as alice → one repo with owner == "alice".
+        let (_, list) = send(&a, req("GET", "/v1/repos", Some(&jwt), None)).await;
+        let entry = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone();
+        assert_eq!(entry["owner"], "alice");
+    }
+
+    // ── list_repos pagination + owner scoping ─────────────────────────────
+
+    #[tokio::test]
+    async fn list_repos_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let (status, page0) = send(
+            &a,
+            req("GET", "/v1/repos?limit=1&offset=0", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page0.as_array().map(|a| a.len()), Some(1));
+
+        let (status, page1) = send(
+            &a,
+            req("GET", "/v1/repos?limit=1&offset=1", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page1.as_array().map(|a| a.len()), Some(1));
+        assert_ne!(page0[0]["id"], page1[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn list_repos_owner_scoping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt_alice = user_jwt("alice");
+        let jwt_bob = user_jwt("bob");
+        // alice creates one repo, bob creates one.
+        let (_, alice_body) =
+            send(&a, req("POST", "/v1/repos", Some(&jwt_alice), Some("{}"))).await;
+        let alice_id = alice_body["id"].as_str().unwrap().to_string();
+        send(&a, req("POST", "/v1/repos", Some(&jwt_bob), Some("{}"))).await;
+
+        // Alice sees only her repo.
+        let (status, list) = send(&a, req("GET", "/v1/repos", Some(&jwt_alice), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], alice_id);
+    }
+
+    // ── fork_repo ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fork_repo_writable_sets_write_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let src = body["id"].as_str().unwrap().to_string();
+        let (status, fork_body) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{src}/forks"),
+                Some(ADMIN),
+                Some(r#"{"readOnly":false}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(fork_body["id"].as_str().is_some());
+        assert!(fork_body["token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn fork_repo_read_only_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let src = body["id"].as_str().unwrap().to_string();
+        let (status, fork_body) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{src}/forks"),
+                Some(ADMIN),
+                Some(r#"{"readOnly":true}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(fork_body["id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn fork_repo_missing_source_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo/forks",
+                Some(ADMIN),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fork_repo_non_owner_jwt_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // alice creates a repo.
+        let jwt_alice = user_jwt("alice");
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt_alice), Some("{}"))).await;
+        let src = body["id"].as_str().unwrap().to_string();
+        // bob tries to fork it → 403.
+        let jwt_bob = user_jwt("bob");
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{src}/forks"),
+                Some(&jwt_bob),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ── delete_repo ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_repo_missing_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req("DELETE", "/v1/repos/no-such-repo", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_with_dependent_fork_without_force_is_409() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, parent_body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let parent_id = parent_body["id"].as_str().unwrap().to_string();
+        // Fork the parent.
+        send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{parent_id}/forks"),
+                Some(ADMIN),
+                Some("{}"),
+            ),
+        )
+        .await;
+        // Delete without force → 409 fork_dependency.
+        let (status, body) = send(
+            &a,
+            req(
+                "DELETE",
+                &format!("/v1/repos/{parent_id}"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "fork_dependency");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_with_force_orphans_fork_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, parent_body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let parent_id = parent_body["id"].as_str().unwrap().to_string();
+        // Fork the parent.
+        send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{parent_id}/forks"),
+                Some(ADMIN),
+                Some("{}"),
+            ),
+        )
+        .await;
+        // Delete with force=true → 200.
+        let (status, body) = send(
+            &a,
+            req(
+                "DELETE",
+                &format!("/v1/repos/{parent_id}?force=true"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_cascade_deletes_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // Create parent.
+        let (_, parent_body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let parent_id = parent_body["id"].as_str().unwrap().to_string();
+        // Fork the parent (dependent fork).
+        let (_, fork_body) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{parent_id}/forks"),
+                Some(ADMIN),
+                Some("{}"),
+            ),
+        )
+        .await;
+        let fork_id = fork_body["id"].as_str().unwrap().to_string();
+        // cascade=true deletes both parent and fork.
+        let (status, body) = send(
+            &a,
+            req(
+                "DELETE",
+                &format!("/v1/repos/{parent_id}?cascade=true"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let deleted = body["deleted"].as_array().unwrap();
+        assert!(deleted.iter().any(|v| v == &parent_id));
+        assert!(deleted.iter().any(|v| v == &fork_id));
+    }
+
+    #[tokio::test]
+    async fn delete_repo_force_and_cascade_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, err) = send(
+            &a,
+            req(
+                "DELETE",
+                &format!("/v1/repos/{id}?force=true&cascade=true"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["error"]["code"], "bad_request");
+    }
+}
