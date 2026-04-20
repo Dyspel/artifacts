@@ -1,5 +1,12 @@
 # Test coverage
 
+**~91% line coverage** (`cargo-tarpaulin`, `src/main.rs` excluded — see
+below), across 596 in-crate unit tests + 8 integration test binaries +
+doctests. The remaining lines are the deliberately-uncovered set
+documented at the bottom (dead status arms, corruption guards,
+`#[cfg(not(unix))]` fallbacks, macro-attributed lines, invariant
+guards) plus a few deep protocol/error branches.
+
 ## How it's measured
 
 ```
