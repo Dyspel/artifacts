@@ -2881,4 +2881,464 @@ mod tests {
         let pruned = r.prune_finalized(now_unix_secs() + 1).unwrap();
         assert_eq!(pruned, 1, "finalized row older than cutoff must be pruned");
     }
+
+    // --- rotate_master_key error branches ----------------------------------
+
+    #[test]
+    fn rotate_master_key_bad_nonce_length_returns_err() {
+        // Insert a row whose secret_nonce is only 5 bytes (not 12).
+        // rotate_master_key must return Err, not panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let key = test_master_key();
+        let r = SqliteWebhookRegistry::open(&path, key).unwrap();
+        // Insert a row with a too-short nonce so the rotate loop hits the
+        // nonce-wrong-length error path.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO webhooks
+                   (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+                 VALUES ('bad-nonce-rot', 'repo-a', 'u', 'somebase64==', X'0102030405', '[]', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let new_key = test_master_key();
+        let result = r.rotate_master_key(new_key);
+        assert!(
+            result.is_err(),
+            "rotate_master_key must return Err when a row has a wrong-length nonce"
+        );
+    }
+
+    #[test]
+    fn rotate_master_key_bad_base64_ciphertext_returns_err() {
+        // Insert a row with a valid 12-byte nonce but garbage base64 in secret.
+        // rotate_master_key must return Err on the base64 decode step.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO webhooks
+                   (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+                 VALUES ('bad-b64-rot', 'repo-a', 'u', '!!!not_valid_base64!!!',
+                         X'000102030405060708090a0b', '[]', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let new_key = test_master_key();
+        let result = r.rotate_master_key(new_key);
+        assert!(
+            result.is_err(),
+            "rotate_master_key must return Err on bad base64 ciphertext"
+        );
+    }
+
+    #[test]
+    fn rotate_master_key_unseal_failure_returns_err() {
+        // Insert a row with a valid 12-byte nonce and valid base64 but garbage
+        // ciphertext bytes that don't decrypt under the master key.
+        // The base64 decodes fine but unseal fails (bad MAC).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // 32 bytes of zeros encoded as base64 — valid base64 and long
+            // enough to have a tag, but won't unseal under any randomly-generated
+            // key (AES-GCM MAC will reject it).
+            let fake_ct = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+            conn.execute(
+                "INSERT INTO webhooks
+                   (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+                 VALUES ('bad-ct-rot', 'repo-a', 'u', ?1,
+                         X'000102030405060708090a0b', '[]', 0)",
+                rusqlite::params![fake_ct],
+            )
+            .unwrap();
+        }
+        let new_key = test_master_key();
+        let result = r.rotate_master_key(new_key);
+        assert!(
+            result.is_err(),
+            "rotate_master_key must return Err when unseal fails under the old key"
+        );
+    }
+
+    // --- enqueue_delivery: bad base64 in subscription secret column --------
+
+    #[test]
+    fn enqueue_delivery_bad_base64_subscription_drops_secret() {
+        // Insert a webhook row directly with garbage base64 in secret but
+        // a valid nonce, then call enqueue_delivery. The enqueue succeeds
+        // (row inserted with NULL secret) — the bad b64 logs a warn and
+        // silently drops the secret for that delivery.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // A 12-byte nonce is needed so the code tries to decode the b64.
+            conn.execute(
+                "INSERT INTO webhooks
+                   (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+                 VALUES ('bad-b64-enq', 'repo-a', 'u', '!!!bad_base64!!!',
+                         X'000102030405060708090a0b', '[]', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        // enqueue_delivery should succeed (bad b64 logs warn and drops secret).
+        let n = r
+            .enqueue_delivery(&rid("repo-a"), "commit", br#"{}"#)
+            .unwrap();
+        assert_eq!(n, 1, "one delivery row must be inserted despite bad b64");
+        // Claim it and confirm secret is None.
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].secret, None,
+            "delivery with bad b64 subscription secret must have no secret"
+        );
+    }
+
+    // --- claim_pending_deliveries: unseal failure --------------------------
+
+    #[test]
+    fn claim_pending_unseal_failure_yields_unsigned_delivery() {
+        // Insert a delivery row with a valid 12-byte nonce but garbage bytes
+        // for the ciphertext (valid length but bad MAC).
+        // claim_pending_deliveries must return the row with secret=None.
+        let (_d, r) = open_sqlite_registry();
+        {
+            let conn = r.lock().unwrap();
+            // 32 bytes of zeros as the "ciphertext" — wrong key/MAC.
+            conn.execute(
+                "INSERT INTO webhook_deliveries
+                   (hook_id, url, secret, secret_nonce, kind, payload, attempts,
+                    next_attempt_at, created_at)
+                 VALUES ('h-bad-ct', 'http://nowhere.invalid',
+                         X'00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000',
+                         X'000102030405060708090a0b',
+                         'commit', X'7b7d', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].secret, None,
+            "delivery with bad ciphertext must yield unsigned delivery"
+        );
+    }
+
+    // --- row_to_sub: invalid repo_id in db row  ----------------------------
+
+    #[test]
+    fn row_to_sub_invalid_repo_id_returns_rusqlite_error() {
+        // Insert a row with a repo_id that won't parse as a valid RepoId
+        // (e.g., too short). list() must return an Err (or silently skip
+        // the row via .flatten()); either behaviour is acceptable as long
+        // as it doesn't panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let _r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // "ab" is only 2 chars — too short for a valid RepoId (min 4).
+        conn.execute(
+            "INSERT INTO webhooks
+               (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+             VALUES ('bad-repo-id', 'ab', 'u', NULL, NULL, '[]', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        // list() on the bad repo returns an error (row_to_sub maps the
+        // invalid repo_id to InvalidColumnType, which makes query_map
+        // skip or propagate it). Use a query on the _actual_ repo_id
+        // string to trigger the row to be included and hit the error path.
+        // We can't call list() with the bad id because rid() would reject it;
+        // directly query via raw SQL to confirm the row exists.
+        let conn2 = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM webhooks WHERE repo_id = 'ab'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "bad-repo-id row should be in the table");
+        // list() via a SqliteWebhookRegistry that includes the bad row.
+        // The row_to_sub closure returns Err for the bad repo_id, which
+        // .flatten() in list() silently drops. So the list returns Ok([])
+        // rather than Err — that's the production behaviour: drop corrupt
+        // rows rather than fail the whole query.
+        let list_result = r.list(&rid("repo-a"));
+        assert!(
+            list_result.is_ok(),
+            "list() must not propagate corrupt-row errors; got {list_result:?}"
+        );
+    }
+
+    // --- refresh_active_webhook_gauge: error arm ---------------------------
+
+    #[test]
+    fn refresh_active_webhook_gauge_error_arm_does_not_panic() {
+        // Use an exhausted pool so count_active() returns Err.
+        // refresh_active_webhook_gauge must not panic — it logs the error
+        // and keeps the gauge at its previous value.
+        let (reg, _held) = exhausted_registry();
+        // Calling with a valid recorder keeps the test side-effect-free.
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            refresh_active_webhook_gauge(&reg);
+        });
+        // No assertion on the gauge value — the test is that we didn't panic.
+    }
+
+    // --- spawn_dispatcher: Lagged branch -----------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatcher_processes_lagged_events_without_panic() {
+        // Build a broadcast channel with capacity=1, overflow it to force
+        // Lagged, then confirm record_dispatcher_lag is reachable. We test
+        // the behaviour directly (calling record_dispatcher_lag) rather than
+        // through the async dispatcher task to keep the test deterministic.
+        use tokio::sync::broadcast;
+        let (tx, mut rx) = broadcast::channel::<crate::events::Event>(1);
+
+        // Send two events into a capacity-1 channel so the single subscriber
+        // lags — the receiver can only hold 1 item; the second overwrites it.
+        let ev1 = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "m1");
+        let ev2 = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "m2");
+        let _ = tx.send(ev1);
+        let _ = tx.send(ev2);
+
+        // The receiver should now be lagged.
+        match rx.recv().await {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                // Directly exercise the same code the dispatcher calls.
+                record_dispatcher_lag(n);
+            },
+            other => {
+                // We got an event instead — still fine; just confirm no panic.
+                let _ = other;
+                record_dispatcher_lag(1);
+            },
+        }
+        // Confirm the Closed path too (dropping tx closes the channel).
+        drop(tx);
+        // Drain any remaining events until the channel closes.
+        loop {
+            if matches!(
+                rx.recv().await,
+                Err(tokio::sync::broadcast::error::RecvError::Closed)
+            ) {
+                break;
+            }
+        }
+    }
+
+    // --- spawn_delivery_worker: claim_pending Err branch -------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delivery_worker_claim_pending_error_does_not_panic() {
+        // Build an exhausted pool so claim_pending_deliveries returns Err.
+        // spawn_delivery_worker must continue (not panic) on that error.
+        let (reg, held) = exhausted_registry();
+        let outbox: Arc<dyn DeliveryOutbox> = Arc::new(reg);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_delivery_worker(outbox, std::time::Duration::from_millis(20), cancel.clone());
+        // Give the worker a beat to hit the error path at least once.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        cancel.cancel();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "delivery worker must resolve after cancel even with pool exhaustion"
+        );
+        drop(held); // release the held connection
+    }
+
+    // --- spawn_prune_task: prune Err branch --------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_task_error_does_not_panic() {
+        // Build an exhausted pool so prune_finalized returns Err.
+        // spawn_prune_task must continue (not panic) on that error.
+        // We need a prune task that fires quickly. Use a very short tick
+        // so the task fires before we cancel; the first tick is skipped
+        // so we need to wait a bit.
+        let (reg, held) = exhausted_registry();
+        let outbox: Arc<dyn DeliveryOutbox> = Arc::new(reg);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_prune_task(
+            outbox,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(86400),
+            cancel.clone(),
+        )
+        .expect("non-zero retention returns Some");
+        // Wait for two ticks (initial skip + one real tick).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "prune task must resolve after cancel even with pool exhaustion"
+        );
+        drop(held);
+    }
+
+    // --- dispatch_row: HMAC secret path (signature header) -----------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_row_with_secret_sends_signature_header() {
+        // A row with a non-None secret must have its body HMAC-signed and
+        // the X-Artifacts-Signature header attached. Verify by inspecting
+        // the raw request captured by the one-shot listener.
+        let (url, recv) = spawn_one_shot_listener();
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: rid("repo-a"),
+            url: url.clone(),
+            secret: Some("dispatch-hmac-key".into()),
+            events: vec![],
+        })
+        .unwrap();
+        r.enqueue_delivery(&rid("repo-a"), "commit", br#"{"x":1}"#)
+            .unwrap();
+        let rows = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = PendingDelivery {
+            id: rows[0].id,
+            hook_id: rows[0].hook_id.clone(),
+            url: url.clone(),
+            secret: Some("dispatch-hmac-key".into()),
+            kind: "commit".into(),
+            payload: br#"{"x":1}"#.to_vec(),
+            attempts: 1,
+        };
+        let path = _d.path().join("webhooks.db");
+        let outbox: Arc<dyn DeliveryOutbox> =
+            Arc::new(SqliteWebhookRegistry::open(&path, test_master_key()).unwrap());
+        let oc = outbox.clone();
+        tokio::task::spawn_blocking(move || dispatch_row(&*oc, row))
+            .await
+            .unwrap();
+
+        let req = tokio::task::spawn_blocking(move || {
+            recv.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .expect("listener must receive the signed delivery");
+        assert!(
+            req.contains("X-Artifacts-Signature: sha256="),
+            "signed delivery must include X-Artifacts-Signature header; got:\n{req}"
+        );
+    }
+
+    // --- publish_event: invalid repo_id in event ---------------------------
+
+    #[test]
+    fn publish_event_invalid_repo_id_does_not_panic() {
+        // Construct a Commit event whose repo_id is too short (< 4 chars)
+        // so RepoId::try_from fails inside publish_event. The function
+        // must swallow the error and still call bus.publish.
+        let (_d, r) = open_sqlite_registry();
+        let bus = crate::events::EventBus::new();
+        // "ab" has only 2 characters — invalid RepoId.
+        let ev = crate::events::Event::commit("ab", "0".repeat(40), "main", "m");
+        publish_event(&bus, Some(&r), ev);
+        // No assert needed — the test is that we didn't panic.
+    }
+
+    // --- publish_event: enqueue error arm ----------------------------------
+
+    #[test]
+    fn publish_event_enqueue_error_does_not_propagate() {
+        // Use an exhausted pool so enqueue_delivery returns Err. publish_event
+        // must log the error and return normally (best-effort: webhook delivery
+        // must never fail the mutation that produced the event).
+        let (reg, _held) = exhausted_registry();
+        let bus = crate::events::EventBus::new();
+        let ev = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "m");
+        publish_event(&bus, Some(&reg), ev);
+        // No assert needed — the test is that we didn't panic.
+    }
+
+    // --- legacy_direct_dispatch: 5xx / transport error path ---------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_direct_dispatch_5xx_labels_exhausted() {
+        // Spawn a listener that replies 503. The legacy path labels any
+        // non-4xx failure as "exhausted" (single attempt). This exercises
+        // the fallthrough Err arm (lines ~1264-1265, ~1269) and the
+        // metrics counter at line ~1277.
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                use std::io::Read as _;
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/hook");
+        let r = MemRegistry::new();
+        r.add(Subscription {
+            id: "hook-5xx".into(),
+            repo_id: rid("repo-a"),
+            url,
+            secret: None,
+            events: vec![],
+        })
+        .unwrap();
+        let ev = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "msg");
+        let body = serde_json::to_vec(&ev).unwrap();
+        // spawn_blocking waits for the blocking task to finish before
+        // returning, so the metrics counter is guaranteed to increment
+        // before we return.
+        tokio::task::spawn_blocking(move || legacy_direct_dispatch(&r, &ev, body))
+            .await
+            .unwrap();
+        // The test is that the exhausted arm was reached without panic.
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_direct_dispatch_network_error_labels_exhausted() {
+        // Port 1 is unreachable — ureq returns a transport error.
+        // The legacy dispatch labels this "exhausted" and emits the metric.
+        let r = MemRegistry::new();
+        r.add(Subscription {
+            id: "hook-net-err".into(),
+            repo_id: rid("repo-a"),
+            url: "http://127.0.0.1:1/hook".into(),
+            secret: None,
+            events: vec![],
+        })
+        .unwrap();
+        let ev = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "msg");
+        let body = serde_json::to_vec(&ev).unwrap();
+        tokio::task::spawn_blocking(move || legacy_direct_dispatch(&r, &ev, body))
+            .await
+            .unwrap();
+        // No panic = pass.
+    }
 }

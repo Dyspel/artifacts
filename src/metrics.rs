@@ -423,4 +423,136 @@ mod tests {
     // the global recorder — which the `metrics` crate deliberately does not
     // provide. Those lines are genuinely only reachable once, not zero times;
     // we document them here rather than producing a false-negative test.
+
+    // -----------------------------------------------------------------------
+    // track_metrics middleware — covers the histogram .record(elapsed) arm.
+    // -----------------------------------------------------------------------
+
+    /// `track_metrics` must call the histogram recorder and return the
+    /// response from the inner handler unchanged. Uses a local `DebuggingRecorder`
+    /// so the assertion is process-isolated and doesn't depend on `init()`.
+    /// Exercises the `.record(elapsed)` call at line ~223.
+    #[test]
+    fn track_metrics_records_histogram_and_counter() {
+        use axum::body::Body;
+        use axum::http::{Method, Request as AxumRequest};
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use tower::ServiceExt;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Build a request without a MatchedPath; exercises the None branch
+        // in path_label_for (unmatched → "<unmatched>").
+        let req = AxumRequest::builder()
+            .method(Method::GET)
+            .uri("/probe/random")
+            .body(Body::empty())
+            .unwrap();
+
+        // Wrap track_metrics through ServiceBuilder so we have a proper
+        // tower Service with the middleware correctly plumbed (Next is
+        // constructed internally by the ServiceBuilder chain).
+        let svc = tower::ServiceBuilder::new()
+            .layer(axum::middleware::from_fn(track_metrics))
+            .service(tower::service_fn(|_req: AxumRequest<Body>| async {
+                Ok::<axum::response::Response<Body>, std::convert::Infallible>(
+                    axum::response::Response::builder()
+                        .status(200)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            }));
+
+        with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let _ = svc.oneshot(req).await;
+            });
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let has_counter = snapshot.iter().any(|(k, _, _, v)| {
+            matches!(v, DebugValue::Counter(_)) && k.key().name() == "artifacts_requests_total"
+        });
+        let has_histogram = snapshot
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "artifacts_request_duration_seconds");
+        assert!(
+            has_counter,
+            "track_metrics must increment artifacts_requests_total"
+        );
+        assert!(
+            has_histogram,
+            "track_metrics must record artifacts_request_duration_seconds"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_pool_gauge_refresher — covers the inner tick loop (lines 322-323).
+    // -----------------------------------------------------------------------
+
+    /// `spawn_pool_gauge_refresher` must publish pool gauges after at least
+    /// one tick (beyond the initial skip-tick). Exercises the loop body at
+    /// lines ~322-323.
+    #[test]
+    fn spawn_pool_gauge_refresher_emits_gauges_after_tick() {
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // Build a minimal r2d2 pool so we have something to pass.
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(2)
+            .connection_timeout(std::time::Duration::from_millis(50))
+            .build(manager)
+            .unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let pools = vec![("test_store", pool)];
+
+        // Use a dedicated single-threaded runtime so block_on doesn't nest
+        // inside any outer async context.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let h = spawn_pool_gauge_refresher(
+                    pools,
+                    std::time::Duration::from_millis(20),
+                    cancel.clone(),
+                );
+                // Wait for the initial publish + at least one loop tick.
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                cancel.cancel();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), h).await;
+            });
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let has_size = snapshot.iter().any(|(k, _, _, v)| {
+            k.key().name() == "artifacts_sqlite_pool_size" && matches!(v, DebugValue::Gauge(_))
+        });
+        let has_in_use = snapshot.iter().any(|(k, _, _, v)| {
+            k.key().name() == "artifacts_sqlite_pool_in_use" && matches!(v, DebugValue::Gauge(_))
+        });
+        assert!(
+            has_size,
+            "pool gauge refresher must emit artifacts_sqlite_pool_size"
+        );
+        assert!(
+            has_in_use,
+            "pool gauge refresher must emit artifacts_sqlite_pool_in_use"
+        );
+    }
 }
