@@ -1,9 +1,18 @@
 # Test coverage
 
-**91.6% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
-excluded), across **654 in-crate unit tests + 9 integration test
+**92.1% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
+excluded), across **656 in-crate unit tests + 9 integration test
 binaries + doctests**. Reconciled across both coverage engines (see
-"two engines" below) the true line coverage is **≈92.3%**.
+"two engines" below) the true line coverage is **≈93%**.
+
+A coverage review of this codebase also surfaced — and fixed — a latent
+bug: because `ureq` 2.x maps every HTTP status ≥ 400 to `Err(Status)`,
+the webhook dispatcher's `Ok`-arm 4xx/5xx handling was unreachable dead
+code, and a real 4xx response fell through the `Err` arm and was
+*retried as a transport error* instead of being finalized as a terminal
+client error. The status handling is now unified on the `Err` side and
+covered by tests. (Trying to cover code is a decent way to find code
+that's wrong.)
 
 The path from the 51.6% baseline to here: the dominant lever was moving
 server execution *in-process* (the `e2e_*` binaries) so it's
@@ -21,12 +30,12 @@ The remaining ~8% is, in order of size:
    non-UTF-8 header). Real `git` and the validated newtypes never
    produce these; they're guarded for safety. This is the domain of the
    `cargo-fuzz` targets (see `fuzz/`), not unit tests.
-2. **Genuinely-dead code** — most notably the `webhooks::dispatch_row`
-   HTTP-status `Ok`-arm: with `ureq` 2.x every status ≥ 400 comes back
-   as `Err(Status)`, so the `Ok`-arm's 4xx/5xx handling is unreachable
-   (a guard for a future client swap). Plus the infallible `Vec`-write
-   / `Response::builder()` `.map_err` arms and the install-once metrics
-   recorder `.map_err`.
+2. **Install-once / genuinely-infallible arms that remain** — the
+   metrics-recorder registration `.map_err` arms (the recorder installs
+   exactly once per process; a test can't force a second failing
+   install). The previously-dead webhook `Ok`-arms and the infallible
+   `Vec`-write / `Response::builder` `.map_err` arms were *removed* in
+   the dead-code refactor rather than left uncovered.
 3. **`Oid`/`RepoId` newtype-precluded guards** — e.g. the
    `ObjectStore::read_object` hex-parse-failure arm: the `Oid` newtype
    already guarantees 40 lowercase hex, so the parse never fails.
