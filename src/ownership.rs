@@ -65,6 +65,20 @@ pub trait OwnershipStore: Send + Sync {
     /// matters, wrap this in a `SELECT count(*) ... FOR UPDATE` or move
     /// the check into the same transaction as the INSERT.
     async fn count_by_owner(&self, subject: &str) -> Result<u64>;
+
+    /// List every repo the store knows about. Admin-only surface —
+    /// intended for the inspection endpoint and the GUI visualizer.
+    /// Order is `created_at DESC` so the newest repos show first.
+    async fn list_all(&self) -> Result<Vec<RepoRow>>;
+}
+
+/// One row of the `repos` table. `owner` is `None` for admin-created
+/// repos (the owner_subject column is NULL).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoRow {
+    pub id: String,
+    pub owner: Option<String>,
+    pub created_at: i64,
 }
 
 /// SQLite-backed `OwnershipStore`. Shares the DB file with
@@ -138,6 +152,27 @@ impl OwnershipStore for SqliteOwnershipStore {
         let row = rows.next()?.expect("COUNT(*) always returns one row");
         let n: i64 = row.get(0)?;
         Ok(n as u64)
+    }
+
+    async fn list_all(&self) -> Result<Vec<RepoRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_subject, created_at
+             FROM repos
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RepoRow {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 }
 
@@ -360,5 +395,37 @@ mod tests {
             r,
             Err(Error::QuotaExceeded { ref subject, limit: 3 }) if subject == "alice"
         ));
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_rows_newest_first() {
+        let (_d, store) = fresh_store();
+        // Insert in a specific order and rely on created_at DESC to
+        // return newest first. SQLite's CURRENT_TIMESTAMP resolution is
+        // second-level; `record_owner` uses epoch seconds via `now_secs()`,
+        // so we sleep a beat to guarantee a distinct timestamp.
+        store.record_owner("old", Some("u")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.record_owner("new", Some("u")).await.unwrap();
+        let rows = store.list_all().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "new");
+        assert_eq!(rows[1].id, "old");
+    }
+
+    #[tokio::test]
+    async fn list_all_empty_when_no_rows() {
+        let (_d, store) = fresh_store();
+        assert!(store.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_all_includes_admin_owned_as_none() {
+        let (_d, store) = fresh_store();
+        store.record_owner("admin-repo", None).await.unwrap();
+        let rows = store.list_all().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "admin-repo");
+        assert!(rows[0].owner.is_none());
     }
 }

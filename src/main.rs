@@ -202,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/commits", post(commits::create_commit))
                 .route("/v1/repos/:id/merge", post(merge::merge_branches))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
+                .route("/v1/admin/repos", get(rest::admin_list_repos))
+                .route("/v1/admin/repos/:id", get(rest::admin_get_repo))
                 .with_state(rest_state)
                 // Metrics middleware only wraps the REST surface (not
                 // /git, which streams large bodies where per-request

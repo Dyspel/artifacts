@@ -269,3 +269,239 @@ pub async fn delete_repo(
 pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Admin read-only inspection surface
+//
+// These endpoints are admin-only (JWT principals get 403) and live under
+// `/v1/admin/*` to make the separation obvious at the URL level. They
+// power the artifacts-gui visualizer, and anyone else who needs to browse
+// the server's state out-of-band.
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoSummary {
+    pub id: String,
+    /// `None` for admin-created repos.
+    pub owner: Option<String>,
+    /// Unix epoch seconds.
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    /// ID of the repo this is a fork of, if any — derived from reading
+    /// `objects/info/alternates`.
+    #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoDetail {
+    #[serde(flatten)]
+    pub summary: AdminRepoSummary,
+    /// Size on disk in bytes. Walks the repo dir so not free — only
+    /// populated on the single-repo endpoint.
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: u64,
+    pub refs: Vec<RefEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefEntry {
+    pub name: String,
+    pub sha: String,
+}
+
+/// `GET /v1/admin/repos`
+///
+/// Returns every repo the server knows about. Expensive bits (disk size,
+/// ref list) are deliberately left off this list endpoint so it stays
+/// cheap even with thousands of repos — those live on the single-repo
+/// detail endpoint.
+pub async fn admin_list_repos(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AdminRepoSummary>>> {
+    require_admin(&state, &headers)?;
+    state.rate_limit.check(
+        &crate::auth::Principal::Admin, // rate-limit is a no-op for admin; kept for symmetry
+        crate::rate_limit::Class::Default,
+    )?;
+
+    let rows = state.ownership.list_all().await?;
+    let repos_dir = state.cfg.repos_dir();
+    let summaries = rows
+        .into_iter()
+        .map(|r| AdminRepoSummary {
+            source_id: read_alternates_source(&repos_dir, &r.id),
+            id: r.id,
+            owner: r.owner,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(Json(summaries))
+}
+
+/// `GET /v1/admin/repos/:id`
+///
+/// Full detail for one repo: base summary + refs + size-on-disk. The
+/// size walk is only done here (not in the list endpoint) because it
+/// requires reading the repo's full directory tree.
+pub async fn admin_get_repo(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AdminRepoDetail>> {
+    require_admin(&state, &headers)?;
+    state.rate_limit.check(
+        &crate::auth::Principal::Admin,
+        crate::rate_limit::Class::Default,
+    )?;
+
+    let owner_row = state.ownership.get_owner(&id).await?;
+    let Some(owner) = owner_row else {
+        return Err(Error::RepoNotFound(id));
+    };
+
+    let repos_dir = state.cfg.repos_dir();
+    let repo_path = repos_dir.join(format!("{id}.git"));
+    if !repo_path.is_dir() {
+        // Metadata says the repo exists but the directory is gone —
+        // treat as missing at the HTTP layer.
+        return Err(Error::RepoNotFound(id));
+    }
+
+    let refs = list_refs(&repo_path).unwrap_or_default();
+    let size_bytes = dir_size(&repo_path).unwrap_or(0);
+    // created_at isn't on owner_row alone — go through list_all for now.
+    // A dedicated `get_row(id)` on the trait would be cleaner; this stays
+    // cheap because list_all is just a SELECT.
+    let created_at = state
+        .ownership
+        .list_all()
+        .await?
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| r.created_at)
+        .unwrap_or(0);
+
+    Ok(Json(AdminRepoDetail {
+        summary: AdminRepoSummary {
+            source_id: read_alternates_source(&repos_dir, &id),
+            id,
+            owner,
+            created_at,
+        },
+        size_bytes,
+        refs,
+    }))
+}
+
+/// Helper: reject non-admin principals with 403.
+fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
+    let principal = authorize_rest(
+        headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    if !matches!(principal, crate::auth::Principal::Admin) {
+        return Err(Error::Forbidden("admin inspection endpoints require admin auth"));
+    }
+    Ok(())
+}
+
+/// Derive the `source_id` (parent repo) by reading `objects/info/alternates`.
+/// Returns `None` if the file doesn't exist (repo is a root, not a fork)
+/// or if its contents don't match our alternates-shape.
+fn read_alternates_source(repos_dir: &std::path::Path, repo_id: &str) -> Option<String> {
+    let p = repos_dir.join(format!("{repo_id}.git/objects/info/alternates"));
+    let s = std::fs::read_to_string(p).ok()?;
+    // Content we wrote is `<repos_dir>/<source_id>.git/objects\n`. Try to
+    // parse that back. If it doesn't match (e.g., someone hand-edited),
+    // fall through to None rather than guessing.
+    let trimmed = s.trim();
+    let prefix = format!("{}/", repos_dir.display());
+    let rest = trimmed.strip_prefix(&prefix)?;
+    let source_id = rest.strip_suffix(".git/objects")?;
+    // Defensive: make sure the computed id doesn't contain path separators,
+    // which would mean the alternates file points somewhere unexpected.
+    if source_id.contains('/') || source_id.contains('\\') {
+        return None;
+    }
+    Some(source_id.to_string())
+}
+
+/// List refs in a bare repo by recursively reading `refs/`. Only uses
+/// the fs — no subprocess — so it's fast enough to include on the detail
+/// endpoint.
+fn list_refs(repo_path: &std::path::Path) -> std::io::Result<Vec<RefEntry>> {
+    let mut out = Vec::new();
+    walk_refs(&repo_path.join("refs"), "refs", &mut out)?;
+    // Also read packed-refs (git consolidates refs here on gc).
+    let packed = repo_path.join("packed-refs");
+    if packed.exists() {
+        let content = std::fs::read_to_string(&packed)?;
+        for line in content.lines() {
+            // Skip comments and peeled-ref lines (start with '^').
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((sha, name)) = line.split_once(' ') {
+                // packed-refs can duplicate loose refs; dedupe by name.
+                if out.iter().any(|r| r.name == name) {
+                    continue;
+                }
+                out.push(RefEntry {
+                    name: name.to_string(),
+                    sha: sha.to_string(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn walk_refs(
+    dir: &std::path::Path,
+    prefix: &str,
+    out: &mut Vec<RefEntry>,
+) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let full = format!("{prefix}/{name}");
+        if path.is_dir() {
+            walk_refs(&path, &full, out)?;
+        } else if path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let sha = content.trim().to_string();
+                if !sha.is_empty() {
+                    out.push(RefEntry { name: full, sha });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursive dir-size. Not cached; a full walk. Only called from the
+/// detail endpoint, so cost is bounded to one repo at a time.
+fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for entry in std::fs::read_dir(&p)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}

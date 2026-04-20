@@ -605,5 +605,40 @@ ffo_code=$(curl -sS -o /dev/null -w '%{http_code}' \
     || { echo "FAIL: ff-only on diverged expected 400, got $ffo_code"; exit 1; }
 echo "    ff-only refuses diverged branches with 400"
 
+# Admin inspection endpoints. Admin sees every repo; JWT users are 403.
+# The source_id field is populated for forks (from reading the
+# alternates file) and absent for roots.
+echo "==> [??] admin inspection endpoints"
+admin_list="${WORK_DIR}/admin_list.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/repos" -o "$admin_list"
+# Must be a JSON array; must contain all the repos we created in the
+# preceding steps; at least one row must have sourceId (from step 4's
+# fork + step 6's ro fork).
+count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$admin_list")
+[[ "$count" -ge 5 ]] \
+    || { echo "FAIL: admin_list returned $count rows, expected ≥ 5"; cat "$admin_list"; exit 1; }
+with_source=$(python3 -c 'import json,sys; rows=json.load(sys.stdin); print(sum(1 for r in rows if r.get("sourceId")))' < "$admin_list")
+[[ "$with_source" -ge 1 ]] \
+    || { echo "FAIL: no repos with sourceId — forks should derive one from alternates"; exit 1; }
+echo "    admin → list → $count repos, $with_source with sourceId (fork relationships visible)"
+
+# JWT user should get 403 on admin endpoints (non-admin principals).
+jwt_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    "${alice_auth[@]}" "$BASE_URL/v1/admin/repos")
+[[ "$jwt_code" == "403" ]] \
+    || { echo "FAIL: JWT user hitting /v1/admin/repos expected 403, got $jwt_code"; exit 1; }
+echo "    JWT user → /v1/admin/repos → 403 (admin-only)"
+
+# Detail endpoint returns refs + size-on-disk.
+detail="${WORK_DIR}/admin_detail.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/repos/${repo_id}" -o "$detail"
+ref_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["refs"]))' < "$detail")
+size=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sizeBytes"])' < "$detail")
+[[ "$ref_count" -ge 1 ]] \
+    || { echo "FAIL: detail has $ref_count refs, expected ≥ 1 (main branch)"; exit 1; }
+[[ "$size" -gt 0 ]] \
+    || { echo "FAIL: detail sizeBytes is $size, expected > 0"; exit 1; }
+echo "    admin → detail → ${ref_count} refs, ${size} bytes on disk"
+
 echo
 echo "==> all checks passed"
