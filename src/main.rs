@@ -67,6 +67,18 @@ enum Cmd {
         /// repos it authorizes.
         #[arg(long)]
         token_db: Option<PathBuf>,
+
+        /// Opt-in to binding a non-loopback address with `http://`.
+        /// Without this flag we refuse to start in that combination,
+        /// because it broadcasts tokens in the clear to anyone who can
+        /// reach the listener. The correct shape for a non-loopback
+        /// deployment is an HTTPS terminator (nginx / caddy / cloudflared)
+        /// in front of the server, with `--public-base-url` set to the
+        /// `https://` URL of that terminator. This flag exists for
+        /// people who know what they're doing (ephemeral test rigs,
+        /// internal networks with out-of-band authentication, etc.).
+        #[arg(long)]
+        allow_insecure: bool,
     },
 }
 
@@ -88,7 +100,14 @@ async fn main() -> anyhow::Result<()> {
             admin_token,
             jwt_secret,
             token_db,
+            allow_insecure,
         } => {
+            // Refuse to start in the "non-loopback bind + plaintext HTTP"
+            // combination. Tokens travel in URLs and Basic auth — both
+            // plaintext unless TLS is terminating somewhere. The #1
+            // reason prototypes leak credentials in real deploys is
+            // forgetting to put a terminator in front.
+            check_bind_safety(&bind, &public_base_url, allow_insecure)?;
             let admin_token = admin_token.unwrap_or_else(|| {
                 let t = random_admin_token();
                 eprintln!("[artifacts] generated admin token: {t}");
@@ -154,6 +173,47 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse to start in the configuration most likely to leak credentials:
+/// a non-loopback bind serving a plaintext-HTTP public URL.
+///
+/// Rationale: every client (git, the REST API) authenticates with a
+/// bearer token or Basic credentials. Both are plaintext. A non-loopback
+/// bind + `http://` public base URL means those plaintext credentials
+/// travel over whatever network reaches the listener. In development
+/// this is someone's laptop over Wi-Fi; in a cloud deployment it's
+/// usually someone who forgot to put a TLS terminator in front and
+/// silently leaked every token to passive observers.
+///
+/// `allow_insecure` is the explicit opt-out. `--bind 127.0.0.1:...` and
+/// loopback IPv6 (`::1`) are permitted unconditionally (nothing but the
+/// local host reaches them).
+fn check_bind_safety(bind: &str, public_base_url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    if allow_insecure {
+        tracing::warn!("--allow-insecure is set; bind-safety check skipped");
+        return Ok(());
+    }
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    // Strip IPv6 brackets if present: `[::1]:8787` → `::1`.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0:0:0:0:0:0:0:1");
+    if is_loopback {
+        return Ok(());
+    }
+    if public_base_url.starts_with("https://") {
+        // Non-loopback + HTTPS is the intended shape — a terminator is
+        // presumably rewriting https:// → http:// on the loopback leg.
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to start: bind={bind} is not loopback and public-base-url={public_base_url} is not https://.\n\
+         Tokens travel in plaintext — this is almost always a deployment mistake.\n\
+         Fix one of:\n\
+           - bind 127.0.0.1:... and put a TLS terminator in front (recommended)\n\
+           - set --public-base-url to an https:// URL (terminator handles TLS for you)\n\
+           - pass --allow-insecure if you really mean it (an ephemeral test rig, say)"
+    );
 }
 
 fn random_admin_token() -> String {
