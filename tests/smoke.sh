@@ -29,6 +29,10 @@ BASE_URL="http://${BIND}"
 DATA_DIR="$(mktemp -d -t artifacts-smoke.XXXXXX)"
 WORK_DIR="$(mktemp -d -t artifacts-smoke-work.XXXXXX)"
 ADMIN_TOKEN="smoke-admin-token-$(date +%s)"
+# Enable the JWT auth path so step 11 can exercise it. The secret is
+# shared with the Dyspel backend in real deployments; for the smoke
+# test it just needs to match what we sign with below.
+JWT_SECRET="smoke-jwt-secret-$(date +%s)"
 SERVER_LOG="${DATA_DIR}/server.log"
 
 cleanup() {
@@ -56,6 +60,7 @@ cargo build --quiet
 
 start_server() {
     ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
+    ARTIFACTS_JWT_SECRET="$JWT_SECRET" \
         ./target/debug/artifacts serve \
             --data-dir "$DATA_DIR" \
             --bind "$BIND" \
@@ -303,6 +308,76 @@ GIT_TERMINAL_PROMPT=0 git clone --quiet "$persist_remote" "${WORK_DIR}/persist"
 [[ -f "${WORK_DIR}/persist/README.md" ]] \
     || { echo "FAIL: restart-then-clone missing README.md"; exit 1; }
 echo "    pre-restart token still authorizes after restart"
+
+# JWT + ownership (the Dyspel integration shape). A Dyspel-signed JWT
+# with a `userId` claim becomes a `Principal::User { subject }`. The
+# user can create and touch their own repos; cross-user access 403s.
+echo "==> [11] JWT auth + per-user repo ownership"
+
+# Self-contained HS256 signer — no extra deps, python3 is already in use.
+sign_jwt() {
+    local secret="$1" user="$2"
+    python3 - "$secret" "$user" <<'PY'
+import base64, hmac, hashlib, json, sys, time
+secret, user = sys.argv[1], sys.argv[2]
+b64 = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
+header  = b64(json.dumps({"alg":"HS256","typ":"JWT"}, separators=(",",":")).encode())
+payload = b64(json.dumps({"userId":user,"exp":int(time.time())+3600}, separators=(",",":")).encode())
+signing_input = f"{header}.{payload}".encode()
+sig = b64(hmac.new(secret.encode(), signing_input, hashlib.sha256).digest())
+print(f"{header}.{payload}.{sig}")
+PY
+}
+
+alice_jwt="$(sign_jwt "$JWT_SECRET" alice)"
+bob_jwt="$(sign_jwt   "$JWT_SECRET" bob)"
+
+alice_auth=(-H "Authorization: Bearer ${alice_jwt}")
+bob_auth=(-H "Authorization: Bearer ${bob_jwt}")
+
+# Alice creates a repo via her JWT.
+alice_resp=$(curl -fsS -X POST "${alice_auth[@]}" "$BASE_URL/v1/repos")
+alice_repo=$(echo "$alice_resp" | json id)
+echo "    alice created repo $alice_repo"
+
+# Bob tries to mint a token for alice's repo — should 403.
+bob_mint_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${bob_auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"scope":"read"}' "$BASE_URL/v1/repos/${alice_repo}/tokens")
+[[ "$bob_mint_code" == "403" ]] \
+    || { echo "FAIL: bob mint-token on alice's repo expected 403, got $bob_mint_code"; exit 1; }
+echo "    bob → alice's repo/tokens → 403 (ownership enforced)"
+
+# Bob tries to delete alice's repo — should 403.
+bob_del_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X DELETE "${bob_auth[@]}" "$BASE_URL/v1/repos/${alice_repo}")
+[[ "$bob_del_code" == "403" ]] \
+    || { echo "FAIL: bob delete on alice's repo expected 403, got $bob_del_code"; exit 1; }
+echo "    bob → DELETE alice's repo → 403"
+
+# Alice mints her own token — should 200.
+alice_tok_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${alice_auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"scope":"read"}' "$BASE_URL/v1/repos/${alice_repo}/tokens")
+[[ "$alice_tok_code" == "200" ]] \
+    || { echo "FAIL: alice mint-token on her own repo expected 200, got $alice_tok_code"; exit 1; }
+echo "    alice → her own repo/tokens → 200"
+
+# Admin still works on alice's repo (bypasses ownership).
+admin_tok_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"scope":"read"}' "$BASE_URL/v1/repos/${alice_repo}/tokens")
+[[ "$admin_tok_code" == "200" ]] \
+    || { echo "FAIL: admin mint on alice's repo expected 200, got $admin_tok_code"; exit 1; }
+echo "    admin → alice's repo/tokens → 200 (bypasses ownership)"
+
+# Non-admin JWT cannot revoke (admin-only endpoint).
+alice_revoke_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${alice_auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"token":"whatever"}' "$BASE_URL/v1/tokens/revoke")
+[[ "$alice_revoke_code" == "403" ]] \
+    || { echo "FAIL: alice revoke expected 403 (admin-only), got $alice_revoke_code"; exit 1; }
+echo "    non-admin JWT → /v1/tokens/revoke → 403 (admin-only)"
 
 echo
 echo "==> all checks passed"

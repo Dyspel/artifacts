@@ -7,6 +7,7 @@ use crate::{
     auth::authorize_rest,
     config::Config,
     error::{Error, Result},
+    ownership::{enforce_owner, OwnershipStore},
     refs::RefStore,
     storage::{new_repo_id, Storage},
     tokens::{Scope, TokenStore},
@@ -26,6 +27,10 @@ pub struct RestState {
     /// (chunked KV, object-store-backed) drop in behind the same trait.
     pub storage: Arc<dyn Storage>,
     pub tokens: Arc<dyn TokenStore>,
+    /// Who-owns-what. Populated by `create_repo` / `fork_repo`, read by
+    /// the ownership-enforcing handlers (anything that mutates or mints
+    /// credentials for an existing repo).
+    pub ownership: Arc<dyn OwnershipStore>,
     /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
     /// distributed impl without touching any handler.
     pub refs: Arc<dyn RefStore>,
@@ -59,16 +64,31 @@ fn remote_url(cfg: &Config, id: &str, token: &str) -> String {
 }
 
 /// POST /v1/repos
+///
+/// Creates an empty repo owned by the caller. If the caller is `Admin`
+/// the owner is recorded as `NULL` (admin-owned); if the caller is a
+/// user, their JWT subject becomes the owner for all subsequent
+/// access checks.
 pub async fn create_repo(
     State(state): State<RestState>,
     headers: HeaderMap,
     body: Option<Json<CreateRepoBody>>,
 ) -> Result<Json<RepoHandle>> {
-    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
     let id = body
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
     state.storage.create(&id)?;
+    // Record ownership *before* minting the token so a crash between the
+    // two leaves a repo we can identify the owner of.
+    state
+        .ownership
+        .record_owner(&id, principal.subject())
+        .await?;
     let token = state.tokens.mint(&id, Scope::Write, None).await?;
     let remote = remote_url(&state.cfg, &id, &token);
     Ok(Json(RepoHandle { id, remote, token }))
@@ -83,21 +103,36 @@ pub struct ForkBody {
 }
 
 /// POST /v1/repos/:id/forks
+///
+/// Forking requires read access to the source (enforced as ownership, so
+/// only the source's owner — or admin — can fork). The fork itself is
+/// owned by the caller; this lets a user fork their own template into a
+/// personal workspace, but prevents arbitrary users from cloning each
+/// other's repos via this endpoint.
 pub async fn fork_repo(
     State(state): State<RestState>,
     Path(source_id): Path<String>,
     headers: HeaderMap,
     body: Option<Json<ForkBody>>,
 ) -> Result<Json<RepoHandle>> {
-    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
     if !state.storage.exists(&source_id) {
         return Err(Error::RepoNotFound(source_id));
     }
+    enforce_owner(&*state.ownership, &principal, &source_id).await?;
     let (fork_id, read_only) = body
         .map(|Json(b)| (b.id, b.read_only))
         .unwrap_or((None, false));
     let fork_id = fork_id.unwrap_or_else(new_repo_id);
     state.storage.fork(&source_id, &fork_id)?;
+    state
+        .ownership
+        .record_owner(&fork_id, principal.subject())
+        .await?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
     let token = state.tokens.mint(&fork_id, scope, None).await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
@@ -128,10 +163,15 @@ pub async fn mint_token(
     headers: HeaderMap,
     Json(body): Json<MintTokenBody>,
 ) -> Result<Json<TokenMinted>> {
-    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
     if !state.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
+    enforce_owner(&*state.ownership, &principal, &id).await?;
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
     let token = state.tokens.mint(&id, body.scope, ttl).await?;
     let remote = remote_url(&state.cfg, &id, &token);
@@ -158,12 +198,25 @@ pub struct RevokeResponse {
 ///
 /// Takes the token in the request body so it doesn't get captured in
 /// access logs, URL history, or any other place URL paths usually land.
+///
+/// **Admin-only for now.** To let a `User` revoke only their own
+/// tokens, we'd need the `TokenStore` to expose "what repo is this
+/// token bound to" so we could `enforce_owner` against that. That's a
+/// trait extension and belongs in M4b alongside `GET /v1/tokens`
+/// listing. Until then, non-admin callers get 403.
 pub async fn revoke_token(
     State(state): State<RestState>,
     headers: HeaderMap,
     Json(body): Json<RevokeBody>,
 ) -> Result<Json<RevokeResponse>> {
-    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    if !matches!(principal, crate::auth::Principal::Admin) {
+        return Err(Error::Forbidden("token revocation is admin-only"));
+    }
     let revoked = state.tokens.revoke(&body.token).await?;
     Ok(Json(RevokeResponse { revoked }))
 }
@@ -174,8 +227,14 @@ pub async fn delete_repo(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    enforce_owner(&*state.ownership, &principal, &id).await?;
     state.storage.delete(&id)?;
+    state.ownership.delete(&id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

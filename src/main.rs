@@ -3,6 +3,7 @@ mod commits;
 mod config;
 mod error;
 mod jwt;
+mod ownership;
 mod refs;
 mod rest;
 mod smart_http;
@@ -11,6 +12,7 @@ mod tokens;
 
 use crate::{
     config::Config,
+    ownership::{OwnershipStore, SqliteOwnershipStore},
     refs::{FsRefStore, RefStore},
     rest::RestState,
     smart_http::GitState,
@@ -107,14 +109,21 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
-            tracing::info!(path = %token_db_path.display(), "opening token db");
+            tracing::info!(path = %token_db_path.display(), "opening metadata db");
             let tokens: Arc<dyn TokenStore> = Arc::new(SqliteTokenStore::open(&token_db_path)?);
+            // Reuses the same SQLite file for a separate `repos` table.
+            // Separate table and separate connection keeps the concerns
+            // cleanly split; WAL-mode lets them coexist without lock
+            // contention on the hot path.
+            let ownership: Arc<dyn OwnershipStore> =
+                Arc::new(SqliteOwnershipStore::open(&token_db_path)?);
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
 
             let rest_state = RestState {
                 cfg: cfg.clone(),
                 storage,
                 tokens: tokens.clone(),
+                ownership,
                 refs,
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };

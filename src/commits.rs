@@ -37,6 +37,7 @@
 use crate::{
     auth::authorize_rest,
     error::{Error, Result},
+    ownership::enforce_owner,
     refs::CasOutcome,
     rest::RestState,
 };
@@ -120,7 +121,7 @@ pub async fn create_commit(
     headers: HeaderMap,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<CommitResult>> {
-    let _principal = authorize_rest(
+    let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
@@ -129,6 +130,7 @@ pub async fn create_commit(
     if !state.storage.exists(&repo_id) {
         return Err(Error::RepoNotFound(repo_id));
     }
+    enforce_owner(&*state.ownership, &principal, &repo_id).await?;
     if !valid_branch_name(&body.branch) {
         return Err(Error::BadRequest(format!("invalid branch name: {:?}", body.branch)));
     }
