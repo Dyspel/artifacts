@@ -82,6 +82,7 @@ impl IntoResponse for Error {
                 // "you've hit your quota" apart from "you're being
                 // rate-limited." Includes the limit so the client UI
                 // can surface it.
+                metrics::counter!("artifacts_quota_exceeded_total").increment(1);
                 let body = Json(json!({
                     "error": {
                         "code": "quota_exceeded",
@@ -96,6 +97,7 @@ impl IntoResponse for Error {
                 // 429 + Retry-After. Distinct `code` from `quota_exceeded`
                 // so clients retry (rate-limited is transient) vs. surface
                 // an error (quota is persistent).
+                metrics::counter!("artifacts_rate_limited_total").increment(1);
                 let body = Json(json!({
                     "error": {
                         "code": "rate_limited",

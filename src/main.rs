@@ -3,6 +3,7 @@ mod commits;
 mod config;
 mod error;
 mod jwt;
+mod metrics;
 mod ownership;
 mod rate_limit;
 mod refs;
@@ -22,6 +23,7 @@ use crate::{
     tokens::{SqliteTokenStore, TokenStore},
 };
 use axum::{
+    middleware as axum_middleware,
     routing::{delete, get, post},
     Router,
 };
@@ -153,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
                 max_commit_blob_bytes,
                 "non-admin quotas"
             );
+
+            // Install the prometheus recorder *before* any metrics call
+            // site runs (startup-time gauges, middleware).
+            let prom_handle = metrics::init();
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
@@ -186,8 +192,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };
 
-            let app = Router::new()
-                // REST
+            let rest_router = Router::new()
                 .route("/v1/health", get(rest::health))
                 .route("/v1/repos", post(rest::create_repo))
                 .route("/v1/repos/:id", delete(rest::delete_repo))
@@ -196,6 +201,22 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/commits", post(commits::create_commit))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .with_state(rest_state)
+                // Metrics middleware only wraps the REST surface (not
+                // /git, which streams large bodies where per-request
+                // timing is a poor signal) and not /metrics itself
+                // (self-scraping would be noise).
+                .layer(axum_middleware::from_fn(metrics::track_metrics));
+
+            // /metrics is outside the REST router so the track_metrics
+            // middleware doesn't observe its own scrape.
+            let metrics_route = {
+                let handle = prom_handle.clone();
+                Router::new()
+                    .route("/metrics", get(move || async move { metrics::render(&handle) }))
+            };
+
+            let app = rest_router
+                .merge(metrics_route)
                 // Git smart-HTTP. A single catch-all route under /git/:id.git/
                 // dispatches to the backend based on the method + path.
                 .nest(
