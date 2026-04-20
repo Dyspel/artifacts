@@ -73,6 +73,12 @@ struct AppState {
     last_poll: Option<Instant>,
     last_error: Option<String>,
     poll_count: u64,
+    /// Populated by the poller whenever `selected_for_detail` is set and
+    /// the `/v1/admin/repos/:id` endpoint is reachable. Lives here (not
+    /// on `App`) because the poller writes it and the UI thread reads it;
+    /// keeping all "server-sourced data" in one struct makes the
+    /// lock-ownership story obvious.
+    detail: Option<RepoDetail>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -83,6 +89,27 @@ struct RepoSummary {
     created_at: i64,
     #[serde(rename = "sourceId", default)]
     source_id: Option<String>,
+}
+
+/// Full detail for one repo. Server emits it with `summary` flattened so
+/// the client sees one flat shape; we match.
+#[derive(Clone, serde::Deserialize)]
+struct RepoDetail {
+    id: String,
+    owner: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: i64,
+    #[serde(rename = "sourceId", default)]
+    source_id: Option<String>,
+    #[serde(rename = "sizeBytes")]
+    size_bytes: u64,
+    refs: Vec<RefEntry>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct RefEntry {
+    name: String,
+    sha: String,
 }
 
 #[derive(Default, Clone)]
@@ -126,7 +153,26 @@ fn poll_once(url: &str, token: &str) -> Result<(Vec<RepoSummary>, MetricsSnapsho
     Ok((repos, parse_metrics(&metrics_text)))
 }
 
-fn spawn_poller(cli: Cli, state: Arc<Mutex<AppState>>) {
+/// Fetch full detail for a single repo. Called by the poller when the
+/// user has selected one. Slightly more expensive than the list (walks
+/// the repo dir on the server to compute size + refs), so we do it at
+/// most once per poll cycle — not per click.
+fn poll_detail(url: &str, token: &str, repo_id: &str) -> Result<RepoDetail> {
+    let base = url.trim_end_matches('/');
+    ureq::get(&format!("{base}/v1/admin/repos/{repo_id}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .with_context(|| format!("GET /v1/admin/repos/{repo_id}"))?
+        .into_json()
+        .context("parse admin/repos/:id response")
+}
+
+fn spawn_poller(
+    cli: Cli,
+    state: Arc<Mutex<AppState>>,
+    selected: Arc<Mutex<Option<String>>>,
+) {
     let interval = Duration::from_secs_f64(cli.poll_interval_secs.max(0.1));
     std::thread::spawn(move || loop {
         match poll_once(&cli.url, &cli.admin_token) {
@@ -151,12 +197,44 @@ fn spawn_poller(cli: Cli, state: Arc<Mutex<AppState>>) {
                         break;
                     }
                 }
+                drop(s);
             }
             Err(e) => {
                 let mut s = state.lock().expect("state mutex poisoned");
                 s.last_error = Some(format!("{e:#}"));
+                // Keep going to the detail fetch anyway — list and
+                // detail have independent failure modes.
+                drop(s);
             }
         }
+
+        // Second leg: if a repo is selected, keep its detail fresh.
+        // If the user hasn't selected anything, this is skipped.
+        let requested = selected.lock().ok().and_then(|g| g.clone());
+        if let Some(id) = requested {
+            match poll_detail(&cli.url, &cli.admin_token, &id) {
+                Ok(detail) => {
+                    if let Ok(mut s) = state.lock() {
+                        // Stash the detail only if the selection hasn't
+                        // changed underfoot. Otherwise we'd briefly
+                        // show stale data for the previous selection.
+                        if detail.id == id {
+                            s.detail = Some(detail);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.last_error = Some(format!("detail {id}: {e:#}"));
+                    }
+                }
+            }
+        } else if let Ok(mut s) = state.lock() {
+            // No selection → drop any stale detail so the Detail tab
+            // shows "pick a repo" instead of an old one.
+            s.detail = None;
+        }
+
         std::thread::sleep(interval);
     });
 }
@@ -285,12 +363,32 @@ enum View {
     Overview,
     Repos,
     Forks,
+    Detail,
 }
 
 struct App {
     cli: Cli,
     state: Arc<Mutex<AppState>>,
     view: View,
+    /// Which repo's detail to show in the Detail tab. The poller reads
+    /// `selected_for_detail` each loop and fetches that repo's detail
+    /// into `state.detail` — so selecting a repo costs one extra HTTP
+    /// call per poll cycle (not per click) and the UI thread never
+    /// blocks on the network.
+    selected_repo: Option<String>,
+    selected_for_detail: Arc<Mutex<Option<String>>>,
+}
+
+impl App {
+    /// Setter used by click handlers on the Repos and Forks tabs. Writes
+    /// to both the local field and the shared slot the poller watches.
+    fn select_repo(&mut self, id: String) {
+        self.selected_repo = Some(id.clone());
+        if let Ok(mut slot) = self.selected_for_detail.lock() {
+            *slot = Some(id);
+        }
+        self.view = View::Detail;
+    }
 }
 
 impl eframe::App for App {
@@ -331,14 +429,20 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.view, View::Overview, "Overview");
                 ui.selectable_value(&mut self.view, View::Repos, "Repos");
                 ui.selectable_value(&mut self.view, View::Forks, "Forks");
+                ui.selectable_value(&mut self.view, View::Detail, "Detail");
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let snapshot = self.state.lock().unwrap().clone_snapshot();
             match self.view {
                 View::Overview => render_overview(ui, &snapshot),
-                View::Repos => render_repos(ui, &snapshot),
+                View::Repos => {
+                    if let Some(clicked) = render_repos(ui, &snapshot, self.selected_repo.as_deref()) {
+                        self.select_repo(clicked);
+                    }
+                }
                 View::Forks => render_forks(ui, &snapshot),
+                View::Detail => render_detail(ui, &snapshot, self.selected_repo.as_deref()),
             }
         });
     }
@@ -352,6 +456,7 @@ struct StateSnapshot {
     repos: Vec<RepoSummary>,
     metrics: MetricsSnapshot,
     history: VecDeque<Sample>,
+    detail: Option<RepoDetail>,
 }
 impl AppState {
     fn clone_snapshot(&self) -> StateSnapshot {
@@ -359,6 +464,7 @@ impl AppState {
             repos: self.repos.clone(),
             metrics: self.metrics.clone(),
             history: self.history.clone(),
+            detail: self.detail.clone(),
         }
     }
 }
@@ -622,10 +728,17 @@ fn draw_plot(
         });
 }
 
-fn render_repos(ui: &mut egui::Ui, s: &StateSnapshot) {
+/// Return `Some(repo_id)` if the user clicked a row, else `None`.
+fn render_repos(ui: &mut egui::Ui, s: &StateSnapshot, selected: Option<&str>) -> Option<String> {
     ui.heading(format!("Repos ({})", s.repos.len()));
+    ui.label(
+        egui::RichText::new("Click a row to see refs, size on disk, and fork source.")
+            .color(egui::Color32::GRAY)
+            .italics(),
+    );
     ui.add_space(4.0);
 
+    let mut clicked: Option<String> = None;
     egui::ScrollArea::both().show(ui, |ui| {
         egui::Grid::new("repos_grid")
             .striped(true)
@@ -638,7 +751,13 @@ fn render_repos(ui: &mut egui::Ui, s: &StateSnapshot) {
                 ui.strong("source");
                 ui.end_row();
                 for r in &s.repos {
-                    ui.monospace(&r.id);
+                    let is_selected = selected.map(|x| x == r.id).unwrap_or(false);
+                    // Make the id cell act as a selectable label. Cheap
+                    // click target — the whole row is visually highlighted
+                    // via selection state on the first cell.
+                    if ui.selectable_label(is_selected, egui::RichText::new(&r.id).monospace()).clicked() {
+                        clicked = Some(r.id.clone());
+                    }
                     ui.label(r.owner.as_deref().unwrap_or("<admin>"));
                     ui.label(format_age(r.created_at));
                     ui.monospace(r.source_id.as_deref().unwrap_or("—"));
@@ -646,6 +765,117 @@ fn render_repos(ui: &mut egui::Ui, s: &StateSnapshot) {
                 }
             });
     });
+    clicked
+}
+
+fn render_detail(ui: &mut egui::Ui, s: &StateSnapshot, selected: Option<&str>) {
+    match (selected, s.detail.as_ref()) {
+        (None, _) => {
+            ui.heading("Detail");
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("No repo selected. Click one on the Repos tab, or a node in the Forks graph.")
+                    .color(egui::Color32::GRAY)
+                    .italics(),
+            );
+        }
+        (Some(id), None) => {
+            ui.heading("Detail");
+            ui.add_space(8.0);
+            ui.label(format!("Loading detail for {id}…"));
+        }
+        (Some(_id), Some(d)) => render_detail_body(ui, d),
+    }
+}
+
+fn render_detail_body(ui: &mut egui::Ui, d: &RepoDetail) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("Detail");
+        ui.add_space(8.0);
+        egui::Grid::new("detail_grid")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                ui.strong("id");
+                ui.monospace(&d.id);
+                ui.end_row();
+
+                ui.strong("owner");
+                ui.label(d.owner.as_deref().unwrap_or("<admin>"));
+                ui.end_row();
+
+                ui.strong("created");
+                ui.label(format!(
+                    "{} ({} unix)",
+                    format_age(d.created_at),
+                    d.created_at
+                ));
+                ui.end_row();
+
+                ui.strong("fork of");
+                match &d.source_id {
+                    Some(src) => {
+                        ui.monospace(src);
+                    }
+                    None => {
+                        ui.label("— (root)");
+                    }
+                }
+                ui.end_row();
+
+                ui.strong("size on disk");
+                ui.label(format_bytes(d.size_bytes));
+                ui.end_row();
+
+                ui.strong("refs");
+                ui.label(format!("{} total", d.refs.len()));
+                ui.end_row();
+            });
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.heading("Refs");
+        if d.refs.is_empty() {
+            ui.label(
+                egui::RichText::new("(no refs — empty repo)")
+                    .color(egui::Color32::GRAY)
+                    .italics(),
+            );
+        } else {
+            egui::Grid::new("refs_grid")
+                .striped(true)
+                .num_columns(2)
+                .spacing([24.0, 2.0])
+                .show(ui, |ui| {
+                    ui.strong("name");
+                    ui.strong("sha");
+                    ui.end_row();
+                    for r in &d.refs {
+                        ui.label(&r.name);
+                        // Show a short prefix of the SHA for scannability;
+                        // full sha on hover via tooltip.
+                        let short: String = r.sha.chars().take(10).collect();
+                        ui.monospace(short).on_hover_text(&r.sha);
+                        ui.end_row();
+                    }
+                });
+        }
+    });
+}
+
+/// Humanize byte counts: 123 → "123 B", 1500 → "1.5 KB", etc.
+fn format_bytes(n: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("GB", 1024 * 1024 * 1024),
+        ("MB", 1024 * 1024),
+        ("KB", 1024),
+    ];
+    for (unit, size) in UNITS {
+        if n >= *size {
+            return format!("{:.2} {}", n as f64 / *size as f64, unit);
+        }
+    }
+    format!("{} B", n)
 }
 
 fn render_forks(ui: &mut egui::Ui, s: &StateSnapshot) {
@@ -743,7 +973,12 @@ fn format_age(epoch: i64) -> String {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let state = Arc::new(Mutex::new(AppState::default()));
-    spawn_poller(cli.clone(), Arc::clone(&state));
+    let selected_for_detail: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    spawn_poller(
+        cli.clone(),
+        Arc::clone(&state),
+        Arc::clone(&selected_for_detail),
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -756,6 +991,8 @@ fn main() -> Result<()> {
         cli,
         state,
         view: View::Overview,
+        selected_repo: None,
+        selected_for_detail,
     };
     eframe::run_native(
         "artifacts-gui",
@@ -947,6 +1184,18 @@ artifacts_build_info{version=\"0.0.1\"} 1
         // y values untouched
         assert_eq!(pts[0][1], 1.0);
         assert_eq!(pts[2][1], 3.0);
+    }
+
+    #[test]
+    fn format_bytes_rolls_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        // Just below the MB threshold.
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1024.00 KB");
     }
 
     #[test]
