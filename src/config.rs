@@ -9,6 +9,11 @@ pub struct Config {
     /// disables the JWT auth path entirely — only the admin token is
     /// accepted. Set via `--jwt-secret` / `ARTIFACTS_JWT_SECRET`.
     pub jwt_secret: Option<String>,
+
+    /// Maximum number of repos a single non-admin user may own. Applies
+    /// to both `create_repo` and `fork_repo`. Admin bypasses. Set via
+    /// `--max-repos-per-user`.
+    pub max_repos_per_user: u64,
 }
 
 impl Config {

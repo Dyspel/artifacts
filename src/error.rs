@@ -39,6 +39,9 @@ pub enum Error {
         current: Option<String>,
     },
 
+    #[error("repo quota exceeded for {subject} (limit: {limit})")]
+    QuotaExceeded { subject: String, limit: u64 },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -71,6 +74,21 @@ impl IntoResponse for Error {
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            Error::QuotaExceeded { subject, limit } => {
+                // 429 with a dedicated code so clients can tell
+                // "you've hit your quota" apart from "you're being
+                // rate-limited." Includes the limit so the client UI
+                // can surface it.
+                let body = Json(json!({
+                    "error": {
+                        "code": "quota_exceeded",
+                        "message": format!("repo quota exceeded for {subject}"),
+                        "subject": subject,
+                        "limit": limit,
+                    }
+                }));
+                return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            }
             Error::RefConflict { branch, expected, current } => {
                 // Dedicated 409 with the current + expected SHAs so callers
                 // can re-read and retry without a second round trip.

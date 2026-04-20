@@ -53,6 +53,18 @@ pub trait OwnershipStore: Send + Sync {
     /// Remove the ownership record (called after a repo is deleted).
     /// Idempotent; returning Ok when the row didn't exist is fine.
     async fn delete(&self, repo_id: &str) -> Result<()>;
+
+    /// Count the repos currently owned by `subject`. Used for the
+    /// per-user repo-count quota check on create / fork.
+    ///
+    /// We enforce the quota in the handler after recording the new
+    /// owner, because the race between check-then-insert is ~milliseconds
+    /// on a single node and the quota is a soft limit (200 requested →
+    /// 200 created) rather than a hard invariant. Under pathological
+    /// concurrent-create load you can overshoot by a few; if that ever
+    /// matters, wrap this in a `SELECT count(*) ... FOR UPDATE` or move
+    /// the check into the same transaction as the INSERT.
+    async fn count_by_owner(&self, subject: &str) -> Result<u64>;
 }
 
 /// SQLite-backed `OwnershipStore`. Shares the DB file with
@@ -117,6 +129,46 @@ impl OwnershipStore for SqliteOwnershipStore {
         conn.execute("DELETE FROM repos WHERE id = ?1", params![repo_id])?;
         Ok(())
     }
+
+    async fn count_by_owner(&self, subject: &str) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
+        let mut rows = stmt.query(params![subject])?;
+        let row = rows.next()?.expect("COUNT(*) always returns one row");
+        let n: i64 = row.get(0)?;
+        Ok(n as u64)
+    }
+}
+
+/// Quota helper: enforce that `principal` hasn't exceeded the per-user
+/// repo-count quota. Admin bypasses. Non-admin callers without a
+/// subject (shouldn't happen today — all non-admin principals carry a
+/// subject) are treated as over-quota to fail closed.
+///
+/// Call this *before* creating a new repo so the creation and the
+/// quota check agree about the count. Race with concurrent creates is
+/// bounded by request concurrency per user, which is tiny in practice.
+pub async fn check_repo_quota(
+    ownership: &dyn OwnershipStore,
+    principal: &Principal,
+    limit: u64,
+) -> Result<()> {
+    if matches!(principal, Principal::Admin) {
+        return Ok(());
+    }
+    let subject = principal.subject().ok_or(Error::QuotaExceeded {
+        subject: "<no-subject>".to_string(),
+        limit,
+    })?;
+    let current = ownership.count_by_owner(subject).await?;
+    if current >= limit {
+        return Err(Error::QuotaExceeded {
+            subject: subject.to_string(),
+            limit,
+        });
+    }
+    Ok(())
 }
 
 /// Enforcement helper: caller's `principal` must be permitted to act on
@@ -246,5 +298,67 @@ mod tests {
         };
         let r = enforce_owner(&store, &alice, "ghost").await;
         assert!(matches!(r, Err(Error::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn count_by_owner_is_zero_without_rows() {
+        let (_d, store) = fresh_store();
+        assert_eq!(store.count_by_owner("nobody").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_by_owner_tracks_inserts_and_deletes() {
+        let (_d, store) = fresh_store();
+        store.record_owner("r1", Some("alice")).await.unwrap();
+        store.record_owner("r2", Some("alice")).await.unwrap();
+        store.record_owner("r3", Some("bob")).await.unwrap();
+        assert_eq!(store.count_by_owner("alice").await.unwrap(), 2);
+        assert_eq!(store.count_by_owner("bob").await.unwrap(), 1);
+        store.delete("r1").await.unwrap();
+        assert_eq!(store.count_by_owner("alice").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn count_ignores_admin_owned() {
+        // Admin-owned rows have owner_subject = NULL. They must not
+        // count toward any user's quota.
+        let (_d, store) = fresh_store();
+        store.record_owner("a1", None).await.unwrap();
+        store.record_owner("a2", None).await.unwrap();
+        store.record_owner("u1", Some("alice")).await.unwrap();
+        assert_eq!(store.count_by_owner("alice").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_admin_bypasses() {
+        let (_d, store) = fresh_store();
+        // Record 5 admin-owned repos and check the admin's own principal
+        // is still OK against a limit of 0.
+        for i in 0..5 {
+            store.record_owner(&format!("r{i}"), None).await.unwrap();
+        }
+        check_repo_quota(&store, &Principal::Admin, 0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_user_allowed_under_limit() {
+        let (_d, store) = fresh_store();
+        store.record_owner("r1", Some("alice")).await.unwrap();
+        let alice = Principal::User { subject: "alice".into() };
+        check_repo_quota(&store, &alice, 5).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quota_user_rejected_at_limit() {
+        let (_d, store) = fresh_store();
+        for i in 0..3u32 {
+            store.record_owner(&format!("r{i}"), Some("alice")).await.unwrap();
+        }
+        let alice = Principal::User { subject: "alice".into() };
+        let r = check_repo_quota(&store, &alice, 3).await;
+        assert!(matches!(
+            r,
+            Err(Error::QuotaExceeded { ref subject, limit: 3 }) if subject == "alice"
+        ));
     }
 }

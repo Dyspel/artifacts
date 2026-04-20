@@ -68,6 +68,15 @@ enum Cmd {
         #[arg(long)]
         token_db: Option<PathBuf>,
 
+        /// Maximum number of repos a single non-admin user may own.
+        /// Prevents an agent retry loop or runaway client from creating
+        /// unbounded repos. Admin callers bypass the limit. Set high
+        /// enough that a legitimate heavy user doesn't hit it; low
+        /// enough that a misbehaving one can't fill the disk before
+        /// someone notices.
+        #[arg(long, default_value_t = 100)]
+        max_repos_per_user: u64,
+
         /// Opt-in to binding a non-loopback address with `http://`.
         /// Without this flag we refuse to start in that combination,
         /// because it broadcasts tokens in the clear to anyone who can
@@ -100,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
             admin_token,
             jwt_secret,
             token_db,
+            max_repos_per_user,
             allow_insecure,
         } => {
             // Refuse to start in the "non-loopback bind + plaintext HTTP"
@@ -124,7 +134,9 @@ async fn main() -> anyhow::Result<()> {
                 public_base_url,
                 admin_token,
                 jwt_secret,
+                max_repos_per_user,
             });
+            tracing::info!(limit = max_repos_per_user, "max repos per non-admin user");
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));

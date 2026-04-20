@@ -7,7 +7,7 @@ use crate::{
     auth::authorize_rest,
     config::Config,
     error::{Error, Result},
-    ownership::{enforce_owner, OwnershipStore},
+    ownership::{check_repo_quota, enforce_owner, OwnershipStore},
     refs::RefStore,
     storage::{new_repo_id, Storage},
     tokens::{Scope, TokenStore},
@@ -79,6 +79,12 @@ pub async fn create_repo(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    check_repo_quota(
+        &*state.ownership,
+        &principal,
+        state.cfg.max_repos_per_user,
+    )
+    .await?;
     let id = body
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
@@ -124,6 +130,15 @@ pub async fn fork_repo(
         return Err(Error::RepoNotFound(source_id));
     }
     enforce_owner(&*state.ownership, &principal, &source_id).await?;
+    // Quota applies to forks too — the point is to bound a single
+    // user's footprint regardless of whether the repos came from
+    // create or fork.
+    check_repo_quota(
+        &*state.ownership,
+        &principal,
+        state.cfg.max_repos_per_user,
+    )
+    .await?;
     let (fork_id, read_only) = body
         .map(|Json(b)| (b.id, b.read_only))
         .unwrap_or((None, false));
