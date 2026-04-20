@@ -282,15 +282,10 @@ is passed. Tokens travel in the clear otherwise.
 
 ## Still open — production blockers this guide does not close
 
-The four commits this guide ships with get Dyspel to the "single-user
-dogfooding" line. Before a user other than you hits the system,
-you also need:
+The commits this guide references cover "single-user dogfooding" plus
+the basic abuse-bounding needed before letting a small cohort in.
+Before public / multi-tenant traffic, you still need:
 
-- **Rate limiting.** Per-subject token-bucket on all REST endpoints,
-  including `POST /v1/repos` (an agent in a retry loop can otherwise
-  create infinite repos).
-- **Per-user quotas.** Max repos per user, max size per repo, max
-  branches per repo. Tied to Lite vs Pro tier.
 - **Backups.** `tokens.db` + `repos/` on one disk. A host-failure-level
   event loses work. Minimum: nightly tar + rsync to object storage,
   documented restore procedure.
@@ -308,3 +303,35 @@ you also need:
 
 See the response in chat for the full priority-ordered list with effort
 estimates; this guide is the "what's wired today" half.
+
+## What's wired today (changelog)
+
+| Feature                                                | In main since |
+| ------------------------------------------------------ | ------------- |
+| JWT verification (HS256, Dyspel claim shape)           | Prod-1        |
+| Per-repo ownership + 403 on cross-user access          | Prod-2        |
+| Refuse non-loopback HTTP bind without `--allow-insecure` | Prod-3        |
+| Per-user repo-count quota (`max_repos_per_user`)       | Prod-5        |
+| Per-subject token-bucket rate limiter                  | Prod-6        |
+| Per-blob size cap on REST commits                      | Prod-7        |
+
+### Tuning knobs
+
+For a Dyspel deploy, override the defaults:
+
+```sh
+ARTIFACTS_ADMIN_TOKEN=...                              # from secrets
+ARTIFACTS_JWT_SECRET="$LITE_JWT_SECRET"                # same as Dyspel
+ARTIFACTS_MAX_REPOS_PER_USER=1000                      # well above any real user
+ARTIFACTS_MAX_COMMIT_BLOB_BYTES=$((8 * 1024 * 1024))   # 8 MB, the default
+artifacts serve \
+  --data-dir /var/lib/artifacts \
+  --bind 127.0.0.1:8787 \
+  --public-base-url https://artifacts.dyspel.example.com
+```
+
+The rate-limit budgets are compile-time constants in
+`src/rate_limit.rs` (20 burst / 10 per min for create, 120 burst / 2
+per sec for token, 600 burst / 10 per sec for commit). If Dyspel
+needs different shapes per tier (e.g., Lite vs Pro), promote those
+to configurable values — a small change.

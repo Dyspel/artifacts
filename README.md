@@ -73,6 +73,12 @@ end-to-end in a day, not a quarter.
 | Tokens with TTL, revocation endpoint, SHA-256 hashed at rest     | ✅     |
 | `git-http-backend` CGI removed — direct pack-handler shell-outs   | ✅     |
 | Native v2 `info/refs` — no subprocess for the discovery request  | ✅     |
+| JWT verification on REST (Dyspel-signed HS256 accepted)          | ✅     |
+| Per-repo ownership + cross-user 403 enforcement                  | ✅     |
+| Refuse non-loopback HTTP bind without `--allow-insecure`         | ✅     |
+| Per-user repo-count quota (429 `quota_exceeded`)                 | ✅     |
+| Per-subject token-bucket rate limiter (429 `rate_limited`)       | ✅     |
+| Per-blob size cap on REST commits                                | ✅     |
 
 **Known not-yet:**
 
