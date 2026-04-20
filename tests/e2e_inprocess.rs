@@ -337,6 +337,21 @@ fn e2e_inprocess_full_surface() {
         "hello from e2e\n"
     );
 
+    // Incremental fetch: push a second commit from clone_a, then fetch
+    // it into clone_a2. The fetch sends `have` lines, exercising the
+    // native v2 fetch path's have/want negotiation (vs the full clone's
+    // empty-haves case).
+    std::fs::write(clone_a.join("second.txt"), "second\n").unwrap();
+    git_must(&clone_a, &["add", "second.txt"]);
+    git_must(&clone_a, &["commit", "-q", "-m", "second"]);
+    git_must(&clone_a, &["push", "-q", "origin", "main"]);
+    git_must(&clone_a2, &["fetch", "-q", "origin", "main"]);
+    git_must(&clone_a2, &["merge", "-q", "--ff-only", "origin/main"]);
+    assert!(
+        clone_a2.join("second.txt").exists(),
+        "incremental fetch landed"
+    );
+
     // --- per-repo read endpoints on the pushed repo ------------------
     let auth = |req: ureq::Request| req.set("Authorization", &bearer(admin));
     let detail = send(auth(ureq::get(&format!("{base}/v1/repos/{repo_id}"))));
