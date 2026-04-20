@@ -55,8 +55,11 @@ fn serve_drains_gracefully_on_sigterm() {
         &base_url,
         "--admin-token",
         "shutdown-admin",
+        // Non-zero drain delay exercises the "mark draining, sleep so
+        // the orchestrator can pull from rotation" branch of the
+        // shutdown signal (the e2e_tls test covers the zero-delay path).
         "--shutdown-drain-delay-secs",
-        "0",
+        "1",
         "--shutdown-timeout-secs",
         "5",
     ])
