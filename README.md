@@ -8,7 +8,11 @@ Git client interop, O(1) forks, a REST side-door — can be made to work
 end-to-end in a day, not a quarter.
 
 > If you want the *why*, read [ARCHITECTURE.md](./ARCHITECTURE.md). This file
-> is the *what* — the surface, the numbers, and the commands.
+> is the *what* — the surface, the numbers, and the commands. For wiring
+> this into the [Dyspel collaborative AI IDE](https://github.com/dyspel),
+> see [DYSPEL.md](./DYSPEL.md) — it covers the JWT handoff, the
+> gitSyncService migration, and what's still open before production
+> traffic.
 
 ## What this is *not*, plainly
 
