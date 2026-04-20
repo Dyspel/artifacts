@@ -90,9 +90,14 @@ struct MetricsSnapshot {
     requests_total: u64,
     rate_limited_total: u64,
     quota_exceeded_total: u64,
-    latency_p50_ms: f64,
-    latency_p95_ms: f64,
-    latency_p99_ms: f64,
+    /// Aggregated histogram: buckets summed across every label series
+    /// into one BTreeMap keyed by upper-bound `le`. Values are cumulative
+    /// counts since server start, which is what Prometheus emits; we
+    /// compute percentiles over *deltas* between snapshots at render
+    /// time, not from the cumulative itself. Cumulative-percentile is
+    /// a flatline at the max-ever-observed latency and doesn't reflect
+    /// current conditions.
+    latency_buckets: BTreeMap<OrdF64, u64>,
     build_version: Option<String>,
 }
 
@@ -165,13 +170,10 @@ fn spawn_poller(cli: Cli, state: Arc<Mutex<AppState>>) {
 
 fn parse_metrics(text: &str) -> MetricsSnapshot {
     let mut out = MetricsSnapshot::default();
-    // Accumulate histogram buckets across all label series. For a
-    // prometheus cumulative histogram, sum-of-cumulative-counts at
-    // each `le` across series gives the overall cumulative count — so
-    // computing percentiles from the aggregate is mathematically
-    // correct (not a "sum of percentiles" fallacy).
-    let mut bucket_agg: BTreeMap<OrdF64, u64> = BTreeMap::new();
-
+    // Aggregate histogram buckets across all label series. Prometheus
+    // cumulative histograms can be summed across series at the same
+    // `le` to produce an overall cumulative histogram with the right
+    // semantics.
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -183,35 +185,54 @@ fn parse_metrics(text: &str) -> MetricsSnapshot {
         } else if let Some(rest) = line.strip_prefix("artifacts_quota_exceeded_total") {
             out.quota_exceeded_total = last_number(rest).unwrap_or(0.0) as u64;
         } else if line.starts_with("artifacts_requests_total{") {
-            // Sum over all label series → total served.
             out.requests_total += last_number(line).unwrap_or(0.0) as u64;
         } else if line.starts_with("artifacts_request_duration_seconds_bucket{") {
             if let (Some(le), Some(count)) = (extract_le(line), last_number(line)) {
-                *bucket_agg.entry(OrdF64(le)).or_insert(0) += count as u64;
+                *out.latency_buckets.entry(OrdF64(le)).or_insert(0) += count as u64;
             }
         } else if line.starts_with("artifacts_build_info{") {
             out.build_version = extract_label(line, "version");
         }
     }
+    out
+}
 
-    // Compute percentiles from the aggregate histogram.
-    if let Some(&total) = bucket_agg.get(&OrdF64(f64::INFINITY)) {
-        if total > 0 {
-            let targets = [(0.50, &mut out.latency_p50_ms),
-                           (0.95, &mut out.latency_p95_ms),
-                           (0.99, &mut out.latency_p99_ms)];
-            for (p, slot) in targets {
-                let need = (total as f64 * p).ceil() as u64;
-                for (le, cum) in &bucket_agg {
-                    if *cum >= need {
-                        *slot = le.0 * 1000.0; // seconds → ms
-                        break;
-                    }
-                }
-            }
+/// Compute the p-th percentile (0.0..=1.0) of the observations *between*
+/// two histogram snapshots. Returns `None` if there were no observations
+/// in that interval — so the chart draws a gap instead of a flatline
+/// when traffic stops, and so the overview table shows "—".
+///
+/// Algorithm:
+///   1. delta[le] = newer[le] - older[le]   (observations in this bucket's
+///      cumulative range during the interval)
+///   2. total = delta[+Inf]                  (all observations in interval)
+///   3. find smallest le where delta[le] ≥ total × p
+///   4. return that le (seconds); caller converts to ms for display
+///
+/// This matches Prometheus's `histogram_quantile(p, rate(...[T]))` —
+/// the interval replaces the rate window.
+fn percentile_between(
+    older: &BTreeMap<OrdF64, u64>,
+    newer: &BTreeMap<OrdF64, u64>,
+    p: f64,
+) -> Option<f64> {
+    let new_total = newer.get(&OrdF64(f64::INFINITY)).copied().unwrap_or(0);
+    let old_total = older.get(&OrdF64(f64::INFINITY)).copied().unwrap_or(0);
+    let total = new_total.saturating_sub(old_total);
+    if total == 0 {
+        return None;
+    }
+    let target = ((total as f64) * p).ceil() as u64;
+    // BTreeMap iterates in key order (ascending `le`), which is what we
+    // want for "smallest le whose delta cumulative is ≥ target".
+    for (le, new_cum) in newer {
+        let old_cum = older.get(le).copied().unwrap_or(0);
+        let delta = new_cum.saturating_sub(old_cum);
+        if delta >= target {
+            return Some(le.0);
         }
     }
-    out
+    None
 }
 
 /// Last whitespace-separated token, parsed as f64.
@@ -378,29 +399,35 @@ fn render_overview(ui: &mut egui::Ui, s: &StateSnapshot) {
             });
 
         ui.add_space(16.0);
-        ui.heading("Latency (aggregate across endpoints)");
+        ui.heading("Latency — last interval");
         ui.add_space(4.0);
+        // Compute over the last two samples in the history. If fewer
+        // than 2 samples yet, or the last interval had no requests,
+        // we render "—" instead of stale cumulative values.
+        let latest_pct = last_interval_percentiles(&s.history);
         egui::Grid::new("latency_grid")
             .num_columns(2)
             .spacing([24.0, 6.0])
             .show(ui, |ui| {
                 ui.strong("p50");
-                ui.monospace(format!("{:.2} ms", s.metrics.latency_p50_ms));
+                ui.monospace(fmt_ms(latest_pct.0));
                 ui.end_row();
                 ui.strong("p95");
-                ui.monospace(format!("{:.2} ms", s.metrics.latency_p95_ms));
+                ui.monospace(fmt_ms(latest_pct.1));
                 ui.end_row();
                 ui.strong("p99");
-                ui.monospace(format!("{:.2} ms", s.metrics.latency_p99_ms));
+                ui.monospace(fmt_ms(latest_pct.2));
                 ui.end_row();
             });
 
         ui.add_space(16.0);
         ui.label(
             egui::RichText::new(
-                "Percentiles are bucket-approximations — upper-edge of the first \
-             bucket at or above the target fraction. For sub-ms accuracy, \
-             tighten the bucket set in src/metrics.rs.",
+                "Percentiles are over the last poll interval, not cumulative \
+             since startup. If no requests happened in the last interval, \
+             the value shows — (not the prior reading). Bucket granularity \
+             is set by the 12 buckets in src/metrics.rs; tighten those if \
+             you need sub-ms resolution.",
             )
             .color(egui::Color32::GRAY)
             .italics(),
@@ -438,19 +465,50 @@ fn render_request_rate_plot(ui: &mut egui::Ui, history: &VecDeque<Sample>) {
     draw_plot(ui, "req_rate_plot", &[("req/s", &points)], /*y_log*/ false);
 }
 
-/// Time-series: p50, p95, p99 over time. Raw values from each sample —
-/// already a per-poll snapshot, no rate math needed.
+/// Time-series: p50, p95, p99 of the observations between each pair of
+/// consecutive samples. The cumulative histogram only ever grows, so
+/// "cumulative p99" is a flatline at max-ever-observed latency — what
+/// the user observed in v1 of this chart. Interval-percentile matches
+/// the Prometheus idiom `histogram_quantile(p, rate(..._bucket[1m]))`.
 fn render_latency_plot(ui: &mut egui::Ui, history: &VecDeque<Sample>) {
-    ui.label(egui::RichText::new("Latency percentiles (ms)").strong());
-    let p50: Vec<[f64; 2]> = abs_points(history, |m| m.latency_p50_ms);
-    let p95: Vec<[f64; 2]> = abs_points(history, |m| m.latency_p95_ms);
-    let p99: Vec<[f64; 2]> = abs_points(history, |m| m.latency_p99_ms);
+    ui.label(egui::RichText::new("Latency percentiles (ms, per-interval)").strong());
+    let p50 = interval_percentile_points(history, 0.50);
+    let p95 = interval_percentile_points(history, 0.95);
+    let p99 = interval_percentile_points(history, 0.99);
     draw_plot(
         ui,
         "latency_plot",
         &[("p50", &p50), ("p95", &p95), ("p99", &p99)],
         false,
     );
+}
+
+/// Build a time-series of interval percentiles across the history. For
+/// each consecutive (prev, curr) pair, compute `percentile_between` —
+/// plot point is `[-curr_age, percentile_ms]`. Intervals with zero
+/// observations are skipped (no point emitted), so the line breaks
+/// rather than misleading the reader with a flat value.
+fn interval_percentile_points(
+    history: &VecDeque<Sample>,
+    p: f64,
+) -> Vec<[f64; 2]> {
+    if history.len() < 2 {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let mut out = Vec::with_capacity(history.len() - 1);
+    let mut prev = &history[0];
+    for s in history.iter().skip(1) {
+        if let Some(v_secs) =
+            percentile_between(&prev.metrics.latency_buckets, &s.metrics.latency_buckets, p)
+        {
+            let age = now.duration_since(s.at).as_secs_f64();
+            // Convert s → ms for the chart.
+            out.push([-age, v_secs * 1000.0]);
+        }
+        prev = s;
+    }
+    out
 }
 
 /// Rate-limit + quota-exceeded counters as rates over time. These are
@@ -469,6 +527,7 @@ fn render_errors_plot(ui: &mut egui::Ui, history: &VecDeque<Sample>) {
 
 /// Convert history into `[-age_secs, value]` points. x is negative so the
 /// most-recent sample sits at x=0 and the oldest is on the left.
+#[cfg(test)]
 fn abs_points(
     history: &VecDeque<Sample>,
     f: impl Fn(&MetricsSnapshot) -> f64,
@@ -481,6 +540,25 @@ fn abs_points(
             [-age, f(&s.metrics)]
         })
         .collect()
+}
+
+/// p50/p95/p99 (ms) over the last poll interval. Returns `(None,...)`
+/// if fewer than 2 samples, or if the interval had no observations.
+fn last_interval_percentiles(history: &VecDeque<Sample>) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if history.len() < 2 {
+        return (None, None, None);
+    }
+    let older = &history[history.len() - 2].metrics.latency_buckets;
+    let newer = &history[history.len() - 1].metrics.latency_buckets;
+    let ms = |p| percentile_between(older, newer, p).map(|s| s * 1000.0);
+    (ms(0.50), ms(0.95), ms(0.99))
+}
+
+fn fmt_ms(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.2} ms", x),
+        None => "—".to_string(),
+    }
 }
 
 /// Convert history into per-second rate points by diffing consecutive
@@ -694,7 +772,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_metrics_extracts_counters_and_percentiles() {
+    fn parse_metrics_extracts_counters_and_buckets() {
         let text = "\
 # TYPE artifacts_rate_limited_total counter
 artifacts_rate_limited_total 7
@@ -715,11 +793,86 @@ artifacts_build_info{version=\"0.0.1\"} 1
         assert_eq!(m.quota_exceeded_total, 2);
         assert_eq!(m.requests_total, 15);
         assert_eq!(m.build_version.as_deref(), Some("0.0.1"));
-        // All 10 observations fall at or below the 0.001 bucket, so p50,
-        // p95, p99 should all land at 1 ms.
-        assert!((m.latency_p50_ms - 1.0).abs() < 1e-6);
-        assert!((m.latency_p95_ms - 1.0).abs() < 1e-6);
-        assert!((m.latency_p99_ms - 1.0).abs() < 1e-6);
+        // Buckets are stored raw now. 10 at 0.001, 10 at 0.01, 10 at +Inf.
+        assert_eq!(m.latency_buckets.get(&OrdF64(0.001)).copied(), Some(10));
+        assert_eq!(m.latency_buckets.get(&OrdF64(0.01)).copied(), Some(10));
+        assert_eq!(m.latency_buckets.get(&OrdF64(f64::INFINITY)).copied(), Some(10));
+    }
+
+    fn buckets(pairs: &[(f64, u64)]) -> BTreeMap<OrdF64, u64> {
+        pairs.iter().map(|(k, v)| (OrdF64(*k), *v)).collect()
+    }
+
+    #[test]
+    fn percentile_between_returns_none_when_interval_empty() {
+        // Same cumulative count on both sides → no new observations.
+        let a = buckets(&[(0.001, 10), (0.01, 10), (f64::INFINITY, 10)]);
+        let b = buckets(&[(0.001, 10), (0.01, 10), (f64::INFINITY, 10)]);
+        assert_eq!(percentile_between(&a, &b, 0.50), None);
+        assert_eq!(percentile_between(&a, &b, 0.99), None);
+    }
+
+    #[test]
+    fn percentile_between_finds_bucket_from_delta() {
+        // older: 10 observations all at ≤1ms.
+        // newer: 10 more observations, but at ≤10ms. Interval delta =
+        // 10 observations at the 0.01 bucket → any percentile should
+        // land at 0.01.
+        let older = buckets(&[(0.001, 10), (0.01, 10), (f64::INFINITY, 10)]);
+        let newer = buckets(&[(0.001, 10), (0.01, 20), (f64::INFINITY, 20)]);
+        assert_eq!(percentile_between(&older, &newer, 0.50), Some(0.01));
+        assert_eq!(percentile_between(&older, &newer, 0.99), Some(0.01));
+    }
+
+    #[test]
+    fn percentile_between_gives_different_answers_for_different_p() {
+        // Interval adds: 90 fast (≤1ms) + 10 slow (>1ms, ≤10ms).
+        // p50 should land at the fast bucket (0.001s).
+        // p95 should land at the slow bucket (0.01s).
+        let older = buckets(&[(0.001, 0), (0.01, 0), (f64::INFINITY, 0)]);
+        let newer = buckets(&[(0.001, 90), (0.01, 100), (f64::INFINITY, 100)]);
+        assert_eq!(percentile_between(&older, &newer, 0.50), Some(0.001));
+        assert_eq!(percentile_between(&older, &newer, 0.95), Some(0.01));
+    }
+
+    #[test]
+    fn last_interval_percentiles_returns_none_with_too_few_samples() {
+        let mut h: VecDeque<Sample> = VecDeque::new();
+        assert_eq!(last_interval_percentiles(&h), (None, None, None));
+        h.push_back(make_sample(0.0, mk_metrics(0)));
+        assert_eq!(last_interval_percentiles(&h), (None, None, None));
+    }
+
+    #[test]
+    fn last_interval_percentiles_uses_only_the_last_pair() {
+        let mut h: VecDeque<Sample> = VecDeque::new();
+        // Three samples; the last interval only saw slow observations.
+        // An older interval had fast observations, but those must NOT
+        // influence the "last interval" values.
+        h.push_back(Sample {
+            at: Instant::now().checked_sub(Duration::from_secs(4)).unwrap_or_else(Instant::now),
+            metrics: MetricsSnapshot {
+                latency_buckets: buckets(&[(0.001, 0), (0.01, 0), (f64::INFINITY, 0)]),
+                ..Default::default()
+            },
+        });
+        h.push_back(Sample {
+            at: Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now),
+            metrics: MetricsSnapshot {
+                latency_buckets: buckets(&[(0.001, 50), (0.01, 50), (f64::INFINITY, 50)]),
+                ..Default::default()
+            },
+        });
+        h.push_back(Sample {
+            at: Instant::now(),
+            metrics: MetricsSnapshot {
+                latency_buckets: buckets(&[(0.001, 50), (0.01, 60), (f64::INFINITY, 60)]),
+                ..Default::default()
+            },
+        });
+        let (p50, _p95, _p99) = last_interval_percentiles(&h);
+        // The last interval added 10 observations, all in the 0.01 bucket.
+        assert_eq!(p50, Some(10.0)); // 10 ms
     }
 
     #[test]
