@@ -1076,4 +1076,179 @@ mod tests {
         assert_ne!(h_a1, h_b, "different actors must hash differently");
         assert_eq!(h_a1.len(), 32, "SHA-256 output is 32 bytes");
     }
+
+    // -----------------------------------------------------------------------
+    // AuditQuery filter-branch coverage
+    // -----------------------------------------------------------------------
+
+    /// Insert rows with distinct timestamps and verify that `since_ts` and
+    /// `until_ts` filters work individually (covering the two SQL branches
+    /// that are only exercised when the fields are `Some`).
+    #[tokio::test]
+    async fn list_since_ts_filter_only() {
+        let (_d, s) = store();
+        let mut e1 = evt("a", "u1", None);
+        e1.ts = 50;
+        let mut e2 = evt("b", "u1", None);
+        e2.ts = 150;
+        s.record(e1).await.unwrap();
+        s.record(e2).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                since_ts: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "b");
+    }
+
+    #[tokio::test]
+    async fn list_until_ts_filter_only() {
+        let (_d, s) = store();
+        let mut e1 = evt("a", "u1", None);
+        e1.ts = 50;
+        let mut e2 = evt("b", "u1", None);
+        e2.ts = 150;
+        s.record(e1).await.unwrap();
+        s.record(e2).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                until_ts: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "a");
+    }
+
+    /// `event` filter: only rows whose event field matches exactly.
+    #[tokio::test]
+    async fn list_event_filter() {
+        let (_d, s) = store();
+        s.record(evt("repo.create", "admin", None)).await.unwrap();
+        s.record(evt("token.mint", "admin", None)).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                event: Some("repo.create".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "repo.create");
+    }
+
+    /// `actor` filter: only rows whose actor matches.
+    #[tokio::test]
+    async fn list_actor_filter() {
+        let (_d, s) = store();
+        s.record(evt("e1", "alice", None)).await.unwrap();
+        s.record(evt("e2", "bob", None)).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                actor: Some("alice".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor, "alice");
+    }
+
+    /// `repo_id` filter: only rows whose repo_id matches.
+    #[tokio::test]
+    async fn list_repo_id_filter() {
+        let (_d, s) = store();
+        s.record(evt("e1", "admin", Some("repo-one")))
+            .await
+            .unwrap();
+        s.record(evt("e2", "admin", Some("repo-two")))
+            .await
+            .unwrap();
+        s.record(evt("e3", "admin", None)).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                repo_id: Some("repo-one".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].repo_id.as_ref().map(crate::ids::RepoId::as_str),
+            Some("repo-one")
+        );
+    }
+
+    /// All five filter fields combined.
+    #[tokio::test]
+    async fn list_all_filters_combined() {
+        let (_d, s) = store();
+        // Row that matches all filters.
+        let mut match_row = evt("repo.create", "admin", Some("repo-a"));
+        match_row.ts = 200;
+        // Row that doesn't match on ts.
+        let mut ts_miss = evt("repo.create", "admin", Some("repo-a"));
+        ts_miss.ts = 50;
+        // Row that doesn't match on event.
+        let mut ev_miss = evt("token.mint", "admin", Some("repo-a"));
+        ev_miss.ts = 200;
+        s.record(match_row).await.unwrap();
+        s.record(ts_miss).await.unwrap();
+        s.record(ev_miss).await.unwrap();
+        let rows = s
+            .list(AuditQuery {
+                since_ts: Some(100),
+                until_ts: Some(300),
+                event: Some("repo.create".into()),
+                actor: Some("admin".into()),
+                repo_id: Some("repo-a".into()),
+                limit: Some(10),
+                offset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "repo.create");
+    }
+
+    /// `verify_chain` on a non-empty store must report the correct count.
+    #[tokio::test]
+    async fn verify_chain_returns_correct_count_for_populated_chain() {
+        let (_d, s) = store();
+        for i in 0..7 {
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
+        }
+        let ok = s.verify_chain().await.unwrap();
+        assert_eq!(ok.verified, 7, "verify_chain must count all chained rows");
+    }
+
+    /// `count` after inserts and after pruning reflects actual row count.
+    #[tokio::test]
+    async fn count_reflects_inserts_and_prune() {
+        let (_d, s) = store();
+        assert_eq!(s.count().await.unwrap(), 0);
+        for i in 0..5 {
+            let mut e = evt(&format!("e{i}"), "admin", None);
+            e.ts = i as i64 * 100 + 100;
+            s.record(e).await.unwrap();
+        }
+        assert_eq!(s.count().await.unwrap(), 5);
+        // Prune rows older than ts=300 (rows with ts < 300 → e0@100, e1@200).
+        let pruned = s.prune_older_than(300).await.unwrap();
+        assert_eq!(pruned, 2);
+        assert_eq!(s.count().await.unwrap(), 3);
+    }
+
+    /// `probe_write` on a real store must succeed.
+    #[tokio::test]
+    async fn probe_write_succeeds_on_real_store() {
+        let (_d, s) = store();
+        s.probe_write().await.unwrap();
+    }
 }

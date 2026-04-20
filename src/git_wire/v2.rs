@@ -603,4 +603,109 @@ mod tests {
         let result = generate_pack_via_pack_objects(&repo.git_dir, &[nonexistent], &[]).await;
         assert!(result.is_err(), "expected error for missing OID, got ok");
     }
+
+    // -----------------------------------------------------------------------
+    // Response-builder / error-branch coverage
+    // -----------------------------------------------------------------------
+
+    /// `native_ls_refs_response` must return 200 + the correct Content-Type
+    /// for a standard prefix set, confirming the `Response::builder()` path
+    /// succeeds (the `.map_err` arms are unreachable because StatusCode::OK
+    /// and the static header value are both valid constants).
+    #[tokio::test]
+    async fn native_ls_refs_response_has_correct_headers() {
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: false,
+            prefixes: vec!["refs/heads/".into()],
+        };
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-result"
+        );
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+    }
+
+    /// `native_ls_refs_response` with an invalid repo_id string must return
+    /// an `Err` (the `RepoId::try_from(repo_id)?` branch at v2.rs ~189).
+    #[tokio::test]
+    async fn native_ls_refs_response_invalid_repo_id_returns_error() {
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: true,
+            prefixes: vec!["HEAD".into()],
+        };
+        // "BAD" is too short (3 chars) to be a valid RepoId.
+        let result = native_ls_refs_response("BAD", &refs, args).await;
+        assert!(
+            result.is_err(),
+            "invalid repo_id must produce an error, not a response"
+        );
+    }
+
+    /// Unborn HEAD without `symrefs: true` must NOT emit the unborn line
+    /// (the `args.symrefs` check at v2.rs ~214).
+    #[tokio::test]
+    async fn native_ls_refs_response_unborn_head_without_symrefs_omits_line() {
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: false, // no symrefs requested
+            prefixes: vec!["HEAD".into()],
+        };
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        // Without symrefs, the unborn HEAD line must NOT appear.
+        assert!(
+            !s.contains("unborn"),
+            "unborn HEAD must not appear when symrefs=false; body={s:?}"
+        );
+        // Only the flush-pkt should be present.
+        assert_eq!(s, "0000", "only flush-pkt expected; body={s:?}");
+    }
+
+    /// `native_v2_fetch_response` must return 200 + correct Content-Type
+    /// even for an empty-wants request (confirms the builder succeeds on
+    /// the no-pack path).
+    #[tokio::test]
+    async fn native_v2_fetch_response_headers_on_empty_wants() {
+        let repo = crate::test_support::TestRepo::new();
+        let req = crate::git_wire::proto::V2FetchRequest {
+            wants: Vec::new(),
+            haves: Vec::new(),
+            done: true,
+            has_unsupported: false,
+            no_progress: true,
+        };
+        let resp = native_v2_fetch_response(&repo.git_dir, req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-result"
+        );
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+    }
+
+    // NOTE on the `Response::builder()` `.map_err` arms at v2.rs ~88 and ~261:
+    // Both arms are genuinely unreachable in practice — `StatusCode::OK` is a
+    // compile-time constant that is always valid, and the header name+value
+    // strings are static literals that `axum::http` accepts unconditionally.
+    // `http::Response::builder()` only errors when the status code or a header
+    // value is malformed, which cannot happen with our fixed constants.
+    // Reaching those arms would require `axum::http` to change the validity
+    // rules for `StatusCode::OK` or for the two static strings — a breaking
+    // change in the http crate, not something a unit test can induce.
 }
