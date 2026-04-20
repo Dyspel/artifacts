@@ -12,7 +12,9 @@ end-to-end in a day, not a quarter.
 > this into the [Dyspel collaborative AI IDE](https://github.com/dyspel),
 > see [DYSPEL.md](./DYSPEL.md) — it covers the JWT handoff, the
 > gitSyncService migration, and what's still open before production
-> traffic.
+> traffic. For a live view of what the server knows about itself —
+> repos, forks, metrics — see [GUI.md](./GUI.md) (eframe/egui,
+> Wayland-ready).
 
 ## What this is *not*, plainly
 
@@ -81,6 +83,8 @@ end-to-end in a day, not a quarter.
 | Per-blob size cap on REST commits                                | ✅     |
 | Prometheus `/metrics` endpoint (request counts, latencies, errors) | ✅   |
 | `X-Request-Id` header roundtrip + structured per-request log     | ✅     |
+| `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
+| `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
 
@@ -445,6 +449,22 @@ supplied one on the request and it's well-formed (≤128 chars of
 every log line the handler emits carries `request_id=<id>` as a
 structured field — grep-friendly for incident debugging.
 
+### Admin inspection (read-only)
+
+```
+GET /v1/admin/repos         →  [{ id, owner, createdAt, sourceId? }, ...]
+GET /v1/admin/repos/:id     →  { …summary, sizeBytes, refs: [{ name, sha }] }
+```
+
+Both admin-only. `sourceId` is derived by reading the repo's
+`objects/info/alternates` file, so forks are discoverable via the
+admin list without a separate column. The list endpoint intentionally
+omits size and ref walks (O(n_repos) each); those live on the detail
+endpoint, which walks only the requested repo.
+
+Powers [`artifacts-gui`](./GUI.md) — the Wayland/X11 live viewer — and
+any other tooling that needs to browse server state out-of-band.
+
 ### Git endpoints
 
 The standard smart-HTTP surface, exposed under `/git/:id.git/`:
@@ -478,7 +498,9 @@ artifacts/
 │   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
 │   ├── smart_http.rs          direct shell-outs to git upload-pack / git receive-pack
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
-│   └── rest.rs                REST endpoints (create / fork / tokens / revoke / delete)
+│   ├── rest.rs                REST endpoints (create / fork / tokens / revoke / delete / admin)
+│   └── bin/
+│       └── artifacts-gui.rs   feature-gated: eframe/egui Wayland/X11 visualizer
 ├── tests/
 │   └── smoke.sh               14-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart → JWT → quota → blob-cap → /metrics
 └── scripts/
