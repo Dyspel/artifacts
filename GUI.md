@@ -81,7 +81,7 @@ shell that already has your session's display env vars. See
 Not tested on macOS or Windows. eframe supports both in principle; if
 you try it there, pass the default build through and see what happens.
 
-## What the three views show
+## What the four views show
 
 **Overview** — the most useful tab. Shows:
 
@@ -103,14 +103,47 @@ samples are needed to compute a rate.
 
 **Repos** — four-column scrollable table: id, owner (or `<admin>`),
 relative created-at, and source id (the parent repo in a fork chain,
-or `—` for roots). Ordering is whatever the server returns, which is
+or `—` for roots). **Click any id to select that repo** — it highlights
+in the list and the Detail tab populates with its refs, size on disk,
+and fork source. Ordering is whatever the server returns, which is
 `created_at DESC` (newest first).
 
-**Forks** — tree view. Roots (repos without a source) at the top,
-their children nested underneath, recursively. Orphaned forks (source
-id not in the current list — parent was deleted, or admin-list data
-is partial) get a separate section at the bottom so they stay visible
-rather than vanishing.
+**Forks** — graphical tree. Roots at the top, forks attached below
+their parent by a line edge. Each node is a rounded rectangle with the
+short repo id + owner. Controls:
+
+- **Drag** to pan
+- **Scroll** to zoom (centered on cursor, clamped 0.25×..4×)
+- **Click** a node to select it → flips to the Detail tab
+- **"fit" button** in the header resets pan/zoom to defaults
+
+Nodes are color-coded:
+
+- **green** — root (repo created from scratch)
+- **gray** — fork (source_id present and parent is in the list)
+- **amber** — orphan (source_id set but parent not in the list;
+  either the parent was deleted or the admin-list view is partial)
+- **blue** — selected, regardless of the above
+
+A legend stays pinned in the top-left of the canvas independent of
+pan/zoom.
+
+Layout is deterministic: siblings sort by id before placement, so the
+tree doesn't jitter across polls even if the server returns rows in a
+different order.
+
+**Detail** — populated when you click a repo in Repos or Forks. Shows:
+
+- id, owner, created-at, fork-of (source_id, if any)
+- on-disk size (humanized: `1.50 KB`, `2.34 MB`, etc.)
+- full ref list: name + short SHA prefix (full SHA on hover)
+
+Data source is `GET /v1/admin/repos/:id`. The fetch is triggered by
+the background poller — selection is written to a shared slot, and on
+the next poll cycle (up to ~2s later) the detail lands in the view.
+This means zero UI-thread blocking on click, but also up to a
+poll-interval of latency before the detail appears. If selection
+changes mid-fetch, the racing response is discarded.
 
 ## What it does NOT do
 
@@ -119,9 +152,9 @@ Intentionally:
 - **No create / fork / delete / revoke buttons.** Mutation stays in
   curl or a proper client SDK. Eliminates a whole class of accidental-
   click incidents.
-- **No repo detail view.** `GET /v1/admin/repos/:id` exists (returns
-  refs + size-on-disk), but there's no page that renders it yet.
-  Drop-in work for a future commit.
+- **No commit-log view.** The Detail tab shows refs (branches + tags)
+  but not individual commits or their graph. `git log`-style history
+  would need a new server endpoint.
 - **No token browsing / audit log.** Tokens are hashed in the DB; the
   server never exposes them through the admin API and the GUI never
   asks.
