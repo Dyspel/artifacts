@@ -620,4 +620,154 @@ mod tests {
         // source() returns None for io::Error (no chain).
         let _ = wrapped.source();
     }
+
+    // -----------------------------------------------------------------------
+    // Additional edge-branch coverage
+    // -----------------------------------------------------------------------
+
+    /// `generate_pack` with an invalid OID in `haves` must error from
+    /// `parse_oids` before the rev-walk, even when `wants` is non-empty
+    /// (covers the `parse_oids(haves)` path at ~123).
+    #[test]
+    fn generate_pack_invalid_have_oid_errors_before_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = crate::storage::new_repo_id();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        // A valid 40-hex want (object doesn't need to exist for parse_oids to
+        // succeed) plus a bad have that parse_oids will reject.
+        let valid_want = "a".repeat(40);
+        let err = generate_pack(&git_dir, &[valid_want], &["zz-not-hex".to_string()]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid oid") || msg.contains("zz-not-hex"),
+            "expected parse error for bad have OID, got: {msg}"
+        );
+    }
+
+    /// `generate_pack` on a repo that doesn't exist on disk must return an
+    /// error from `gix::open` (the `GixError` branch at ~115).
+    #[test]
+    fn generate_pack_nonexistent_repo_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("no-such-repo.git");
+        let want = "a".repeat(40);
+        let err = generate_pack(&nonexistent, &[want], &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gix::open") || msg.contains("no such"),
+            "expected gix::open error for nonexistent repo, got: {msg}"
+        );
+    }
+
+    /// `parse_oids` with a valid 40-hex string returns a single OID.
+    #[test]
+    fn parse_oids_accepts_valid_hex40() {
+        let hexes = vec!["4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()];
+        let oids = parse_oids(&hexes).unwrap();
+        assert_eq!(oids.len(), 1);
+    }
+
+    /// `parse_oids` with an empty slice returns an empty vec.
+    #[test]
+    fn parse_oids_empty_input_returns_empty() {
+        let oids = parse_oids(&[]).unwrap();
+        assert!(oids.is_empty());
+    }
+
+    /// `empty_pack_bytes` is called when `wants` is empty AND when
+    /// `commit_ids` is empty (fully covered by haves). Verify both
+    /// code-paths return the same canonical 32-byte pack.
+    #[test]
+    fn empty_pack_bytes_matches_wants_empty_short_circuit() {
+        let canonical = empty_pack_bytes();
+        // The wants-empty short-circuit at ~111 also calls empty_pack_bytes().
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = crate::storage::new_repo_id();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+        let from_generate = generate_pack(&git_dir, &[], &[]).unwrap();
+        assert_eq!(
+            canonical, from_generate,
+            "empty_pack_bytes() must match generate_pack(wants=[]) output"
+        );
+    }
+
+    /// `index_pack_into_repo` on a nonexistent repo path errors at `gix::open`.
+    #[test]
+    fn index_pack_into_repo_nonexistent_repo_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("ghost.git");
+        // Build a pack that is > 32 bytes so the short-circuit doesn't fire.
+        // We use a real pack generated from a real repo.
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = crate::storage::new_repo_id();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+        // Generate a non-empty pack by seeding the repo with a commit first.
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut bp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        bp.stdin.as_mut().unwrap().write_all(b"idx-err\n").unwrap();
+        let blob = String::from_utf8(bp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut tp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tp.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob}\tf.txt\n").as_bytes())
+            .unwrap();
+        let tree = String::from_utf8(tp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let co = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "e", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(co.stdout).unwrap().trim().to_string();
+        let pack = generate_pack(&git_dir, &[commit], &[]).unwrap();
+        assert!(pack.len() > 32);
+        // Now feed this pack to `index_pack_into_repo` with a nonexistent repo.
+        let err = index_pack_into_repo(&nonexistent, &pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gix::open") || msg.contains("no such") || msg.contains("Bundle"),
+            "expected error from index_pack_into_repo on nonexistent repo, got: {msg}"
+        );
+    }
 }
