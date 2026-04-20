@@ -8,6 +8,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     ownership::{check_repo_quota, enforce_owner, OwnershipStore},
+    rate_limit::{Class, RateLimiter},
     refs::RefStore,
     storage::{new_repo_id, Storage},
     tokens::{Scope, TokenStore},
@@ -34,6 +35,10 @@ pub struct RestState {
     /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
     /// distributed impl without touching any handler.
     pub refs: Arc<dyn RefStore>,
+    /// Token-bucket rate limiter, keyed by `(subject, class)`. Admin
+    /// bypasses. Enforced per handler by the handler itself so that
+    /// expensive vs cheap endpoints draw from separate classes.
+    pub rate_limit: Arc<RateLimiter>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -79,6 +84,7 @@ pub async fn create_repo(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    state.rate_limit.check(&principal, Class::Create)?;
     check_repo_quota(
         &*state.ownership,
         &principal,
@@ -126,6 +132,7 @@ pub async fn fork_repo(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    state.rate_limit.check(&principal, Class::Create)?;
     if !state.storage.exists(&source_id) {
         return Err(Error::RepoNotFound(source_id));
     }
@@ -183,6 +190,7 @@ pub async fn mint_token(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    state.rate_limit.check(&principal, Class::Token)?;
     if !state.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
@@ -232,6 +240,9 @@ pub async fn revoke_token(
     if !matches!(principal, crate::auth::Principal::Admin) {
         return Err(Error::Forbidden("token revocation is admin-only"));
     }
+    // Admin-only; rate-limit skipped (admin is exempt anyway). Left
+    // here as a no-op call for symmetry with the other handlers.
+    state.rate_limit.check(&principal, Class::Token)?;
     let revoked = state.tokens.revoke(&body.token).await?;
     Ok(Json(RevokeResponse { revoked }))
 }
@@ -247,6 +258,7 @@ pub async fn delete_repo(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    state.rate_limit.check(&principal, Class::Default)?;
     enforce_owner(&*state.ownership, &principal, &id).await?;
     state.storage.delete(&id)?;
     state.ownership.delete(&id).await?;

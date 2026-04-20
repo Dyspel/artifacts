@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod jwt;
 mod ownership;
+mod rate_limit;
 mod refs;
 mod rest;
 mod smart_http;
@@ -13,6 +14,7 @@ mod tokens;
 use crate::{
     config::Config,
     ownership::{OwnershipStore, SqliteOwnershipStore},
+    rate_limit::RateLimiter,
     refs::{FsRefStore, RefStore},
     rest::RestState,
     smart_http::GitState,
@@ -24,7 +26,7 @@ use axum::{
     Router,
 };
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tower_http::trace::TraceLayer;
 
 #[derive(Parser)]
@@ -149,6 +151,16 @@ async fn main() -> anyhow::Result<()> {
             let ownership: Arc<dyn OwnershipStore> =
                 Arc::new(SqliteOwnershipStore::open(&token_db_path)?);
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
+            let rate_limit = Arc::new(RateLimiter::with_defaults());
+            // Prune stale per-subject buckets every 5 min; buckets not
+            // touched for an hour get dropped. Keeps the map from
+            // growing unbounded if a lot of short-lived JWT subjects
+            // come and go.
+            rate_limit::spawn_cleanup(
+                rate_limit.clone(),
+                Duration::from_secs(300),
+                Duration::from_secs(3600),
+            );
 
             let rest_state = RestState {
                 cfg: cfg.clone(),
@@ -156,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 tokens: tokens.clone(),
                 ownership,
                 refs,
+                rate_limit,
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };
 

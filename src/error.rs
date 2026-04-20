@@ -42,6 +42,9 @@ pub enum Error {
     #[error("repo quota exceeded for {subject} (limit: {limit})")]
     QuotaExceeded { subject: String, limit: u64 },
 
+    #[error("rate limited; retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -88,6 +91,24 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            }
+            Error::RateLimited { retry_after_secs } => {
+                // 429 + Retry-After. Distinct `code` from `quota_exceeded`
+                // so clients retry (rate-limited is transient) vs. surface
+                // an error (quota is persistent).
+                let body = Json(json!({
+                    "error": {
+                        "code": "rate_limited",
+                        "message": format!("rate limited; retry after {retry_after_secs}s"),
+                        "retryAfter": retry_after_secs,
+                    }
+                }));
+                let mut resp =
+                    (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+                return resp;
             }
             Error::RefConflict { branch, expected, current } => {
                 // Dedicated 409 with the current + expected SHAs so callers

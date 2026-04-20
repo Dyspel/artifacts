@@ -38,6 +38,7 @@ use crate::{
     auth::authorize_rest,
     error::{Error, Result},
     ownership::enforce_owner,
+    rate_limit::Class,
     refs::CasOutcome,
     rest::RestState,
 };
@@ -126,6 +127,7 @@ pub async fn create_commit(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
+    state.rate_limit.check(&principal, Class::Commit)?;
     crate::storage::validate_repo_id(&repo_id)?;
     if !state.storage.exists(&repo_id) {
         return Err(Error::RepoNotFound(repo_id));
