@@ -1166,4 +1166,128 @@ mod tests {
             other => panic!("expected Symbolic from packed fallback, got {other:?}"),
         }
     }
+
+    // ── enumerate_refs: malformed packed-refs lines ───────────────────────
+
+    /// Lines in packed-refs whose sha doesn't parse as a valid Oid are
+    /// silently skipped — the function must not error or panic on
+    /// garbage input (e.g. a partially-written file or on-disk corruption).
+    #[tokio::test]
+    async fn enumerate_refs_skips_malformed_packed_ref_lines() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let good_sha = write_blob(&git_dir, b"good");
+        // Mix a valid line with two malformed ones.
+        let packed = format!(
+            "# pack-refs with: peeled\n\
+             not-a-sha refs/test/bad-sha\n\
+             {good_sha} refs/test/good\n\
+             {good_sha} not-a-valid-refname!!!\n"
+        );
+        std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+        let all = refs.list(&repo, &[]).await.unwrap();
+        // Only the well-formed entry survives.
+        let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"refs/test/good"), "good ref must survive");
+        assert!(
+            !names.contains(&"refs/test/bad-sha"),
+            "bad-sha line must be skipped"
+        );
+    }
+
+    /// A loose ref file whose content is not a valid Oid (e.g. a symref
+    /// `ref: ...` or pure garbage) must be silently skipped by
+    /// `enumerate_refs`, not returned as garbage or as an error.
+    #[tokio::test]
+    async fn enumerate_refs_skips_loose_ref_with_non_oid_content() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        // Write a loose ref file whose content is garbage.
+        std::fs::create_dir_all(git_dir.join("refs/test")).unwrap();
+        std::fs::write(git_dir.join("refs/test/bad-content"), "not-an-oid\n").unwrap();
+        // Also write a valid one so we know the walk reaches the dir.
+        let sha = write_blob(&git_dir, b"good-ref");
+        std::fs::write(git_dir.join("refs/test/good"), format!("{sha}\n")).unwrap();
+        let all = refs.list(&repo, &[]).await.unwrap();
+        let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"refs/test/good"));
+        assert!(!names.contains(&"refs/test/bad-content"));
+    }
+
+    /// HEAD is a symref pointing at a target whose loose ref file exists
+    /// but contains non-Oid content → `head_state` falls through to the
+    /// packed-refs lookup, and if that also misses, returns `Unborn`.
+    #[tokio::test]
+    async fn read_head_symref_with_bad_loose_content_falls_back_to_unborn() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        // Write a loose ref with garbage content.
+        std::fs::create_dir_all(git_dir.join("refs/test")).unwrap();
+        std::fs::write(git_dir.join("refs/test/branch"), "not-an-oid\n").unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/test/branch\n").unwrap();
+        // No packed-refs entry exists, so we expect Unborn.
+        let st = refs.read_head(&repo).await.unwrap();
+        assert!(
+            matches!(st, HeadState::Unborn { .. }),
+            "expected Unborn when loose ref has bad content and no packed fallback, got {st:?}"
+        );
+    }
+
+    /// packed-refs HEAD fallback: SHA on the matching line doesn't parse
+    /// → the loop skips it and we still get Unborn (not a panic or error).
+    #[tokio::test]
+    async fn read_head_packed_refs_with_bad_sha_yields_unborn() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        // packed-refs line whose sha is malformed.
+        let packed = "# pack-refs with: peeled\nnot-a-sha refs/test/branch\n";
+        std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/test/branch\n").unwrap();
+        let st = refs.read_head(&repo).await.unwrap();
+        assert!(
+            matches!(st, HeadState::Unborn { .. }),
+            "expected Unborn when packed-refs sha is malformed, got {st:?}"
+        );
+    }
+
+    // ── FsRefStore: cas_delete absent ref with expected = Some ───────────
+
+    /// Deleting a ref that doesn't exist with `expected = Some(sha)` must
+    /// conflict because the current value (None) doesn't match the expected
+    /// SHA.  `git update-ref -d <ref> <sha>` returns non-zero in this case.
+    #[tokio::test]
+    async fn fs_cas_delete_absent_ref_with_expected_returns_conflict() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let sha = to_oid(&write_blob(&git_dir, b"ghost"));
+        let rname = rn("refs/test/absent");
+        // Ref doesn't exist, expected = Some(sha) → mismatch → Conflict.
+        let out = refs.cas_delete(&repo, &rname, Some(&sha)).await.unwrap();
+        match out {
+            CasOutcome::Conflict { current } => {
+                assert!(current.is_none(), "absent ref → current must be None");
+            },
+            CasOutcome::Updated => panic!("deleting absent ref should conflict, not succeed"),
+        }
+    }
+
+    // ── enumerate_refs: peeled annotation for unknown preceding ref ───────
+
+    /// A `^<sha>` peeled line without a preceding valid ref entry must not
+    /// panic — `last_name` is None so the annotation is discarded.
+    #[tokio::test]
+    async fn enumerate_refs_orphan_peel_line_is_harmless() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let sha = write_blob(&git_dir, b"peel-orphan");
+        // A peeled annotation before any ref entry — last_name is None.
+        let packed =
+            format!("# pack-refs with: peeled fully-peeled\n^{sha}\n{sha} refs/test/after-peel\n");
+        std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+        let all = refs.list(&repo, &[]).await.unwrap();
+        // The ref after the orphan peel must still be present.
+        assert!(all
+            .iter()
+            .any(|e| e.name.as_str() == "refs/test/after-peel"));
+    }
 }

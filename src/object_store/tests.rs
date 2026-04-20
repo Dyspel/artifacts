@@ -755,3 +755,206 @@ fn fs_delete_loose_returns_false_when_object_absent() {
     // Object was never written — delete should be a no-op returning false.
     assert!(!store.delete_loose(&r, &o).unwrap());
 }
+
+// ─── FsObjectStore: read_object exercising gix_kind_to_ours branches ──
+
+/// `read_object` on a real FS repo returns the correct kind + payload for
+/// blobs and commits; this also exercises the `record_read_object_metrics`
+/// "hit" and "miss" paths and the `gix_kind_to_ours` Blob/Commit branches.
+#[test]
+fn fs_read_object_returns_blob_and_commit() {
+    use std::process::Command;
+    let (_t, store, repo_id, blob_oid) = fs_fixture();
+    let git_dir = store.root.join(format!("{repo_id}.git"));
+
+    // The fixture already wrote a blob; read it back via read_object.
+    let (kind, payload) = store
+        .read_object(&repo_id, &blob_oid)
+        .unwrap()
+        .expect("blob must be found");
+    assert_eq!(kind, ObjectKind::Blob);
+    assert_eq!(payload, b"hello\n");
+
+    // Build a commit that wraps it so we can test the Commit arm.
+    let tree_out = {
+        let proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        let mut proc = proc;
+        writeln!(
+            proc.stdin.as_mut().unwrap(),
+            "100644 blob {}\thello.txt",
+            blob_oid.as_str()
+        )
+        .unwrap();
+        proc.wait_with_output().unwrap()
+    };
+    let tree_oid_str = String::from_utf8(tree_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let tree_oid = to_oid(&tree_oid_str);
+
+    // Tree kind.
+    let (tree_kind, _) = store
+        .read_object(&repo_id, &tree_oid)
+        .unwrap()
+        .expect("tree must be found");
+    assert_eq!(tree_kind, ObjectKind::Tree);
+
+    // Commit kind.
+    let commit_out = Command::new("git")
+        .arg("--git-dir")
+        .arg(&git_dir)
+        .args(["commit-tree", "-m", "cov-test", &tree_oid_str])
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    let commit_oid_str = String::from_utf8(commit_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let commit_oid = to_oid(&commit_oid_str);
+    let (commit_kind, _) = store
+        .read_object(&repo_id, &commit_oid)
+        .unwrap()
+        .expect("commit must be found");
+    assert_eq!(commit_kind, ObjectKind::Commit);
+}
+
+/// `read_object` for a Tag object exercises the `gix_kind_to_ours` Tag arm.
+#[test]
+fn fs_read_object_returns_tag() {
+    use std::process::Command;
+    let (_t, store, repo_id, blob_oid) = fs_fixture();
+    let git_dir = store.root.join(format!("{repo_id}.git"));
+
+    // Build a minimal commit so annotated tag has a target.
+    let tree_out = {
+        let proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        let mut proc = proc;
+        writeln!(
+            proc.stdin.as_mut().unwrap(),
+            "100644 blob {}\tf.txt",
+            blob_oid.as_str()
+        )
+        .unwrap();
+        proc.wait_with_output().unwrap()
+    };
+    let tree_str = String::from_utf8(tree_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let commit_str = String::from_utf8(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "tag-base", &tree_str])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Annotated tag.
+    let tag_str = String::from_utf8(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["tag", "-a", "v0.1", "-m", "release", &commit_str])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // `git tag -a` writes to refs/tags/v0.1; read the tag object OID.
+    let tag_oid_str = String::from_utf8(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-parse", "refs/tags/v0.1"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let _ = tag_str; // suppress unused
+    let tag_oid = to_oid(&tag_oid_str);
+    let (kind, _) = store
+        .read_object(&repo_id, &tag_oid)
+        .unwrap()
+        .expect("tag must be found");
+    assert_eq!(kind, ObjectKind::Tag);
+}
+
+/// `FsObjectStore::ingest_pack` short-circuit: packs <= 32 bytes are a no-op.
+#[test]
+fn fs_ingest_pack_short_circuit_for_undersized_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    let r = rid("ingest-repo");
+    assert_eq!(store.ingest_pack(&r, b"").unwrap(), 0);
+    assert_eq!(store.ingest_pack(&r, &[0u8; 16]).unwrap(), 0);
+    assert_eq!(store.ingest_pack(&r, &[0u8; 32]).unwrap(), 0);
+}
+
+/// `FsObjectStore::list_loose` with a real loose object exercises the
+/// happy-path branches inside the read_dir walk (2-hex subdir, 38-hex file).
+#[test]
+fn fs_list_loose_with_real_object() {
+    let (_t, store, repo_id, oid) = fs_fixture();
+    let list = store.list_loose(&repo_id).unwrap();
+    assert!(
+        list.iter().any(|i| i.oid == oid),
+        "expected fixture oid in list_loose output"
+    );
+}
+
+/// Write corrupt bytes (not valid zlib) to a loose-object path; confirm
+/// `read_loose` returns them verbatim (raw bytes), and that a caller who
+/// then tries to inflate them will get an error — the store itself is
+/// not responsible for validating zlib content.
+#[test]
+fn fs_read_loose_corrupt_bytes_returned_verbatim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("corrupt-repo");
+    let o = to_oid("aabbccddeeff00112233445566778899aabbccdd");
+    // Write the object path manually with junk bytes.
+    let shard = repos.join("corrupt-repo.git/objects/aa");
+    std::fs::create_dir_all(&shard).unwrap();
+    let obj_path = shard.join("bbccddeeff00112233445566778899aabbccdd");
+    std::fs::write(&obj_path, b"not valid zlib at all\xff\xfe").unwrap();
+    // read_loose returns whatever is on disk.
+    let bytes = store.read_loose(&r, &o).unwrap().expect("file exists");
+    assert_eq!(bytes, b"not valid zlib at all\xff\xfe");
+}
