@@ -1061,4 +1061,24 @@ mod tests {
         req.has_unsupported = true;
         assert!(!req.is_simple());
     }
+
+    // ── parse_v2_fetch: args loop exhausted without flush (line 285) ─────────
+
+    /// A body with a valid command + delim + args but NO terminating flush-pkt
+    /// causes the args loop to exhaust without returning `Some`; the function
+    /// falls off the end and returns `None` (line 285).
+    #[test]
+    fn parse_v2_fetch_args_loop_exhausted_without_flush_returns_none() {
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_data(&mut body, b"agent=git/test\n");
+        crate::pkt_line::write_delim(&mut body);
+        // Write an arg but no terminating flush — iterator exhausts normally.
+        crate::pkt_line::write_data(&mut body, b"done\n");
+        // (no flush at the end)
+        assert!(
+            parse_v2_fetch(&body).is_none(),
+            "args loop exhausted without flush must return None"
+        );
+    }
 }
