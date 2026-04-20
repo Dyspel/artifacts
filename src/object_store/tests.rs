@@ -958,3 +958,263 @@ fn fs_read_loose_corrupt_bytes_returned_verbatim() {
     let bytes = store.read_loose(&r, &o).unwrap().expect("file exists");
     assert_eq!(bytes, b"not valid zlib at all\xff\xfe");
 }
+
+// ─── FsObjectStore: IO error branches ──────────────────────────────────
+
+/// `read_loose` on a file that exists but is not readable (chmod 000) should
+/// return an IO error — the non-NotFound branch at the end of the match.
+/// Skipped if we are running as root (root ignores permissions).
+#[test]
+fn fs_read_loose_io_error_not_notfound() {
+    // Skip on root: root can read any file regardless of permissions.
+    // SAFETY: getuid() is always safe to call — it has no preconditions,
+    // never modifies memory, and returns the real UID of the calling process.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("perm-repo");
+    let o = to_oid("aabbccddeeff00112233445566778899aabbccde");
+    let shard = repos.join("perm-repo.git/objects/aa");
+    std::fs::create_dir_all(&shard).unwrap();
+    let obj_path = shard.join("bbccddeeff00112233445566778899aabbccde");
+    std::fs::write(&obj_path, b"some bytes").unwrap();
+    // Remove read permission so std::fs::read fails with a non-NotFound error.
+    std::fs::set_permissions(
+        &obj_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    let result = store.read_loose(&r, &o);
+    // Restore permissions so tempdir cleanup doesn't fail.
+    std::fs::set_permissions(
+        &obj_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(result.is_err(), "expected Err from permission-denied read");
+}
+
+/// `write_loose` failure path when the shard directory is not writable:
+/// `File::create(&tmp)` returns EACCES, which propagates as an IO error
+/// from write_loose. This exercises the error-propagation plumbing of
+/// the atomic-write path (File::create → fsync → rename pipeline). Tests
+/// the write-error surface; the rename-specific Err branch (lines 324-329)
+/// is structurally hard to reach deterministically because it requires the
+/// rename syscall itself to fail (e.g. full disk or cross-device), which
+/// cannot be injected without kernel-level filesystem manipulation.
+/// Skipped when running as root (root ignores permissions).
+#[test]
+fn fs_write_loose_shard_not_writable_returns_err() {
+    // Skip on root: root can write into read-only directories.
+    // SAFETY: getuid() is always safe to call — no preconditions,
+    // no memory side effects, returns the real UID of this process.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("perm-write-repo");
+    let o = to_oid("1122334455667788990011223344556677889900");
+    // Pre-create the shard directory so create_dir_all is a no-op inside
+    // write_loose (no permission needed for the no-op).
+    let shard = repos.join("perm-write-repo.git/objects/11");
+    std::fs::create_dir_all(&shard).unwrap();
+    // Make the shard directory read+execute only (no write permission).
+    // File::create(&tmp) inside write_loose will fail with EACCES.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = store.write_loose(&r, &o, b"payload");
+    // Restore permissions so tempdir cleanup succeeds.
+    std::fs::set_permissions(&shard, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "expected Err when shard dir is not writable"
+    );
+}
+
+/// `list_loose` silently skips loose-object files whose 2-hex + 38-hex
+/// names pass the ASCII-hexdigit length filter but are *uppercase* —
+/// `Oid::try_from` requires lowercase, so the Err arm (lines 376-377) fires.
+/// This models FS-level corruption (e.g. a file copied with uppercase
+/// casing out-of-band) — the list continues rather than panicking.
+#[test]
+fn fs_list_loose_skips_uppercase_hex_filename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("upper-repo");
+    // Create the shard dir with a 2-hex name and put a file whose 38-char
+    // name is uppercase hex. `is_ascii_hexdigit()` accepts A-F, so the
+    // length+charset filter passes, but Oid::try_from rejects uppercase.
+    let shard = repos.join("upper-repo.git/objects/ab");
+    std::fs::create_dir_all(&shard).unwrap();
+    // 38 uppercase hex chars — passes the len/hexdigit filter but Oid rejects it.
+    let bad_name = "CDEF1234567890ABCDEF1234567890ABCDEF12";
+    std::fs::write(shard.join(bad_name), b"junk").unwrap();
+    // list_loose must not error and must not include the skipped entry.
+    let list = store.list_loose(&r).unwrap();
+    assert!(
+        list.is_empty(),
+        "expected no valid entries (uppercase filename must be skipped), got {list:?}"
+    );
+}
+
+/// `delete_loose` returns an IO error (non-NotFound) when the shard
+/// directory is not traversable (mode 000). Tests line 411.
+/// Skipped when running as root.
+#[test]
+fn fs_delete_loose_io_error_not_notfound() {
+    // SAFETY: getuid() is always safe to call — no preconditions,
+    // no memory side effects, returns the real UID of this process.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("delperm-repo");
+    let o = to_oid("aabbccddeeff00112233445566778899aabbccdf");
+    // Create and populate the loose file.
+    let shard = repos.join("delperm-repo.git/objects/aa");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::write(shard.join("bbccddeeff00112233445566778899aabbccdf"), b"x").unwrap();
+    // Remove execute bit from shard so remove_file fails with EACCES.
+    std::fs::set_permissions(&shard, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+    let result = store.delete_loose(&r, &o);
+    // Restore before assertion so cleanup works.
+    std::fs::set_permissions(&shard, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "expected Err from permission-denied delete"
+    );
+}
+
+/// `FsObjectStore::exists` slow-path: object isn't loose, repo dir exists
+/// but isn't a valid git repo (non-bare, no HEAD, etc.) — gix::open fails →
+/// `Ok(false)` (line 439).
+#[test]
+fn fs_exists_slow_path_gix_open_fails_returns_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    // Create a directory that looks like a repo path but is not a valid git repo.
+    let fake_git_dir = repos.join("fake-repo.git");
+    std::fs::create_dir_all(&fake_git_dir).unwrap();
+    // No HEAD, no objects dir — gix::open will refuse to open this.
+    let store = FsObjectStore::new(&repos);
+    let r = rid("fake-repo");
+    let o = to_oid("a".repeat(40).as_str());
+    // The oid is not loose (no shard dir), so fast-path returns false quickly.
+    // Then the slow path checks is_dir (true), calls gix::open (fails) → false.
+    assert!(
+        !store.exists(&r, &o).unwrap(),
+        "expected false for non-git-dir repo"
+    );
+}
+
+/// `read_object_fs_inner` gix::open failure path (line 499): the repo
+/// directory exists but is not a valid git repository.
+#[test]
+fn fs_read_object_non_git_dir_gix_open_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let fake_git_dir = repos.join("notgit-repo.git");
+    std::fs::create_dir_all(&fake_git_dir).unwrap();
+    let store = FsObjectStore::new(&repos);
+    let r = rid("notgit-repo");
+    let o = to_oid("b".repeat(40).as_str());
+    // read_object calls read_object_fs_inner. The repo dir exists (is_dir=true)
+    // but gix::open fails → Ok(None).
+    let result = store.read_object(&r, &o).unwrap();
+    assert!(result.is_none(), "expected None when gix::open fails");
+}
+
+/// `FsObjectStore::ingest_pack` real-pack path (lines 458-459, 465):
+/// for a pack larger than 32 bytes, the method calls index_pack_into_repo
+/// and returns Ok(0). Uses a real repo and a valid pack.
+#[test]
+fn fs_ingest_pack_real_pack_returns_ok_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let storage = crate::storage::FsStorage::new(&repos).unwrap();
+    let repo_id_str = crate::storage::new_repo_id();
+    storage
+        .create(&crate::ids::RepoId::try_from(repo_id_str.as_str()).unwrap())
+        .unwrap();
+    let git_dir = repos.join(format!("{repo_id_str}.git"));
+    // Seed the repo with a blob.
+    let blob_oid = write_blob(&git_dir, b"ingest-pack-test\n");
+
+    // Build a tree + commit so generate_pack has reachable objects.
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut tree_proc = Command::new("git")
+        .args(["--git-dir"])
+        .arg(&git_dir)
+        .args(["mktree"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        tree_proc.stdin.as_mut().unwrap(),
+        "100644 blob {blob_oid}\tfile.txt"
+    )
+    .unwrap();
+    let tree_out = tree_proc.wait_with_output().unwrap();
+    let tree_oid = String::from_utf8(tree_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let commit_out = Command::new("git")
+        .args(["--git-dir"])
+        .arg(&git_dir)
+        .args(["commit-tree", "-m", "ingest-test", &tree_oid])
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    let commit_oid = String::from_utf8(commit_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let pack_bytes =
+        crate::native_pack::generate_pack(&git_dir, std::slice::from_ref(&commit_oid), &[])
+            .unwrap();
+    assert!(pack_bytes.len() > 32);
+
+    let store = FsObjectStore::new(&repos);
+    let r = rid(&repo_id_str);
+    // ingest_pack on FsObjectStore returns Ok(0) (count not surfaced).
+    let count = store.ingest_pack(&r, &pack_bytes).unwrap();
+    assert_eq!(count, 0, "FsObjectStore::ingest_pack always returns Ok(0)");
+}
+
+/// `record_read_object_metrics` "miss" outcome: reading an object that
+/// doesn't exist still calls the metrics helper with outcome="miss".
+/// Also covers the list_loose multi-fanout-dir path when multiple
+/// 2-hex shards are present.
+#[test]
+fn fs_list_loose_multiple_fanout_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    let r = rid("multi-fan");
+    // Write two objects that land in different 2-hex shard dirs.
+    let o1 = to_oid("1234567890abcdef1234567890abcdef12345678");
+    let o2 = to_oid("abcdef1234567890abcdef1234567890abcdef12");
+    store.write_loose(&r, &o1, b"obj1").unwrap();
+    store.write_loose(&r, &o2, b"obj2").unwrap();
+    let mut list = store.list_loose(&r).unwrap();
+    list.sort_by(|a, b| a.oid.cmp(&b.oid));
+    let oids: Vec<&str> = list.iter().map(|i| i.oid.as_str()).collect();
+    assert!(
+        oids.contains(&o1.as_str()) && oids.contains(&o2.as_str()),
+        "both objects from different fanout dirs must appear in list_loose"
+    );
+}

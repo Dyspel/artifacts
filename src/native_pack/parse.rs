@@ -2494,4 +2494,376 @@ mod tests {
         // function returns Err; if it hits the terminator first it returns
         // Ok.  Either way no panic.
     }
+
+    // --- parse_ofs_delta_offset: overflow-guard no-panic sweep (line 294) ---
+
+    /// The `checked_add(1).and_then(|v| v.checked_shl(7)).ok_or_else(...)` guard
+    /// at line 294 protects against the (theoretical) case where the accumulated
+    /// OFS_DELTA offset value reaches `u64::MAX` and `+1` wraps. In practice
+    /// `checked_shl(7)` never returns `None` (shift of 7 is always < 64), so the
+    /// None path is only reachable via the `checked_add` arm. Since the OFS_DELTA
+    /// encoding grows values as ~128^n and u64::MAX ≈ 1.8×10^19, no finite byte
+    /// stream produces exactly u64::MAX before wrapping (the real checked_shl
+    /// overflow is silently wrapping on u64). The guard is therefore structurally
+    /// dead code for any input a real pack file can produce; we document that here
+    /// and verify only the "no panic" invariant.
+    #[test]
+    fn parse_ofs_delta_offset_overflow_guard_no_panic() {
+        // Feed enough continuation bytes that the accumulated value is near u64::MAX.
+        // The important invariant is no panic regardless of outcome.
+        let bytes: Vec<u8> = std::iter::repeat_n(0x80u8, 10)
+            .chain(std::iter::once(0x00u8))
+            .collect();
+        // Must not panic — either Ok or Err is acceptable.
+        let _result = parse_ofs_delta_offset(&bytes);
+    }
+
+    // --- decompress_zlib: map_err on decompress (line 328) -----------------
+
+    /// `decompress_zlib` with truly corrupt zlib bytes (not just truncated)
+    /// — the `map_err(|e| ...)` on the `decompress` call (line 328) fires
+    /// when flate2 returns a stream error on a completely invalid header.
+    #[test]
+    fn decompress_zlib_rejects_corrupt_zlib_header() {
+        // Bytes that are definitely not a valid zlib stream (wrong CMF/FLG).
+        let bad_zlib: &[u8] = b"\xff\xfefinvalid-zlib-content\x00\x00";
+        let result = decompress_zlib(bad_zlib, 1024);
+        assert!(result.is_err(), "expected error for corrupt zlib header");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("zlib") || msg.contains("invalid"),
+            "expected zlib error message, got: {msg}"
+        );
+    }
+
+    // --- read_loose_inflated: non-UTF-8 header triggers line 606 -----------
+
+    /// A loose object whose inflated header bytes (before the NUL) are not
+    /// valid UTF-8 — `std::str::from_utf8` returns an error, which the
+    /// `map_err` on line 606 turns into a PackParse error.
+    #[test]
+    fn read_loose_inflated_non_utf8_header_returns_error() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let base_oid_hex = "aabbccddeeff00112233445566778899aabbccde";
+        let base_oid = oid_from(base_oid_hex);
+        let store = MemObjectStore::new();
+
+        // Inflate to bytes where the content before the NUL is invalid UTF-8.
+        // 0xff, 0xfe are not valid UTF-8 start bytes.
+        let content: &[u8] = &[0xffu8, 0xfeu8, 0x00u8, b'h', b'i'];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(content).unwrap();
+        let compressed = enc.finish().unwrap();
+        store.write_loose(&rid(), &base_oid, &compressed).unwrap();
+
+        let base_oid_bytes: [u8; 20] = {
+            let mut arr = [0u8; 20];
+            for (i, b) in arr.iter_mut().enumerate() {
+                let hi = base_oid_hex.as_bytes()[i * 2];
+                let lo = base_oid_hex.as_bytes()[i * 2 + 1];
+                *b = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+            }
+            arr
+        };
+        let delta_body: Vec<u8> = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(0));
+            d.extend_from_slice(&delta_varint(0));
+            d
+        };
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let dlen = delta_body.len() as u64;
+        pack.push(
+            (if dlen >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dlen & 0xf) as u8),
+        );
+        pack.extend_from_slice(&base_oid_bytes);
+        {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&delta_body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("utf8") || msg.contains("UTF") || msg.contains("utf"),
+            "expected utf8 error for non-UTF-8 header, got: {msg}"
+        );
+    }
+
+    // --- store_with_full_resolution: OFS_DELTA pending pass (line 714) -----
+
+    /// An OFS_DELTA whose base hasn't been resolved in the current pass
+    /// (because the base is itself a delta that was resolved in a prior pass
+    /// but now the OFS_DELTA needs it from the `resolved` cache). We
+    /// build a 3-entry pack: Direct → OFS_DELTA-1 → OFS_DELTA-2, where
+    /// OFS_DELTA-2's base is OFS_DELTA-1. On the first delta-resolution
+    /// pass OFS_DELTA-1 resolves (its base is Direct, already in `resolved`),
+    /// but OFS_DELTA-2 has to wait because OFS_DELTA-1 hadn't been put in
+    /// `resolved` before OFS_DELTA-2 was processed. On the second pass
+    /// OFS_DELTA-2 can resolve.
+    ///
+    /// This covers line 714 (`still_pending.push(i)` in the OFS_DELTA arm
+    /// of `store_with_full_resolution`) and line 844
+    /// (`pending = still_pending` when there was progress).
+    #[test]
+    fn full_resolution_ofs_delta_chained_resolves_in_two_passes() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        // Three-entry pack:
+        //   [0] Direct Blob "base"
+        //   [1] OFS_DELTA(→ [0]) adding " mid"
+        //   [2] OFS_DELTA(→ [1]) adding " end"
+        //
+        // In phase-2 pass 1: [1] resolves against resolved[0]; [2]'s base
+        // ([1]) is not yet in resolved, so [2] is deferred (line 714).
+        // In phase-2 pass 2: [2] resolves against resolved[1] (line 844).
+
+        let base_payload = b"base";
+        let mid_tail = b" mid";
+        let end_tail = b" end";
+
+        // Build each delta.
+        let mid_payload: Vec<u8> = [base_payload.as_ref(), mid_tail.as_ref()].concat();
+        let end_payload: Vec<u8> = [mid_payload.as_slice(), end_tail.as_ref()].concat();
+
+        // delta1: COPY all of base, INSERT " mid"
+        let delta1 = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(base_payload.len() as u64));
+            d.extend_from_slice(&delta_varint(mid_payload.len() as u64));
+            let b0 = (base_payload.len() & 0xff) as u8;
+            let copy_op = 0x80u8 | 0x01u8 | if b0 != 0 { 0x10u8 } else { 0u8 };
+            d.push(copy_op);
+            d.push(0u8); // offset = 0
+            if b0 != 0 {
+                d.push(b0);
+            }
+            assert!(mid_tail.len() <= 127);
+            d.push(mid_tail.len() as u8);
+            d.extend_from_slice(mid_tail);
+            d
+        };
+
+        // delta2: COPY all of mid_payload, INSERT " end"
+        let delta2 = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(mid_payload.len() as u64));
+            d.extend_from_slice(&delta_varint(end_payload.len() as u64));
+            let b0 = (mid_payload.len() & 0xff) as u8;
+            let copy_op = 0x80u8 | 0x01u8 | if b0 != 0 { 0x10u8 } else { 0u8 };
+            d.push(copy_op);
+            d.push(0u8); // offset = 0
+            if b0 != 0 {
+                d.push(b0);
+            }
+            assert!(end_tail.len() <= 127);
+            d.push(end_tail.len() as u8);
+            d.extend_from_slice(end_tail);
+            d
+        };
+
+        // Helper to encode a pack entry header (same as build_minimal_pack).
+        let entry_header = |type_byte: u8, mut size: u64| -> Vec<u8> {
+            let mut hdr = Vec::new();
+            let low = (size & 0b1111) as u8;
+            size >>= 4;
+            hdr.push((if size > 0 { 0x80 } else { 0 }) | (type_byte << 4) | low);
+            while size > 0 {
+                let byte = (size & 0x7f) as u8;
+                size >>= 7;
+                hdr.push((if size > 0 { 0x80 } else { 0 }) | byte);
+            }
+            hdr
+        };
+
+        let zlib = |payload: &[u8]| -> Vec<u8> {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload).unwrap();
+            enc.finish().unwrap()
+        };
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&3u32.to_be_bytes()); // 3 entries
+
+        // Entry 0: Direct base at offset 12.
+        let offset0 = pack.len();
+        pack.extend_from_slice(&entry_header(OBJ_BLOB, base_payload.len() as u64));
+        pack.extend_from_slice(&zlib(base_payload));
+
+        // Entry 1: OFS_DELTA pointing at offset0.
+        let offset1 = pack.len();
+        pack.extend_from_slice(&entry_header(OBJ_OFS_DELTA, delta1.len() as u64));
+        pack.extend_from_slice(&encode_ofs_offset((offset1 - offset0) as u64));
+        pack.extend_from_slice(&zlib(&delta1));
+
+        // Entry 2: OFS_DELTA pointing at offset1 (the previous delta).
+        let offset2 = pack.len();
+        pack.extend_from_slice(&entry_header(OBJ_OFS_DELTA, delta2.len() as u64));
+        pack.extend_from_slice(&encode_ofs_offset((offset2 - offset1) as u64));
+        pack.extend_from_slice(&zlib(&delta2));
+
+        // SHA-1 trailer.
+        let mut h = Sha1::new();
+        h.update(&pack);
+        pack.extend_from_slice(&h.finalize());
+
+        let store = MemObjectStore::new();
+        let n = store_with_full_resolution(&pack, &rid(), &store).unwrap();
+        assert_eq!(
+            n, 3,
+            "expected 3 objects (base + two delta-resolved targets)"
+        );
+
+        let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
+        let mid_oid = loose_oid_hex(ObjectKind::Blob, &mid_payload);
+        let end_oid = loose_oid_hex(ObjectKind::Blob, &end_payload);
+        assert!(store.exists(&rid(), &base_oid).unwrap());
+        assert!(store.exists(&rid(), &mid_oid).unwrap());
+        assert!(store.exists(&rid(), &end_oid).unwrap());
+    }
+
+    // --- store_with_ref_delta_resolution: multi-pass chain (lines 840, 844) -
+
+    /// A REF_DELTA chain: delta-B points at delta-A, delta-A points at the
+    /// base. Phase-1 writes the base. Pass-1 resolves delta-A (base is now
+    /// in the store); delta-B's base (delta-A's result) is not yet in the
+    /// store, so delta-B is deferred (line 819 `still_pending.push(i)`) and
+    /// still_pending.len() < before (progress was made), so we loop (line 844).
+    /// Pass-2 resolves delta-B. Tests lines 819/840/844.
+    #[test]
+    fn ref_delta_resolution_multi_pass_chain_resolves() {
+        let base_payload = b"chain-base";
+        let mid_tail = b"-mid";
+        let end_tail = b"-end";
+        let mid_payload: Vec<u8> = [base_payload.as_ref(), mid_tail.as_ref()].concat();
+        let end_payload: Vec<u8> = [mid_payload.as_slice(), end_tail.as_ref()].concat();
+
+        let base_kind = ObjectKind::Blob;
+        let base_oid = loose_oid_hex(base_kind, base_payload);
+        let mid_oid = loose_oid_hex(base_kind, &mid_payload);
+
+        // Build raw 20-byte OID arrays for embedding in REF_DELTA entries.
+        let raw_oid = |hex: &str| -> [u8; 20] {
+            let mut arr = [0u8; 20];
+            for (i, b) in arr.iter_mut().enumerate() {
+                let hi = hex.as_bytes()[i * 2];
+                let lo = hex.as_bytes()[i * 2 + 1];
+                *b = u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+            }
+            arr
+        };
+
+        let base_oid_bytes = raw_oid(base_oid.as_str());
+        let mid_oid_bytes = raw_oid(mid_oid.as_str());
+
+        // Build delta-A (base → mid): COPY base, INSERT mid_tail.
+        let delta_a = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(base_payload.len() as u64));
+            d.extend_from_slice(&delta_varint(mid_payload.len() as u64));
+            let b0 = (base_payload.len() & 0xff) as u8;
+            let copy_op = 0x80u8 | 0x01u8 | if b0 != 0 { 0x10u8 } else { 0u8 };
+            d.push(copy_op);
+            d.push(0u8);
+            if b0 != 0 {
+                d.push(b0);
+            }
+            assert!(mid_tail.len() <= 127);
+            d.push(mid_tail.len() as u8);
+            d.extend_from_slice(mid_tail);
+            d
+        };
+
+        // Build delta-B (mid → end): COPY mid_payload, INSERT end_tail.
+        let delta_b = {
+            let mut d = Vec::new();
+            d.extend_from_slice(&delta_varint(mid_payload.len() as u64));
+            d.extend_from_slice(&delta_varint(end_payload.len() as u64));
+            let b0 = (mid_payload.len() & 0xff) as u8;
+            let copy_op = 0x80u8 | 0x01u8 | if b0 != 0 { 0x10u8 } else { 0u8 };
+            d.push(copy_op);
+            d.push(0u8);
+            if b0 != 0 {
+                d.push(b0);
+            }
+            assert!(end_tail.len() <= 127);
+            d.push(end_tail.len() as u8);
+            d.extend_from_slice(end_tail);
+            d
+        };
+
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        let zlib = |payload: &[u8]| -> Vec<u8> {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload).unwrap();
+            enc.finish().unwrap()
+        };
+
+        let dlen_header = |type_byte: u8, len: u64| -> Vec<u8> {
+            let mut dsz = len;
+            let mut h = vec![
+                (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (type_byte << 4) | ((dsz & 0xf) as u8),
+            ];
+            dsz >>= 4;
+            while dsz > 0 {
+                let b = (dsz & 0x7f) as u8;
+                dsz >>= 7;
+                h.push((if dsz > 0 { 0x80 } else { 0 }) | b);
+            }
+            h
+        };
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&3u32.to_be_bytes()); // 3 entries
+
+        // Entry 0: Direct base blob.
+        let bsz = base_payload.len() as u64;
+        pack.extend_from_slice(&dlen_header(OBJ_BLOB, bsz));
+        pack.extend_from_slice(&zlib(base_payload));
+
+        // Entry 1: REF_DELTA pointing at base → mid.
+        pack.extend_from_slice(&dlen_header(OBJ_REF_DELTA, delta_a.len() as u64));
+        pack.extend_from_slice(&base_oid_bytes);
+        pack.extend_from_slice(&zlib(&delta_a));
+
+        // Entry 2: REF_DELTA pointing at mid → end. The mid object is
+        // NOT in the store after phase-1; it lands in the store only after
+        // pass-1 resolves entry-1. So entry-2 is deferred to pass-2.
+        pack.extend_from_slice(&dlen_header(OBJ_REF_DELTA, delta_b.len() as u64));
+        pack.extend_from_slice(&mid_oid_bytes);
+        pack.extend_from_slice(&zlib(&delta_b));
+
+        // SHA-1 trailer.
+        let mut h = Sha1::new();
+        h.update(&pack);
+        pack.extend_from_slice(&h.finalize());
+
+        let store = MemObjectStore::new();
+        let n = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap();
+        assert_eq!(n, 3, "expected 3 objects (base + two chained deltas)");
+
+        let end_oid = loose_oid_hex(base_kind, &end_payload);
+        assert!(store.exists(&rid(), &base_oid).unwrap());
+        assert!(store.exists(&rid(), &mid_oid).unwrap());
+        assert!(store.exists(&rid(), &end_oid).unwrap());
+    }
 }
