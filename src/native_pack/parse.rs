@@ -384,13 +384,16 @@ pub(crate) fn loose_format_bytes(kind: ObjectKind, payload: &[u8]) -> Result<Vec
     use std::io::Write;
     let mut buf = Vec::with_capacity(payload.len() + 20);
     {
+        // The sink is an in-memory `Vec` (its `Write` impl is infallible)
+        // and zlib compression of valid bytes never errors — so these
+        // writes can't fail. `expect` keeps the impossible-error path off
+        // the surface rather than bubbling a `Result` no caller can hit.
         let mut enc = ZlibEncoder::new(&mut buf, Compression::default());
         write!(enc, "{} {}\0", kind_str(kind), payload.len())
-            .map_err(|e| Error::PackParse(format!("loose header write: {e}")))?;
+            .expect("zlib write to Vec is infallible");
         enc.write_all(payload)
-            .map_err(|e| Error::PackParse(format!("loose payload write: {e}")))?;
-        enc.finish()
-            .map_err(|e| Error::PackParse(format!("loose zlib finish: {e}")))?;
+            .expect("zlib write to Vec is infallible");
+        enc.finish().expect("zlib finish to Vec is infallible");
     }
     Ok(buf)
 }

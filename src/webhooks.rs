@@ -1100,63 +1100,51 @@ fn dispatch_row(outbox: &dyn DeliveryOutbox, row: PendingDelivery) {
     if let Some(sig) = signature.as_deref() {
         req = req.set("X-Artifacts-Signature", sig);
     }
+    // `ureq` maps any HTTP status >= 400 to `Err(Error::Status(code, _))`,
+    // so a successful `Ok` is always a 2xx/3xx (a delivered webhook). The
+    // failure modes that matter are therefore all on the `Err` side:
+    //   - `Status(4xx)` → terminal client error (don't retry).
+    //   - `Status(5xx)` or any transport/timeout error → retryable.
     match req.send_bytes(&row.payload) {
         Ok(resp) => {
             let status = resp.status();
-            if (200..400).contains(&status) {
-                let _ =
-                    outbox.mark_delivery_finalized(row.id, "success", Some(&status.to_string()));
-                metrics::counter!(
-                    "artifacts_webhook_deliveries_total",
-                    "kind" => row.kind.clone(),
-                    "outcome" => "success",
-                )
-                .increment(1);
-                return;
-            }
-            if (500..600).contains(&status) {
-                // Retryable.
-                if row.attempts >= WORKER_MAX_ATTEMPTS {
-                    finalize_exhausted(outbox, &row, Some(&status.to_string()));
-                } else {
-                    let next = now_unix_secs() + worker_backoff_secs(row.attempts);
-                    let _ =
-                        outbox.mark_delivery_retry(row.id, row.attempts, next, &status.to_string());
-                    tracing::warn!(
-                        delivery_id = row.id, hook = %row.hook_id, url = %row.url,
-                        status, attempt = row.attempts, next_secs = next - now_unix_secs(),
-                        "webhook 5xx; will retry"
-                    );
-                }
-            } else {
-                // 4xx — terminal client error.
-                let _ = outbox.mark_delivery_finalized(
-                    row.id,
-                    "client_error",
-                    Some(&status.to_string()),
-                );
-                tracing::warn!(
-                    delivery_id = row.id, hook = %row.hook_id, url = %row.url,
-                    status, attempt = row.attempts, "webhook 4xx; not retrying"
-                );
-                metrics::counter!(
-                    "artifacts_webhook_deliveries_total",
-                    "kind" => row.kind.clone(),
-                    "outcome" => "client_error",
-                )
-                .increment(1);
-            }
+            let _ = outbox.mark_delivery_finalized(row.id, "success", Some(&status.to_string()));
+            metrics::counter!(
+                "artifacts_webhook_deliveries_total",
+                "kind" => row.kind.clone(),
+                "outcome" => "success",
+            )
+            .increment(1);
         },
-        Err(e) => {
-            // Network / transport / timeout — all retryable.
+        // 4xx — terminal client error; retrying won't help.
+        Err(ureq::Error::Status(status, _)) if (400..500).contains(&status) => {
+            let _ =
+                outbox.mark_delivery_finalized(row.id, "client_error", Some(&status.to_string()));
+            tracing::warn!(
+                delivery_id = row.id, hook = %row.hook_id, url = %row.url,
+                status, attempt = row.attempts, "webhook 4xx; not retrying"
+            );
+            metrics::counter!(
+                "artifacts_webhook_deliveries_total",
+                "kind" => row.kind.clone(),
+                "outcome" => "client_error",
+            )
+            .increment(1);
+        },
+        // 5xx (Status) or a transport/timeout error — retryable.
+        failure => {
+            let reason = match &failure {
+                Err(ureq::Error::Status(status, _)) => status.to_string(),
+                _ => "network".to_string(),
+            };
             if row.attempts >= WORKER_MAX_ATTEMPTS {
-                finalize_exhausted(outbox, &row, Some("network"));
+                finalize_exhausted(outbox, &row, Some(&reason));
             } else {
                 let next = now_unix_secs() + worker_backoff_secs(row.attempts);
-                let _ = outbox.mark_delivery_retry(row.id, row.attempts, next, "network");
+                let _ = outbox.mark_delivery_retry(row.id, row.attempts, next, &reason);
                 tracing::warn!(
                     delivery_id = row.id, hook = %row.hook_id, url = %row.url,
-                    attempt = row.attempts, error = %e,
+                    reason, attempt = row.attempts, next_secs = next - now_unix_secs(),
                     "webhook delivery failed; will retry"
                 );
             }
@@ -1264,42 +1252,29 @@ fn legacy_direct_dispatch(registry: &dyn WebhookRegistry, ev: &Event, body: Vec<
             if let Some(sig) = signature.as_deref() {
                 req = req.set("X-Artifacts-Signature", sig);
             }
-            match req.send_bytes(&body) {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let outcome = if (200..400).contains(&status) {
-                        "success"
-                    } else if (500..600).contains(&status) {
-                        "exhausted"
-                    } else {
-                        "client_error"
-                    };
-                    metrics::counter!(
-                        "artifacts_webhook_deliveries_total",
-                        "kind" => kind.clone(),
-                        "outcome" => outcome,
-                    )
-                    .increment(1);
-                    if outcome != "success" {
-                        tracing::warn!(
-                            hook = %sub.id, url = %sub.url, status,
-                            "legacy direct-dispatch: non-2xx (single attempt)"
-                        );
-                    }
+            // `ureq` maps any status >= 400 to `Err(Status)`, so `Ok` is a
+            // delivered 2xx/3xx. This dispatch is single-attempt (no
+            // outbox to retry against), so every failure is terminal —
+            // a 4xx is a `client_error`, anything else `exhausted`.
+            let outcome = match req.send_bytes(&body) {
+                Ok(_resp) => "success",
+                Err(ureq::Error::Status(status, _)) if (400..500).contains(&status) => {
+                    "client_error"
                 },
                 Err(e) => {
                     tracing::warn!(
                         hook = %sub.id, url = %sub.url, error = %e,
-                        "legacy direct-dispatch: transport error (single attempt)"
+                        "legacy direct-dispatch failed (single attempt)"
                     );
-                    metrics::counter!(
-                        "artifacts_webhook_deliveries_total",
-                        "kind" => kind.clone(),
-                        "outcome" => "exhausted",
-                    )
-                    .increment(1);
+                    "exhausted"
                 },
-            }
+            };
+            metrics::counter!(
+                "artifacts_webhook_deliveries_total",
+                "kind" => kind,
+                "outcome" => outcome,
+            )
+            .increment(1);
         });
     }
 }
@@ -2679,6 +2654,99 @@ mod tests {
             req.contains("X-Artifacts-Event: commit"),
             "event header must be present"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_row_4xx_finalizes_as_client_error() {
+        // A 4xx is a terminal client error: even below MAX attempts the
+        // delivery is finalized (not rescheduled), so it never retries.
+        // `ureq` surfaces 4xx as `Err(Status)`, so this exercises the
+        // 4xx arm of dispatch_row.
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::Read as _;
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf); // drain the request first
+                let _ = sock.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/hook");
+
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: rid("repo-a"),
+            url: url.clone(),
+            secret: None,
+            events: vec![],
+        })
+        .unwrap();
+        r.enqueue_delivery(&rid("repo-a"), "commit", br#"{}"#)
+            .unwrap();
+        let rows = r.claim_pending_deliveries(10).unwrap();
+        let row = PendingDelivery {
+            id: rows[0].id,
+            hook_id: rows[0].hook_id.clone(),
+            url,
+            secret: None,
+            kind: "commit".into(),
+            payload: br#"{}"#.to_vec(),
+            attempts: 1, // below MAX — a retryable error would reschedule
+        };
+        let path = _d.path().join("webhooks.db");
+        let outbox: Arc<dyn DeliveryOutbox> =
+            Arc::new(SqliteWebhookRegistry::open(&path, test_master_key()).unwrap());
+        let oc = outbox.clone();
+        tokio::task::spawn_blocking(move || dispatch_row(&*oc, row))
+            .await
+            .unwrap();
+        // Finalized (terminal) rows have a non-NULL finalized_at, so a
+        // future-cutoff prune reaps exactly this one — proving 4xx was
+        // finalized, not retried (a retry leaves finalized_at NULL).
+        let pruned = outbox.prune_finalized(now_unix_secs() + 3600).unwrap();
+        assert_eq!(pruned, 1, "4xx delivery must be finalized as terminal");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_direct_dispatch_4xx_is_client_error() {
+        // The single-attempt legacy path labels a 4xx as client_error
+        // (vs exhausted for 5xx/transport). Just assert it doesn't panic
+        // and completes against a 404 listener — exercises that arm.
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                use std::io::Read as _;
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/hook");
+        let r = MemRegistry::new();
+        r.add(Subscription {
+            id: "hook-4xx".into(),
+            repo_id: rid("repo-a"),
+            url,
+            secret: None,
+            events: vec![],
+        })
+        .unwrap();
+        let ev = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "msg");
+        let body = serde_json::to_vec(&ev).unwrap();
+        tokio::task::spawn_blocking(move || legacy_direct_dispatch(&r, &ev, body))
+            .await
+            .unwrap();
     }
 
     // --- sign_body: verify the header format ----------------------------

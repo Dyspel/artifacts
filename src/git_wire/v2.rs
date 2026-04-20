@@ -80,12 +80,16 @@ pub(crate) async fn native_v2_fetch_response(
     }
     pkt::write_flush(&mut body);
 
-    Response::builder()
+    // `200 OK` + static header literals + an in-memory body can't fail
+    // to build (the only `http::Response` build errors are an invalid
+    // status or header, neither of which is possible here), so `expect`
+    // rather than a bubbled error keeps the impossible path off the surface.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + static headers always builds a valid response"))
 }
 
 /// Subprocess fallback for fetch pack generation. Runs
@@ -253,12 +257,16 @@ pub(crate) async fn native_ls_refs_response(
     }
     pkt::write_flush(&mut body);
 
-    Response::builder()
+    // `200 OK` + static header literals + an in-memory body can't fail
+    // to build (the only `http::Response` build errors are an invalid
+    // status or header, neither of which is possible here), so `expect`
+    // rather than a bubbled error keeps the impossible path off the surface.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + static headers always builds a valid response"))
 }
 
 #[cfg(test)]
@@ -698,14 +706,4 @@ mod tests {
         );
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
     }
-
-    // NOTE on the `Response::builder()` `.map_err` arms at v2.rs ~88 and ~261:
-    // Both arms are genuinely unreachable in practice — `StatusCode::OK` is a
-    // compile-time constant that is always valid, and the header name+value
-    // strings are static literals that `axum::http` accepts unconditionally.
-    // `http::Response::builder()` only errors when the status code or a header
-    // value is malformed, which cannot happen with our fixed constants.
-    // Reaching those arms would require `axum::http` to change the validity
-    // rules for `StatusCode::OK` or for the two static strings — a breaking
-    // change in the http crate, not something a unit test can induce.
 }
