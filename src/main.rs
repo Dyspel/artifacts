@@ -3,6 +3,7 @@ mod commits;
 mod config;
 mod error;
 mod jwt;
+mod merge;
 mod metrics;
 mod ownership;
 mod rate_limit;
@@ -199,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
                 .route("/v1/repos/:id/commits", post(commits::create_commit))
+                .route("/v1/repos/:id/merge", post(merge::merge_branches))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .with_state(rest_state)
                 // Metrics middleware only wraps the REST surface (not

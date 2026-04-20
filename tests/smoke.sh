@@ -487,5 +487,123 @@ gen_id=$(awk 'tolower($1)=="x-request-id:"{print $2}' "${WORK_DIR}/rid_gen.txt" 
     || { echo "FAIL: generated X-Request-Id is not 32 chars (got $gen_id len=${#gen_id})"; exit 1; }
 echo "    generated X-Request-Id observed ($gen_id)"
 
+# POST /v1/repos/:id/merge — fast-forward, three-way, and conflict paths.
+#
+# The REST commits endpoint treats `parent` as both the new commit's parent
+# and the CAS expectation on the target branch's current head, which means
+# it can't create a branch off a non-orphan parent in one call. We use
+# smart-HTTP (git push) to set up the feature/side/conflict-* branches
+# instead — exactly how a real git client would.
+echo "==> [15] merge: fast-forward, three-way clean, three-way conflict"
+merge_resp=$(curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/repos")
+merge_id=$(echo "$merge_resp" | json id)
+merge_remote=$(echo "$merge_resp" | json remote)
+
+# c1 on main: seed README + a.txt (this is the merge base for every later step).
+m_c1=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{
+      "branch": "main",
+      "parent": null,
+      "message": "base",
+      "changes": [
+        {"op":"write","path":"README.md","content":"# base\n"},
+        {"op":"write","path":"a.txt","content":"one\n"}
+      ]
+    }' \
+    "$BASE_URL/v1/repos/${merge_id}/commits" | json commit)
+
+# Clone and use the working copy as a branch-push source. `GIT_*` env vars
+# pin identity so `git commit` doesn't fail on an empty user.name config.
+merge_work="${WORK_DIR}/merge_work"
+rm -rf "$merge_work"
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$merge_remote" "$merge_work"
+export GIT_AUTHOR_NAME="smoke" GIT_AUTHOR_EMAIL="smoke@artifacts.local"
+export GIT_COMMITTER_NAME="smoke" GIT_COMMITTER_EMAIL="smoke@artifacts.local"
+
+push_branch() {
+    local branch="$1" path="$2" content="$3"
+    git -C "$merge_work" checkout -q -B "$branch" "$m_c1"
+    printf '%s' "$content" > "$merge_work/$path"
+    git -C "$merge_work" add "$path"
+    git -C "$merge_work" commit -q -m "$branch: $path"
+    git -C "$merge_work" push -q origin "$branch" >/dev/null 2>&1
+    git -C "$merge_work" rev-parse HEAD
+}
+
+# Fast-forward: "feature" adds b.txt on top of c1. Merging feature → main
+# advances main to feature's tip without a merge commit.
+ff_c=$(push_branch feature b.txt b)
+ff_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"sourceBranch":"feature","targetBranch":"main"}' \
+    "$BASE_URL/v1/repos/${merge_id}/merge")
+ff_head=$(echo "$ff_resp" | json commit)
+ff_flag=$(echo "$ff_resp" | json fastForward)
+[[ "$ff_head" == "$ff_c" ]] \
+    || { echo "FAIL: FF merge expected head=$ff_c, got $ff_head"; exit 1; }
+[[ "$ff_flag" == "True" ]] \
+    || { echo "FAIL: FF merge expected fastForward=True, got $ff_flag"; exit 1; }
+echo "    fast-forward merge advances main to feature head ($ff_c)"
+
+# Three-way clean: advance main with a new commit that doesn't touch c.txt;
+# create "side" off ff_c (the current main) that adds c.txt; merge side →
+# main. This forces divergence without conflict.
+git -C "$merge_work" checkout -q main
+git -C "$merge_work" pull -q --ff-only origin main
+printf 'd' > "$merge_work/d.txt"
+git -C "$merge_work" add d.txt
+git -C "$merge_work" commit -q -m "main: add d"
+m_c2=$(git -C "$merge_work" rev-parse HEAD)
+git -C "$merge_work" push -q origin main >/dev/null 2>&1
+
+side_c=$(push_branch side c.txt c)
+
+tw_resp=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"sourceBranch":"side","targetBranch":"main","message":"merge side"}' \
+    "$BASE_URL/v1/repos/${merge_id}/merge")
+tw_head=$(echo "$tw_resp" | json commit)
+tw_flag=$(echo "$tw_resp" | json fastForward)
+[[ "$tw_flag" == "False" ]] \
+    || { echo "FAIL: 3-way merge expected fastForward=False, got $tw_flag"; exit 1; }
+[[ "$tw_head" != "$m_c2" && "$tw_head" != "$side_c" ]] \
+    || { echo "FAIL: 3-way merge head should be new commit; got $tw_head"; exit 1; }
+tw_clone="${WORK_DIR}/merge_tw"
+rm -rf "$tw_clone"
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$merge_remote" "$tw_clone"
+parents=$(git -C "$tw_clone" rev-list --parents -n 1 HEAD | awk '{$1=""; print substr($0,2)}')
+[[ "$parents" == "${m_c2} ${side_c}" ]] \
+    || { echo "FAIL: merge commit parents expected '$m_c2 $side_c', got '$parents'"; exit 1; }
+[[ -f "$tw_clone/c.txt" && -f "$tw_clone/d.txt" ]] \
+    || { echo "FAIL: merge tree missing c.txt or d.txt"; exit 1; }
+echo "    three-way clean merge produces commit with two parents + unified tree"
+
+# Three-way conflict: both sides edit a.txt differently on top of c1.
+push_branch conflict-left  a.txt $'left\n'  >/dev/null
+push_branch conflict-right a.txt $'right\n' >/dev/null
+
+cf_file="${WORK_DIR}/merge_conflict.json"
+cf_code=$(curl -sS -o "$cf_file" -w '%{http_code}' \
+    -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"sourceBranch":"conflict-right","targetBranch":"conflict-left","message":"should conflict"}' \
+    "$BASE_URL/v1/repos/${merge_id}/merge")
+[[ "$cf_code" == "409" ]] \
+    || { echo "FAIL: conflicting merge expected 409, got $cf_code; body:"; cat "$cf_file"; exit 1; }
+cf_err_code=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["code"])' < "$cf_file")
+[[ "$cf_err_code" == "merge_conflict" ]] \
+    || { echo "FAIL: expected code=merge_conflict, got $cf_err_code"; exit 1; }
+cf_paths=$(python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["error"]["conflicts"]))' < "$cf_file")
+[[ "$cf_paths" == "a.txt" ]] \
+    || { echo "FAIL: expected conflicts=[a.txt], got [$cf_paths]"; exit 1; }
+echo "    conflicting merge reports 409 merge_conflict with path=a.txt"
+
+# ff-only strategy refuses a non-FF. Use the already-diverged conflict-left
+# vs conflict-right: no FF exists in either direction. Should 400.
+ffo_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"sourceBranch":"conflict-right","targetBranch":"conflict-left","strategy":"ff-only"}' \
+    "$BASE_URL/v1/repos/${merge_id}/merge")
+[[ "$ffo_code" == "400" ]] \
+    || { echo "FAIL: ff-only on diverged expected 400, got $ffo_code"; exit 1; }
+echo "    ff-only refuses diverged branches with 400"
+
 echo
 echo "==> all checks passed"

@@ -39,6 +39,13 @@ pub enum Error {
         current: Option<String>,
     },
 
+    #[error("merge conflict on branch {target_branch} ({} path{})", conflict_paths.len(), if conflict_paths.len() == 1 { "" } else { "s" })]
+    MergeConflict {
+        target_branch: String,
+        source_branch: String,
+        conflict_paths: Vec<String>,
+    },
+
     #[error("repo quota exceeded for {subject} (limit: {limit})")]
     QuotaExceeded { subject: String, limit: u64 },
 
@@ -122,6 +129,27 @@ impl IntoResponse for Error {
                         "branch": branch,
                         "expected": expected,
                         "current": current,
+                    }
+                }));
+                return (StatusCode::CONFLICT, body).into_response();
+            }
+            Error::MergeConflict { target_branch, source_branch, conflict_paths } => {
+                // 409 with the paths that failed to merge so the caller can
+                // surface them directly in a UI or resolve server-side by
+                // re-issuing with explicit content.
+                let body = Json(json!({
+                    "error": {
+                        "code": "merge_conflict",
+                        "message": format!(
+                            "merge conflict: {} → {} ({} conflicting path{})",
+                            source_branch,
+                            target_branch,
+                            conflict_paths.len(),
+                            if conflict_paths.len() == 1 { "" } else { "s" },
+                        ),
+                        "sourceBranch": source_branch,
+                        "targetBranch": target_branch,
+                        "conflicts": conflict_paths,
                     }
                 }));
                 return (StatusCode::CONFLICT, body).into_response();

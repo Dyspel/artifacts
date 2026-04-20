@@ -374,7 +374,7 @@ pub async fn create_commit(
 
 /// Shell out to `git --git-dir <dir> <args>`, optionally pipe `stdin` in,
 /// collect stdout + stderr, return exit code and both streams.
-async fn run_git(
+pub(crate) async fn run_git(
     git_dir: &Path,
     args: &[&str],
     env: &[(&str, &str)],
@@ -410,7 +410,7 @@ async fn run_git(
     Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
-fn valid_branch_name(s: &str) -> bool {
+pub(crate) fn valid_branch_name(s: &str) -> bool {
     // A useful subset of git-check-ref-format. Rejects empty, leading/trailing
     // slashes, double slashes, ".." and "@{", plus any byte below 0x20.
     if s.is_empty() || s.starts_with('/') || s.ends_with('/') || s.contains("//") {
@@ -432,7 +432,7 @@ fn valid_path(p: &str) -> bool {
     p.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-fn validate_sha(s: &str) -> Result<()> {
+pub(crate) fn validate_sha(s: &str) -> Result<()> {
     if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
