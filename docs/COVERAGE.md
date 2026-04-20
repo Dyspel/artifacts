@@ -1,9 +1,12 @@
 # Test coverage
 
-**92.1% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
-excluded), across **656 in-crate unit tests + 9 integration test
+**93.4% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
+excluded), across **723 in-crate unit tests + 11 integration test
 binaries + doctests**. Reconciled across both coverage engines (see
-"two engines" below) the true line coverage is **≈93%**.
+"two engines" below) the true line coverage is **≈94%** — and the
+single biggest ptrace shortfall, `error.rs` at 68%, is **97% under the
+LLVM engine** (ptrace doesn't credit the lines inside its multi-line
+`json!{}` `IntoResponse` arms, all of which the unit tests execute).
 
 A coverage review of this codebase also surfaced — and fixed — a latent
 bug: because `ureq` 2.x maps every HTTP status ≥ 400 to `Err(Status)`,
