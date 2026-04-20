@@ -39,11 +39,12 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
 # GUI-only deps; opt-in via `--features gui` so the server binary stays lean.
 eframe = { version = "0.27", optional = true }
+egui_plot = { version = "0.27", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:ureq"]
+gui = ["dep:eframe", "dep:egui_plot", "dep:ureq"]
 
 [[bin]]
 name = "artifacts-gui"
