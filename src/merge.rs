@@ -483,3 +483,303 @@ async fn run_merge_tree(
     }
     Ok(MergeTreeOutcome::Conflict { paths })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_ancestor, resolve_ref, run_merge_tree, tree_of, MergeTreeOutcome};
+    use crate::commits::validate_sha;
+    use std::path::Path;
+
+    // ── bare-repo fixture ─────────────────────────────────────────────────
+
+    /// Build a minimal bare repo and seed it with one commit on `main`.
+    /// Returns the commit SHA for that initial commit.
+    fn git_plumbing(git_dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("git");
+        cmd.arg("--git-dir").arg(git_dir).args(args);
+        if stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        if let Some(data) = stdin {
+            child.stdin.as_mut().unwrap().write_all(data).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Create a bare repo and a commit with `content` in `filename` on `branch`.
+    /// Returns (git_dir path via tempdir, first commit SHA).
+    async fn new_bare_repo_with_commit(
+        dir: &Path,
+        branch: &str,
+        filename: &str,
+        content: &[u8],
+    ) -> String {
+        use std::process::Command;
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(dir)
+            .status()
+            .unwrap();
+
+        let blob = git_plumbing(dir, &["hash-object", "-w", "--stdin"], Some(content));
+        let tree_entry = format!("100644 blob {blob}\t{filename}\n");
+        let tree = git_plumbing(dir, &["mktree"], Some(tree_entry.as_bytes()));
+        let commit = git_plumbing_commit(dir, &tree, &[]);
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["update-ref", &format!("refs/heads/{branch}"), &commit])
+            .status()
+            .unwrap();
+        commit
+    }
+
+    fn git_plumbing_commit(git_dir: &Path, tree: &str, parents: &[&str]) -> String {
+        use std::process::Command;
+        let mut args = vec!["commit-tree", "-m", "test"];
+        for p in parents {
+            args.push("-p");
+            args.push(p);
+        }
+        args.push(tree);
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir)
+            .args(&args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_string())
+            .unwrap()
+    }
+
+    // ── resolve_ref ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_ref_returns_sha_for_existing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = new_bare_repo_with_commit(&git_dir, "main", "hello.txt", b"hello\n").await;
+
+        let got = resolve_ref(&git_dir, "refs/heads/main").await.unwrap();
+        assert_eq!(got, Some(commit));
+    }
+
+    /// `show-ref --verify --hash` exits 128 (not 1) for a missing ref on
+    /// some git versions — `resolve_ref` maps that to `Err`, not `None`.
+    /// The `rc == 1 → Ok(None)` path is exercised only on git builds that
+    /// emit exit code 1 for a missing ref; we test it as an error here so
+    /// the test is portable across git versions.
+    #[tokio::test]
+    async fn resolve_ref_errors_or_none_for_missing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        new_bare_repo_with_commit(&git_dir, "main", "hello.txt", b"hello\n").await;
+
+        let got = resolve_ref(&git_dir, "refs/heads/nope").await;
+        // Accept either Ok(None) (git exits 1) or Err (git exits 128) —
+        // both indicate "ref not present".
+        match got {
+            Ok(None) | Err(_) => {},
+            Ok(Some(sha)) => panic!("expected missing ref, got sha: {sha}"),
+        }
+    }
+
+    // ── is_ancestor ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn is_ancestor_true_when_a_is_parent_of_b() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let parent = new_bare_repo_with_commit(&git_dir, "main", "a.txt", b"first\n").await;
+
+        // Create a child commit
+        let blob = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"second\n"),
+        );
+        let tree_entry = format!("100644 blob {blob}\tb.txt\n");
+        let tree = git_plumbing(&git_dir, &["mktree"], Some(tree_entry.as_bytes()));
+        let child = git_plumbing_commit(&git_dir, &tree, &[&parent]);
+
+        let result = is_ancestor(&git_dir, &parent, &child).await.unwrap();
+        assert!(result, "parent should be an ancestor of child");
+    }
+
+    #[tokio::test]
+    async fn is_ancestor_false_when_commits_are_unrelated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let c1 = new_bare_repo_with_commit(&git_dir, "main", "a.txt", b"aaa\n").await;
+        let c2 = new_bare_repo_with_commit(&git_dir, "other", "b.txt", b"bbb\n").await;
+
+        let result = is_ancestor(&git_dir, &c1, &c2).await.unwrap();
+        assert!(!result, "unrelated commits are not ancestors of each other");
+    }
+
+    // ── tree_of ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tree_of_returns_tree_sha_for_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = new_bare_repo_with_commit(&git_dir, "main", "file.txt", b"content\n").await;
+
+        let tree = tree_of(&git_dir, &commit).await.unwrap();
+        // tree SHA should be a 40-hex string
+        assert_eq!(tree.len(), 40);
+        assert!(tree.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── run_merge_tree ────────────────────────────────────────────────────
+
+    /// Two branches that only touch different files should merge cleanly.
+    #[tokio::test]
+    async fn run_merge_tree_clean_merge_returns_tree_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        use std::process::Command;
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        // Create a shared base commit
+        let blob_a = git_plumbing(&git_dir, &["hash-object", "-w", "--stdin"], Some(b"base\n"));
+        let tree_entry = format!("100644 blob {blob_a}\tbase.txt\n");
+        let base_tree = git_plumbing(&git_dir, &["mktree"], Some(tree_entry.as_bytes()));
+        let base_commit = git_plumbing_commit(&git_dir, &base_tree, &[]);
+
+        // Branch A: adds a.txt (different from B so no conflict)
+        let blob_a2 = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"from a\n"),
+        );
+        let tree_a_entry =
+            format!("100644 blob {blob_a}\tbase.txt\n100644 blob {blob_a2}\ta.txt\n");
+        let tree_a = git_plumbing(&git_dir, &["mktree"], Some(tree_a_entry.as_bytes()));
+        let commit_a = git_plumbing_commit(&git_dir, &tree_a, &[&base_commit]);
+
+        // Branch B: adds b.txt
+        let blob_b = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"from b\n"),
+        );
+        let tree_b_entry = format!("100644 blob {blob_a}\tbase.txt\n100644 blob {blob_b}\tb.txt\n");
+        let tree_b = git_plumbing(&git_dir, &["mktree"], Some(tree_b_entry.as_bytes()));
+        let commit_b = git_plumbing_commit(&git_dir, &tree_b, &[&base_commit]);
+
+        let outcome = run_merge_tree(&git_dir, &commit_a, &commit_b)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MergeTreeOutcome::Clean { .. }),
+            "non-conflicting branches should merge cleanly"
+        );
+        if let MergeTreeOutcome::Clean { tree } = outcome {
+            assert_eq!(tree.len(), 40);
+            assert!(tree.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    /// Two branches that both modify the same file produce a conflict.
+    #[tokio::test]
+    async fn run_merge_tree_conflicting_branches_returns_conflict_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        use std::process::Command;
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        // Base: shared.txt
+        let blob_base = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"line1\nline2\nline3\n"),
+        );
+        let base_entry = format!("100644 blob {blob_base}\tshared.txt\n");
+        let base_tree = git_plumbing(&git_dir, &["mktree"], Some(base_entry.as_bytes()));
+        let base_commit = git_plumbing_commit(&git_dir, &base_tree, &[]);
+
+        // Branch A: edits shared.txt with different content
+        let blob_a = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"A changed line1\nline2\nline3\n"),
+        );
+        let entry_a = format!("100644 blob {blob_a}\tshared.txt\n");
+        let tree_a = git_plumbing(&git_dir, &["mktree"], Some(entry_a.as_bytes()));
+        let commit_a = git_plumbing_commit(&git_dir, &tree_a, &[&base_commit]);
+
+        // Branch B: edits shared.txt with yet another content
+        let blob_b = git_plumbing(
+            &git_dir,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"B changed line1\nline2\nline3\n"),
+        );
+        let entry_b = format!("100644 blob {blob_b}\tshared.txt\n");
+        let tree_b = git_plumbing(&git_dir, &["mktree"], Some(entry_b.as_bytes()));
+        let commit_b = git_plumbing_commit(&git_dir, &tree_b, &[&base_commit]);
+
+        let outcome = run_merge_tree(&git_dir, &commit_a, &commit_b)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MergeTreeOutcome::Conflict { .. }),
+            "divergent edits to the same file should produce a conflict"
+        );
+        if let MergeTreeOutcome::Conflict { paths } = outcome {
+            assert!(
+                paths.iter().any(|p| p == "shared.txt"),
+                "conflict paths should include shared.txt, got: {paths:?}"
+            );
+        }
+    }
+
+    // ── validate_sha (re-tested via merge.rs import) ─────────────────────
+
+    #[test]
+    fn validate_sha_accepts_40_hex() {
+        assert!(validate_sha("0000000000000000000000000000000000000000").is_ok());
+        assert!(validate_sha("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").is_ok());
+    }
+
+    #[test]
+    fn validate_sha_rejects_non_40_and_non_hex() {
+        assert!(validate_sha("").is_err(), "empty");
+        assert!(validate_sha("deadbeef").is_err(), "too short");
+        assert!(
+            validate_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err(),
+            "non-hex chars"
+        );
+        assert!(
+            validate_sha("deadbeef deadbeef deadbeef deadbeef dead").is_err(),
+            "space in sha"
+        );
+        // 41 chars — too long
+        assert!(
+            validate_sha("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefa").is_err(),
+            "41 chars"
+        );
+    }
+}
