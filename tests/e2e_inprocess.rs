@@ -771,6 +771,16 @@ fn e2e_inprocess_full_surface() {
         "explicit merge strategy never fast-forwards"
     );
 
+    // Delete a ref via push (`push origin :ffforce`) — exercises the
+    // receive-pack delete-ref path.
+    git_must(&mw2, &["push", "-q", "origin", ":ffforce"]);
+    let refs_after = send(auth(ureq::get(&format!("{base}/v1/repos/{repo_id}/refs"))));
+    assert!(
+        !refs_after.1.contains("refs/heads/ffforce"),
+        "ffforce should be deleted: {}",
+        refs_after.1
+    );
+
     // --- smart-HTTP v0/v1 advertise (no Git-Protocol header) --------
     // A raw GET to info/refs WITHOUT the v2 negotiation header drives
     // the subprocess advertise path (git upload-pack --advertise-refs),
