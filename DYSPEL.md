@@ -283,8 +283,8 @@ is passed. Tokens travel in the clear otherwise.
 ## Still open — production blockers this guide does not close
 
 The commits this guide references cover "single-user dogfooding" plus
-the basic abuse-bounding needed before letting a small cohort in.
-Before public / multi-tenant traffic, you still need:
+the basic abuse-bounding and observability needed before letting a
+small cohort in. Before public / multi-tenant traffic, you still need:
 
 - **Backups.** `tokens.db` + `repos/` on one disk. A host-failure-level
   event loses work. Minimum: nightly tar + rsync to object storage,
@@ -314,6 +314,8 @@ estimates; this guide is the "what's wired today" half.
 | Per-user repo-count quota (`max_repos_per_user`)       | Prod-5        |
 | Per-subject token-bucket rate limiter                  | Prod-6        |
 | Per-blob size cap on REST commits                      | Prod-7        |
+| Prometheus `/metrics` endpoint                         | Prod-9        |
+| X-Request-Id roundtrip + structured request logs       | Prod-10       |
 
 ### Tuning knobs
 

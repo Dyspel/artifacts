@@ -79,6 +79,8 @@ end-to-end in a day, not a quarter.
 | Per-user repo-count quota (429 `quota_exceeded`)                 | ✅     |
 | Per-subject token-bucket rate limiter (429 `rate_limited`)       | ✅     |
 | Per-blob size cap on REST commits                                | ✅     |
+| Prometheus `/metrics` endpoint (request counts, latencies, errors) | ✅   |
+| `X-Request-Id` header roundtrip + structured per-request log     | ✅     |
 
 **Known not-yet:**
 
@@ -407,6 +409,42 @@ HTTP 409 Conflict
 Clients should re-read, rebase their change set, and retry. The `current`
 field lets them do that without a second round trip.
 
+### Metrics
+
+```
+GET /metrics
+```
+
+Returns Prometheus text format (no auth). Scrape at whatever interval
+your monitor prefers.
+
+Exposed metrics:
+
+| Name                                           | Kind      | Labels                   |
+| ---------------------------------------------- | --------- | ------------------------ |
+| `artifacts_requests_total`                     | counter   | `method`, `path`, `status` |
+| `artifacts_request_duration_seconds`           | histogram | `method`, `path`         |
+| `artifacts_rate_limited_total`                 | counter   | —                        |
+| `artifacts_quota_exceeded_total`               | counter   | —                        |
+| `artifacts_build_info`                         | gauge     | `version`                |
+
+The `path` label is the **route template** (`/v1/repos/:id/tokens`),
+not the concrete URI. Cardinality is bounded by the route table, not
+by the number of repos created.
+
+Histogram buckets are tuned for HTTP latency (1 ms through 10 s, 12
+buckets). Good for percentile approximation up to p99-ish; if you
+need finer resolution, tighten the bucket list in `src/metrics.rs`.
+
+### Request IDs
+
+Every response carries an `X-Request-Id: <id>` header. If the caller
+supplied one on the request and it's well-formed (≤128 chars of
+`[A-Za-z0-9_-]`), we echo it back; otherwise we generate a UUIDv4
+(32-char hex). The id is attached to the per-request tracing span so
+every log line the handler emits carries `request_id=<id>` as a
+structured field — grep-friendly for incident debugging.
+
 ### Git endpoints
 
 The standard smart-HTTP surface, exposed under `/git/:id.git/`:
@@ -442,7 +480,7 @@ artifacts/
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
 │   └── rest.rs                REST endpoints (create / fork / tokens / revoke / delete)
 ├── tests/
-│   └── smoke.sh               10-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart
+│   └── smoke.sh               14-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart → JWT → quota → blob-cap → /metrics
 └── scripts/
     ├── bench_fork.sh          10,000-fork benchmark; measures disk + latency
     └── bench_clone.sh         clone-latency benchmark; p50/p95/p99/max over N clones
@@ -529,8 +567,8 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 23 unit tests (storage, smart-http, refs, commits, tokens, auth)
-./tests/smoke.sh            # 10-step end-to-end integration test
+cargo test                  # 64 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id)
+./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
 FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
