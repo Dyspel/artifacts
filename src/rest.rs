@@ -4,7 +4,7 @@
 //! written for that surface can be adapted with a URL change.
 
 use crate::{
-    auth::authorize_admin,
+    auth::authorize_rest,
     config::Config,
     error::{Error, Result},
     refs::RefStore,
@@ -64,7 +64,7 @@ pub async fn create_repo(
     headers: HeaderMap,
     body: Option<Json<CreateRepoBody>>,
 ) -> Result<Json<RepoHandle>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
     let id = body
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
@@ -89,7 +89,7 @@ pub async fn fork_repo(
     headers: HeaderMap,
     body: Option<Json<ForkBody>>,
 ) -> Result<Json<RepoHandle>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
     if !state.storage.exists(&source_id) {
         return Err(Error::RepoNotFound(source_id));
     }
@@ -128,7 +128,7 @@ pub async fn mint_token(
     headers: HeaderMap,
     Json(body): Json<MintTokenBody>,
 ) -> Result<Json<TokenMinted>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
     if !state.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
@@ -163,7 +163,7 @@ pub async fn revoke_token(
     headers: HeaderMap,
     Json(body): Json<RevokeBody>,
 ) -> Result<Json<RevokeResponse>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
     let revoked = state.tokens.revoke(&body.token).await?;
     Ok(Json(RevokeResponse { revoked }))
 }
@@ -174,7 +174,7 @@ pub async fn delete_repo(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(&headers, &state.cfg.admin_token, state.cfg.jwt_secret.as_deref())?;
     state.storage.delete(&id)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

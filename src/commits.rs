@@ -35,7 +35,7 @@
 //! RefStore trait in M3.
 
 use crate::{
-    auth::authorize_admin,
+    auth::authorize_rest,
     error::{Error, Result},
     refs::CasOutcome,
     rest::RestState,
@@ -120,7 +120,11 @@ pub async fn create_commit(
     headers: HeaderMap,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<CommitResult>> {
-    authorize_admin(&headers, &state.cfg.admin_token)?;
+    let _principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
     crate::storage::validate_repo_id(&repo_id)?;
     if !state.storage.exists(&repo_id) {
         return Err(Error::RepoNotFound(repo_id));

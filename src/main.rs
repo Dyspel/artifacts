@@ -2,6 +2,7 @@ mod auth;
 mod commits;
 mod config;
 mod error;
+mod jwt;
 mod refs;
 mod rest;
 mod smart_http;
@@ -51,6 +52,14 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_ADMIN_TOKEN")]
         admin_token: Option<String>,
 
+        /// Shared HS256 secret for verifying JWTs on REST endpoints.
+        /// When set, any `Authorization: Bearer <jwt>` that verifies
+        /// against this secret resolves to `Principal::User { subject }`
+        /// from the JWT's `userId` (Dyspel convention) or `sub` claim.
+        /// When unset, only the admin token authorizes REST calls.
+        #[arg(long, env = "ARTIFACTS_JWT_SECRET")]
+        jwt_secret: Option<String>,
+
         /// Path to the SQLite file that stores minted tokens. Defaults to
         /// `<data-dir>/tokens.db` so the token table lives next to the
         /// repos it authorizes.
@@ -75,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
             bind,
             public_base_url,
             admin_token,
+            jwt_secret,
             token_db,
         } => {
             let admin_token = admin_token.unwrap_or_else(|| {
@@ -83,10 +93,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[artifacts] export ARTIFACTS_ADMIN_TOKEN={t} to persist across restarts");
                 t
             });
+            if jwt_secret.is_some() {
+                tracing::info!("jwt auth enabled (HS256)");
+            } else {
+                tracing::info!("jwt auth disabled — only admin token accepted");
+            }
             let cfg = Arc::new(Config {
                 data_dir: data_dir.clone(),
                 public_base_url,
                 admin_token,
+                jwt_secret,
             });
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
