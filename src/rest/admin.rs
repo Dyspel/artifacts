@@ -495,3 +495,469 @@ pub async fn admin_list_audit(
         .await?;
     Ok(Json(rows))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        admin_audit_stats, admin_gc_preview, admin_gc_run, admin_get_repo, admin_list_audit,
+        admin_list_repos, admin_rotate_jwt_key, admin_rotate_token, admin_rotate_webhook_key,
+        admin_verify_audit_chain, create_repo, fork_repo, AuthnState, DataState, ObservState,
+        RestState, RuntimeState,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::{get, post},
+        Router,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    use tower::ServiceExt;
+
+    const ADMIN: &str = "admin-token-for-rest-router-tests-01234567";
+    const JWT_SECRET: &str = "rest-router-test-secret";
+
+    fn build_state(dir: &std::path::Path) -> RestState {
+        let data_dir = dir.to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        RestState {
+            cfg: Arc::new(cfg),
+            data: DataState {
+                storage: Arc::new(storage),
+                ownership: Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: Arc::new(crate::refs::MemRefStore::new()),
+                objects: Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: Arc::new(crate::alternates_cache::AlternatesCache::new()),
+            },
+            authn: AuthnState {
+                tokens: Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .route("/v1/repos", post(create_repo))
+            .route("/v1/repos/:id/forks", post(fork_repo))
+            .route("/v1/admin/repos", get(admin_list_repos))
+            .route("/v1/admin/repos/:id", get(admin_get_repo))
+            .route("/v1/admin/repos/:id/gc-preview", get(admin_gc_preview))
+            .route("/v1/admin/repos/:id/gc", post(admin_gc_run))
+            .route("/v1/admin/token/rotate", post(admin_rotate_token))
+            .route("/v1/admin/jwt-key/rotate", post(admin_rotate_jwt_key))
+            .route(
+                "/v1/admin/webhook-key/rotate",
+                post(admin_rotate_webhook_key),
+            )
+            .route("/v1/admin/audit", get(admin_list_audit))
+            .route("/v1/admin/audit/stats", get(admin_audit_stats))
+            .route(
+                "/v1/admin/audit/verify-chain",
+                get(admin_verify_audit_chain),
+            )
+            .with_state(build_state(dir))
+    }
+
+    fn user_jwt(subject: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: String,
+            exp: usize,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        encode(
+            &Header::default(),
+            &Claims {
+                sub: subject.to_string(),
+                exp,
+            },
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap()
+    }
+
+    async fn send(app: &Router, r: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(r).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    // ── admin_list_audit ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_list_audit_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("GET", "/v1/admin/audit", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_list_audit_jwt_user_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, _) = send(&a, req("GET", "/v1/admin/audit", Some(&jwt), None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_list_audit_with_query_params_returns_200() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // Exercise every supported query param to hit the filter branches.
+        let (status, body) = send(
+            &a,
+            req(
+                "GET",
+                "/v1/admin/audit?event=repo.create&actor=admin&repoId=some-repo&since=0&until=9999999999&limit=5&offset=0",
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_array());
+    }
+
+    // ── admin_audit_stats ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_audit_stats_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("GET", "/v1/admin/audit/stats", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_audit_stats_jwt_user_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, _) = send(&a, req("GET", "/v1/admin/audit/stats", Some(&jwt), None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_audit_stats_admin_returns_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) = send(&a, req("GET", "/v1/admin/audit/stats", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["count"].is_number());
+    }
+
+    // ── admin_verify_audit_chain ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_verify_audit_chain_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("GET", "/v1/admin/audit/verify-chain", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_verify_audit_chain_admin_returns_verified_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) = send(
+            &a,
+            req("GET", "/v1/admin/audit/verify-chain", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["verified"].is_number());
+    }
+
+    // ── admin_get_repo ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_get_repo_missing_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req("GET", "/v1/admin/repos/no-such-repo", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_get_repo_existing_returns_detail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // Create a repo so there is something to fetch.
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, detail) = send(
+            &a,
+            req("GET", &format!("/v1/admin/repos/{id}"), Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["id"], id);
+        assert!(detail["sizeBytes"].is_number());
+    }
+
+    #[tokio::test]
+    async fn admin_get_repo_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("GET", "/v1/admin/repos/any-repo", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── admin_gc_preview / admin_gc_run ───────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_gc_preview_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req(
+                "GET",
+                "/v1/admin/repos/no-such-repo/gc-preview",
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_preview_existing_repo_returns_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, _) = send(
+            &a,
+            req(
+                "GET",
+                &format!("/v1/admin/repos/{id}/gc-preview"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_run_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req("POST", "/v1/admin/repos/no-such-repo/gc", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_gc_run_existing_repo_returns_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // Pass minAgeSecs=0 so no age-gating, no objects exist anyway.
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/admin/repos/{id}/gc?minAgeSecs=0"),
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // ── admin_rotate_token ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_rotate_token_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("POST", "/v1/admin/token/rotate", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_token_jwt_user_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, _) = send(&a, req("POST", "/v1/admin/token/rotate", Some(&jwt), None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_token_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) =
+            send(&a, req("POST", "/v1/admin/token/rotate", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["token"].as_str().is_some());
+    }
+
+    // ── admin_rotate_jwt_key ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_rotate_jwt_key_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("POST", "/v1/admin/jwt-key/rotate", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_jwt_key_jwt_user_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, _) = send(
+            &a,
+            req("POST", "/v1/admin/jwt-key/rotate", Some(&jwt), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_jwt_key_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) = send(
+            &a,
+            req("POST", "/v1/admin/jwt-key/rotate", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key"].as_str().is_some());
+        // Not file-backed in tests → persisted == false.
+        assert_eq!(body["persisted"], false);
+    }
+
+    // ── admin_rotate_webhook_key ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_rotate_webhook_key_no_auth_is_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(&a, req("POST", "/v1/admin/webhook-key/rotate", None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_webhook_key_jwt_user_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (status, _) = send(
+            &a,
+            req("POST", "/v1/admin/webhook-key/rotate", Some(&jwt), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_webhook_key_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, body) = send(
+            &a,
+            req("POST", "/v1/admin/webhook-key/rotate", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key"].as_str().is_some());
+        assert!(body["rotated"].is_number());
+    }
+
+    // ── admin_list_repos pagination ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_list_repos_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // Create two repos.
+        send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        // limit=1 offset=0 → one result.
+        let (status, body) = send(
+            &a,
+            req("GET", "/v1/admin/repos?limit=1&offset=0", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(|a| a.len()), Some(1));
+        // offset=1 → second result.
+        let (status, body2) = send(
+            &a,
+            req("GET", "/v1/admin/repos?limit=1&offset=1", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body2.as_array().map(|a| a.len()), Some(1));
+        // The two pages should have different ids.
+        assert_ne!(body[0]["id"], body2[0]["id"]);
+    }
+}

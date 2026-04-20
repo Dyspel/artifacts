@@ -293,3 +293,398 @@ pub async fn rotate_tokens(
         remote,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        create_repo, fork_repo, list_tokens, mint_token, revoke_token, rotate_tokens, AuthnState,
+        DataState, ObservState, RestState, RuntimeState,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    use tower::ServiceExt;
+
+    const ADMIN: &str = "admin-token-for-rest-router-tests-01234567";
+    const JWT_SECRET: &str = "rest-router-test-secret";
+
+    fn build_state(dir: &std::path::Path) -> RestState {
+        let data_dir = dir.to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        RestState {
+            cfg: Arc::new(cfg),
+            data: DataState {
+                storage: Arc::new(storage),
+                ownership: Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: Arc::new(crate::refs::MemRefStore::new()),
+                objects: Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: Arc::new(crate::alternates_cache::AlternatesCache::new()),
+            },
+            authn: AuthnState {
+                tokens: Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .route("/v1/repos", post(create_repo))
+            .route("/v1/repos/:id/forks", post(fork_repo))
+            .route("/v1/repos/:id/tokens", post(mint_token).get(list_tokens))
+            .route("/v1/repos/:id/tokens/rotate", post(rotate_tokens))
+            .route("/v1/tokens/revoke", post(revoke_token))
+            .with_state(build_state(dir))
+    }
+
+    fn user_jwt(subject: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: String,
+            exp: usize,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        encode(
+            &Header::default(),
+            &Claims {
+                sub: subject.to_string(),
+                exp,
+            },
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap()
+    }
+
+    async fn send(app: &Router, r: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(r).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    // ── mint_token ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mint_token_admin_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, tok) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(ADMIN),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tok["token"].as_str().is_some());
+        assert!(tok["remote"].as_str().is_some());
+        assert!(tok["expiresAt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mint_token_jwt_owner_subject_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        // alice creates repo.
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // alice mints a token → 200 with subject path exercised.
+        let (status, tok) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(&jwt),
+                Some(r#"{"scope":"write"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tok["token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn mint_token_non_owner_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt_alice = user_jwt("alice");
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt_alice), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // bob tries to mint → 403.
+        let jwt_bob = user_jwt("bob");
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(&jwt_bob),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mint_token_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo/tokens",
+                Some(ADMIN),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mint_token_bad_scope_is_422() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // "admin" is not a valid Scope → axum JSON extractor should 422.
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(ADMIN),
+                Some(r#"{"scope":"admin"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn mint_token_with_ttl_has_expires_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, tok) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(ADMIN),
+                Some(r#"{"scope":"read","ttlSeconds":3600}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tok["expiresAt"].is_number());
+    }
+
+    // ── list_tokens ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_tokens_owner_sees_own_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, list) = send(
+            &a,
+            req("GET", &format!("/v1/repos/{id}/tokens"), Some(&jwt), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list.is_array());
+    }
+
+    #[tokio::test]
+    async fn list_tokens_non_owner_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt_alice = user_jwt("alice");
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt_alice), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let jwt_bob = user_jwt("bob");
+        let (status, _) = send(
+            &a,
+            req(
+                "GET",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(&jwt_bob),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ── revoke_token ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn revoke_token_existing_returns_revoked_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // Mint a token to revoke.
+        let (_, tok_body) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens"),
+                Some(ADMIN),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        let token_val = tok_body["token"].as_str().unwrap().to_string();
+        let revoke_body = format!(r#"{{"token":"{token_val}"}}"#);
+        let (status, resp) = send(
+            &a,
+            req("POST", "/v1/tokens/revoke", Some(ADMIN), Some(&revoke_body)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["revoked"], true);
+    }
+
+    #[tokio::test]
+    async fn revoke_token_unknown_token_returns_revoked_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // A token that was never minted → revoked: false.
+        let (status, resp) = send(
+            &a,
+            req(
+                "POST",
+                "/v1/tokens/revoke",
+                Some(ADMIN),
+                Some(r#"{"token":"aaaa-bbbb-cccc-dddd-eeee"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resp["revoked"], false);
+    }
+
+    // ── rotate_tokens ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rotate_tokens_owner_gets_fresh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let jwt = user_jwt("alice");
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(&jwt), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, resp) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens/rotate"),
+                Some(&jwt),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["token"].as_str().is_some());
+        assert!(resp["revoked"].is_number());
+    }
+
+    #[tokio::test]
+    async fn rotate_tokens_with_optional_scope_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, resp) = send(
+            &a,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/tokens/rotate"),
+                Some(ADMIN),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(resp["token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn rotate_tokens_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        let (status, _) = send(
+            &a,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo/tokens/rotate",
+                Some(ADMIN),
+                Some("{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
