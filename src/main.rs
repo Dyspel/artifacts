@@ -159,8 +159,11 @@ async fn main() -> anyhow::Result<()> {
             );
 
             // Install the prometheus recorder *before* any metrics call
-            // site runs (startup-time gauges, middleware).
-            let prom_handle = metrics::init();
+            // site runs (startup-time gauges, middleware). Fallible
+            // because registration can fail (duplicate name, bad
+            // matcher) — surface a clean error instead of a panic.
+            let prom_handle = metrics::init()
+                .map_err(|e| anyhow::anyhow!("metrics init failed: {e:#}"))?;
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));

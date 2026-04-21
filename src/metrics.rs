@@ -42,7 +42,7 @@ use std::time::Instant;
 /// Bucket granularity costs memory per metric series; too few and
 /// p99-ish percentiles become unreliable. Seven buckets is a reasonable
 /// middle ground.
-pub fn init() -> PrometheusHandle {
+pub fn init() -> anyhow::Result<PrometheusHandle> {
     const BUCKETS: &[f64] = &[
         0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
     ];
@@ -53,13 +53,13 @@ pub fn init() -> PrometheusHandle {
             ),
             BUCKETS,
         )
-        .expect("register histogram buckets")
+        .map_err(|e| anyhow::anyhow!("register histogram buckets: {e}"))?
         .install_recorder()
-        .expect("install prometheus recorder");
+        .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     // Emit a static build_info metric so scrapers can see what's running.
     metrics::gauge!("artifacts_build_info", "version" => env!("CARGO_PKG_VERSION"))
         .set(1.0);
-    handle
+    Ok(handle)
 }
 
 /// Axum middleware: per-request timing + status counter.
