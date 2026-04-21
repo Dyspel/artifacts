@@ -2,6 +2,7 @@ mod auth;
 mod commits;
 mod config;
 mod error;
+mod events;
 mod jwt;
 mod merge;
 mod metrics;
@@ -205,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
                 ownership,
                 refs,
                 rate_limit,
+                events: events::EventBus::new(),
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };
 
@@ -221,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/blob", get(reads::get_blob))
                 .route("/v1/repos/:id/diff", get(reads::get_diff))
                 .route("/v1/repos/:id/notes", get(reads::get_note))
+                .route("/v1/events", get(events::sse_stream))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))

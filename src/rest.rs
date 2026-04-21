@@ -39,6 +39,12 @@ pub struct RestState {
     /// bypasses. Enforced per handler by the handler itself so that
     /// expensive vs cheap endpoints draw from separate classes.
     pub rate_limit: Arc<RateLimiter>,
+    /// In-process fan-out for commit / fork / status events. Populated
+    /// by the mutating handlers (commit, merge, fork, create). Consumed
+    /// by the SSE endpoint in events.rs and (through there) by the
+    /// backend BFF's live-stream bridge. Lossy by design — slow
+    /// subscribers get a Lagged error instead of blocking the bus.
+    pub events: crate::events::EventBus,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -103,6 +109,10 @@ pub async fn create_repo(
         .await?;
     let token = state.tokens.mint(&id, Scope::Write, None).await?;
     let remote = remote_url(&state.cfg, &id, &token);
+    // Emit a status transition so subscribers pick up brand-new repos
+    // without polling. "unknown → idle" matches the repo's initial
+    // state in the Fleet UI's RepoStatus enum.
+    state.events.publish(crate::events::Event::status(&id, "unknown", "idle"));
     Ok(Json(RepoHandle { id, remote, token }))
 }
 
@@ -158,6 +168,7 @@ pub async fn fork_repo(
     let scope = if read_only { Scope::Read } else { Scope::Write };
     let token = state.tokens.mint(&fork_id, scope, None).await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
+    state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
 

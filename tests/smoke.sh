@@ -743,6 +743,42 @@ missing_code=$(curl -sS -o /dev/null -w '%{http_code}' \
 [[ "$missing_code" == "404" ]] || { echo "FAIL: missing note expected 404, got $missing_code"; exit 1; }
 echo "    notes → missing note → 404"
 
+# Event bus + SSE: commit via REST and verify a matching `commit` event
+# shows up on the /v1/events stream. Open the SSE connection *before*
+# the mutation so we don't miss the event (it fires synchronously from
+# the handler post-CAS).
+echo "==> [18] event bus — SSE stream delivers commit/fork events"
+sse_log="${WORK_DIR}/sse.log"
+curl -sN "${auth[@]}" "$BASE_URL/v1/events" > "$sse_log" &
+sse_pid=$!
+# Give the subscribe a moment to register.
+sleep 0.5
+
+# Trigger a commit on a fresh repo so only one commit event lands in
+# the window we care about.
+ev_resp=$(curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/repos")
+ev_id=$(echo "$ev_resp" | json id)
+curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"branch":"main","parent":null,"message":"first","changes":[{"op":"write","path":"README.md","content":"hi"}]}' \
+    "$BASE_URL/v1/repos/${ev_id}/commits" > /dev/null
+
+# Fork it too so we pick up a `fork` event.
+curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{}' "$BASE_URL/v1/repos/${ev_id}/forks" > /dev/null
+
+# Give events a moment to propagate to the SSE stream before we tear down.
+sleep 0.5
+kill "$sse_pid" 2>/dev/null || true
+wait "$sse_pid" 2>/dev/null || true
+
+grep -q '"kind":"commit"' "$sse_log" \
+    || { echo "FAIL: no commit event on SSE stream:"; cat "$sse_log"; exit 1; }
+grep -q '"kind":"fork"' "$sse_log" \
+    || { echo "FAIL: no fork event on SSE stream:"; cat "$sse_log"; exit 1; }
+grep -q "\"repoId\":\"$ev_id\"" "$sse_log" \
+    || { echo "FAIL: event missing repoId=$ev_id"; exit 1; }
+echo "    SSE stream delivered commit + fork events for repo $ev_id"
+
 # Admin inspection endpoints. Admin sees every repo; JWT users are 403.
 # The source_id field is populated for forks (from reading the
 # alternates file) and absent for roots.

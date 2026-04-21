@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
+# `sync` brings BroadcastStream — adapter from tokio::sync::broadcast
+# to a Stream usable by axum's Sse response.
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"

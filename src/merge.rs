@@ -177,6 +177,15 @@ pub async fn merge_branches(
         {
             CasOutcome::Updated => {
                 let tree = tree_of(&git_dir, &source_sha).await?;
+                // FF merge is a ref advance — surface as a commit event so
+                // subscribers see the same shape whether we reach main via
+                // POST /commits or POST /merge.
+                state.events.publish(crate::events::Event::commit(
+                    &repo_id,
+                    &source_sha,
+                    &body.target_branch,
+                    format!("merge {} (fast-forward)", body.source_branch),
+                ));
                 return Ok(Json(MergeResult {
                     commit: source_sha.clone(),
                     tree,
@@ -284,6 +293,15 @@ pub async fn merge_branches(
             });
         }
     }
+
+    // Three-way merge commit — emit under the target branch so the event
+    // shape is consistent with a direct commit.
+    state.events.publish(crate::events::Event::commit(
+        &repo_id,
+        &commit_sha,
+        &body.target_branch,
+        format!("merge {} into {}", body.source_branch, body.target_branch),
+    ));
 
     Ok(Json(MergeResult {
         commit: commit_sha,
