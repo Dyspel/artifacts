@@ -445,7 +445,7 @@ fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
 /// Derive the `source_id` (parent repo) by reading `objects/info/alternates`.
 /// Returns `None` if the file doesn't exist (repo is a root, not a fork)
 /// or if its contents don't match our alternates-shape.
-fn read_alternates_source(repos_dir: &std::path::Path, repo_id: &str) -> Option<String> {
+pub(crate) fn read_alternates_source(repos_dir: &std::path::Path, repo_id: &str) -> Option<String> {
     let p = repos_dir.join(format!("{repo_id}.git/objects/info/alternates"));
     let s = std::fs::read_to_string(p).ok()?;
     // Content we wrote is `<repos_dir>/<source_id>.git/objects\n`. Try to

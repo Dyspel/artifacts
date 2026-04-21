@@ -632,6 +632,101 @@ alice_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "
     || { echo "FAIL: admin count ($admin_count) should exceed alice's ($alice_count)"; exit 1; }
 echo "    admin → GET /v1/repos → $admin_count repos (alice sees $alice_count)"
 
+# Read endpoints: per-repo detail + git plumbing (commits, refs, tree,
+# blob, diff, notes). All owner-scoped — admin token is fine here and
+# keeps the setup short. Uses `rest_id` which already has the REST-side
+# commits `c1_sha` → `c2_sha` from section [8].
+echo "==> [17] per-repo read endpoints (GET /v1/repos/:id/{detail,commits,refs,tree,blob,diff,notes})"
+
+# Detail — should echo the owner (null for admin-created), created_at,
+# HEAD sha, and list the main branch ref.
+det="${WORK_DIR}/read_detail.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}" -o "$det"
+det_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' < "$det")
+det_head=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("headSha",""))' < "$det")
+det_ref_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["refs"]))' < "$det")
+[[ "$det_id" == "$rest_id" ]] || { echo "FAIL: detail id mismatch: $det_id vs $rest_id"; exit 1; }
+[[ "$det_head" == "$c2_sha" ]] || { echo "FAIL: detail headSha=$det_head, expected $c2_sha"; exit 1; }
+[[ "$det_ref_count" -ge 1 ]] || { echo "FAIL: detail refs count=$det_ref_count"; exit 1; }
+echo "    detail → id=$det_id head=$det_head refs=$det_ref_count"
+
+# Commits — returns c1 and c2 (orphan + delete+add). Most-recent first.
+commits_body="${WORK_DIR}/read_commits.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/commits" -o "$commits_body"
+commits_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$commits_body")
+first_sha=$(python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["sha"])' < "$commits_body")
+[[ "$commits_count" -ge 2 ]] || { echo "FAIL: commits count=$commits_count, expected ≥ 2"; exit 1; }
+[[ "$first_sha" == "$c2_sha" ]] || { echo "FAIL: newest commit sha=$first_sha, expected $c2_sha"; exit 1; }
+# Parents field is a list — c2 has c1 as parent; c1 has no parents (orphan).
+c2_parents=$(python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)[0]["parents"]))' < "$commits_body")
+[[ "$c2_parents" == "$c1_sha" ]] || { echo "FAIL: c2 parents=$c2_parents, expected $c1_sha"; exit 1; }
+echo "    commits → $commits_count entries, newest=$first_sha, parent chain intact"
+
+# Refs — contains refs/heads/main.
+refs_body="${WORK_DIR}/read_refs.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/refs" -o "$refs_body"
+main_sha=$(python3 -c 'import json,sys; refs=json.load(sys.stdin); print(next(r["sha"] for r in refs if r["name"]=="refs/heads/main"))' < "$refs_body")
+[[ "$main_sha" == "$c2_sha" ]] || { echo "FAIL: refs main=$main_sha, expected $c2_sha"; exit 1; }
+echo "    refs → refs/heads/main → $main_sha"
+
+# Tree — c2 has README.md + src/ + src/b.txt, src/a.txt deleted.
+tree_body="${WORK_DIR}/read_tree.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/tree" -o "$tree_body"
+tree_has_readme=$(python3 -c 'import json,sys; print(int(any(e["path"]=="README.md" and e["type"]=="file" for e in json.load(sys.stdin))))' < "$tree_body")
+tree_has_src_b=$(python3 -c 'import json,sys; print(int(any(e["path"]=="src/b.txt" and e["type"]=="file" for e in json.load(sys.stdin))))' < "$tree_body")
+tree_has_src_a=$(python3 -c 'import json,sys; print(int(any(e["path"]=="src/a.txt" for e in json.load(sys.stdin))))' < "$tree_body")
+tree_has_src_dir=$(python3 -c 'import json,sys; print(int(any(e["path"]=="src" and e["type"]=="dir" for e in json.load(sys.stdin))))' < "$tree_body")
+[[ "$tree_has_readme" == "1" ]] || { echo "FAIL: tree missing README.md"; cat "$tree_body"; exit 1; }
+[[ "$tree_has_src_b" == "1" ]] || { echo "FAIL: tree missing src/b.txt"; exit 1; }
+[[ "$tree_has_src_dir" == "1" ]] || { echo "FAIL: tree missing src/ directory entry"; exit 1; }
+[[ "$tree_has_src_a" == "0" ]] || { echo "FAIL: tree should not have src/a.txt (deleted in c2)"; exit 1; }
+echo "    tree → README.md + src/ + src/b.txt present, src/a.txt absent"
+
+# Blob — raw bytes of README.md at HEAD.
+blob_body="${WORK_DIR}/read_blob.txt"
+blob_code=$(curl -sS -o "$blob_body" -w '%{http_code}' \
+    "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/blob?path=README.md")
+[[ "$blob_code" == "200" ]] || { echo "FAIL: blob expected 200, got $blob_code"; exit 1; }
+grep -q "rest-initial" "$blob_body" \
+    || { echo "FAIL: blob content unexpected:"; cat "$blob_body"; exit 1; }
+echo "    blob → README.md → $(wc -c < "$blob_body") bytes"
+
+# Diff — c2 deletes src/a.txt and adds src/b.txt. Expect two files in
+# the response with the right statuses.
+diff_body="${WORK_DIR}/read_diff.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/diff?commit=${c2_sha}" -o "$diff_body"
+diff_file_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$diff_body")
+diff_has_delete=$(python3 -c 'import json,sys; print(int(any(f["status"]=="deleted" for f in json.load(sys.stdin))))' < "$diff_body")
+diff_has_add=$(python3 -c 'import json,sys; print(int(any(f["status"]=="added" for f in json.load(sys.stdin))))' < "$diff_body")
+[[ "$diff_file_count" -ge 2 ]] || { echo "FAIL: diff had $diff_file_count files, expected ≥ 2"; exit 1; }
+[[ "$diff_has_delete" == "1" ]] || { echo "FAIL: diff missing deleted file"; cat "$diff_body"; exit 1; }
+[[ "$diff_has_add" == "1" ]] || { echo "FAIL: diff missing added file"; exit 1; }
+echo "    diff → $diff_file_count files, add + delete statuses parsed"
+
+# Notes — create one via git CLI against a clone, then fetch via REST.
+# Exercises the `refs/notes/agent` path cc-wasm uses in production.
+note_clone="${WORK_DIR}/note_setup"
+rm -rf "$note_clone"
+GIT_TERMINAL_PROMPT=0 git clone --quiet "$rest_remote" "$note_clone"
+git -C "$note_clone" notes --ref=refs/notes/agent add \
+    -m '{"version":1,"sessionId":"smoke","model":"test","turns":[]}' "${c2_sha}"
+GIT_TERMINAL_PROMPT=0 git -C "$note_clone" push --quiet "$rest_remote" refs/notes/agent
+
+note_body="${WORK_DIR}/read_note.json"
+note_code=$(curl -sS -o "$note_body" -w '%{http_code}' \
+    "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/notes?ref=refs/notes/agent&commit=${c2_sha}")
+[[ "$note_code" == "200" ]] || { echo "FAIL: note fetch expected 200, got $note_code"; cat "$note_body"; exit 1; }
+note_text=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["text"])' < "$note_body")
+echo "$note_text" | grep -q '"sessionId":"smoke"' \
+    || { echo "FAIL: note text missing sessionId field; got: $note_text"; exit 1; }
+echo "    notes → refs/notes/agent payload round-trips"
+
+# Missing note → 404. A commit with no note on the requested ref.
+missing_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}/notes?ref=refs/notes/agent&commit=${c1_sha}")
+[[ "$missing_code" == "404" ]] || { echo "FAIL: missing note expected 404, got $missing_code"; exit 1; }
+echo "    notes → missing note → 404"
+
 # Admin inspection endpoints. Admin sees every repo; JWT users are 403.
 # The source_id field is populated for forks (from reading the
 # alternates file) and absent for roots.

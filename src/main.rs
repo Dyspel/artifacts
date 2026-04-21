@@ -7,6 +7,7 @@ mod merge;
 mod metrics;
 mod ownership;
 mod rate_limit;
+mod reads;
 mod refs;
 mod request_id;
 mod rest;
@@ -196,11 +197,16 @@ async fn main() -> anyhow::Result<()> {
             let rest_router = Router::new()
                 .route("/v1/health", get(rest::health))
                 .route("/v1/repos", post(rest::create_repo).get(rest::list_repos))
-                .route("/v1/repos/:id", delete(rest::delete_repo))
+                .route("/v1/repos/:id", delete(rest::delete_repo).get(reads::get_repo))
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
-                .route("/v1/repos/:id/commits", post(commits::create_commit))
+                .route("/v1/repos/:id/commits", post(commits::create_commit).get(reads::list_commits))
                 .route("/v1/repos/:id/merge", post(merge::merge_branches))
+                .route("/v1/repos/:id/refs", get(reads::list_refs))
+                .route("/v1/repos/:id/tree", get(reads::get_tree))
+                .route("/v1/repos/:id/blob", get(reads::get_blob))
+                .route("/v1/repos/:id/diff", get(reads::get_diff))
+                .route("/v1/repos/:id/notes", get(reads::get_note))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))
