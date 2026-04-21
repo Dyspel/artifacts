@@ -51,7 +51,7 @@ gui = ["dep:eframe", "dep:egui_plot", "dep:ureq"]
 
 [[bin]]
 name = "artifacts-gui"
-path = "src/bin/artifacts-gui.rs"
+path = "src/bin/artifacts-gui/main.rs"
 required-features = ["gui"]
 
 [dev-dependencies]
