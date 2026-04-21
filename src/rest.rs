@@ -400,8 +400,9 @@ pub async fn admin_get_repo(
         crate::rate_limit::Class::Default,
     )?;
 
-    let owner_row = state.ownership.get_owner(&id).await?;
-    let Some(owner) = owner_row else {
+    // One PK lookup — gives us both the owner and the created_at
+    // without scanning the whole repos table.
+    let Some(row) = state.ownership.get_row(&id).await? else {
         return Err(Error::RepoNotFound(id));
     };
 
@@ -415,24 +416,13 @@ pub async fn admin_get_repo(
 
     let refs = list_refs(&repo_path).unwrap_or_default();
     let size_bytes = dir_size(&repo_path).unwrap_or(0);
-    // created_at isn't on owner_row alone — go through list_all for now.
-    // A dedicated `get_row(id)` on the trait would be cleaner; this stays
-    // cheap because list_all is just a SELECT.
-    let created_at = state
-        .ownership
-        .list_all()
-        .await?
-        .into_iter()
-        .find(|r| r.id == id)
-        .map(|r| r.created_at)
-        .unwrap_or(0);
 
     Ok(Json(AdminRepoDetail {
         summary: AdminRepoSummary {
             source_id: read_alternates_source(&repos_dir, &id),
             id,
-            owner,
-            created_at,
+            owner: row.owner,
+            created_at: row.created_at,
         },
         size_bytes,
         refs,

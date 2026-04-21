@@ -76,6 +76,12 @@ pub trait OwnershipStore: Send + Sync {
     /// fleet. Order is `created_at DESC`. Uses the `idx_repos_owner`
     /// index so this stays cheap as the table grows.
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>>;
+
+    /// Fetch one row by id. Used by the admin-detail endpoint, which
+    /// needs `created_at` alongside the ownership check. A dedicated
+    /// PK-lookup is O(1); previously this was a `list_all().find(...)`
+    /// scan over the whole table.
+    async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>>;
 }
 
 /// One row of the `repos` table. `owner` is `None` for admin-created
@@ -201,6 +207,22 @@ impl OwnershipStore for SqliteOwnershipStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_subject, created_at FROM repos WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![repo_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(RepoRow {
+            id: row.get(0)?,
+            owner: row.get(1)?,
+            created_at: row.get(2)?,
+        }))
     }
 }
 
@@ -423,6 +445,31 @@ mod tests {
             r,
             Err(Error::QuotaExceeded { ref subject, limit: 3 }) if subject == "alice"
         ));
+    }
+
+    #[tokio::test]
+    async fn get_row_returns_none_for_unknown_repo() {
+        let (_d, store) = fresh_store();
+        assert!(store.get_row("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_row_returns_owner_and_created_at() {
+        let (_d, store) = fresh_store();
+        store.record_owner("r1", Some("alice")).await.unwrap();
+        let row = store.get_row("r1").await.unwrap().expect("row present");
+        assert_eq!(row.id, "r1");
+        assert_eq!(row.owner.as_deref(), Some("alice"));
+        assert!(row.created_at > 0);
+    }
+
+    #[tokio::test]
+    async fn get_row_distinguishes_admin_owned_from_missing() {
+        let (_d, store) = fresh_store();
+        store.record_owner("admin-repo", None).await.unwrap();
+        let row = store.get_row("admin-repo").await.unwrap().expect("row");
+        assert!(row.owner.is_none());
+        assert!(store.get_row("ghost").await.unwrap().is_none());
     }
 
     #[tokio::test]
