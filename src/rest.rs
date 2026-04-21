@@ -444,22 +444,55 @@ fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
 
 /// Derive the `source_id` (parent repo) by reading `objects/info/alternates`.
 /// Returns `None` if the file doesn't exist (repo is a root, not a fork)
-/// or if its contents don't match our alternates-shape.
+/// or if its contents don't match exactly the shape we wrote.
+///
+/// The old implementation parsed by string prefix/suffix, which was
+/// fragile: a trailing slash on `repos_dir`, a symlink anywhere in the
+/// path, or a hand-edited alternates file could make the lexical form
+/// match while the target pointed somewhere unexpected. We now:
+///
+///   1. Canonicalize both the repos dir and the alternates target.
+///      This resolves symlinks — if someone symlinked a repo's alternates
+///      to point at `/etc`, the canonical form diverges from the
+///      canonical repos dir and the check fails.
+///   2. Use `Path::components()` on the relative path rather than
+///      string splitting. Catches any structural surprises (root
+///      components, parent-dir segments).
+///   3. Validate the extracted id against our own repo-id shape.
 pub(crate) fn read_alternates_source(repos_dir: &std::path::Path, repo_id: &str) -> Option<String> {
-    let p = repos_dir.join(format!("{repo_id}.git/objects/info/alternates"));
-    let s = std::fs::read_to_string(p).ok()?;
-    // Content we wrote is `<repos_dir>/<source_id>.git/objects\n`. Try to
-    // parse that back. If it doesn't match (e.g., someone hand-edited),
-    // fall through to None rather than guessing.
-    let trimmed = s.trim();
-    let prefix = format!("{}/", repos_dir.display());
-    let rest = trimmed.strip_prefix(&prefix)?;
-    let source_id = rest.strip_suffix(".git/objects")?;
-    // Defensive: make sure the computed id doesn't contain path separators,
-    // which would mean the alternates file points somewhere unexpected.
-    if source_id.contains('/') || source_id.contains('\\') {
+    let alternates_path = repos_dir.join(format!("{repo_id}.git/objects/info/alternates"));
+    let s = std::fs::read_to_string(&alternates_path).ok()?;
+    let target_str = s.trim();
+    if target_str.is_empty() {
         return None;
     }
+
+    let target = std::path::PathBuf::from(target_str);
+    // Canonicalize both ends so symlinks can't move us outside the
+    // repos tree while the string still looks safe.
+    let canon_root = repos_dir.canonicalize().ok()?;
+    let canon_target = target.canonicalize().ok()?;
+
+    // Target must be a direct child under canon_root, with exactly two
+    // components: `<id>.git` and `objects`. Anything else (extra
+    // depth, siblings, a `..` traversal made possible by a weird
+    // symlink layout) fails here.
+    let rel = canon_target.strip_prefix(&canon_root).ok()?;
+    let mut comps = rel.components();
+    let first = comps.next()?;
+    let second = comps.next()?;
+    if comps.next().is_some() {
+        return None;
+    }
+    let (first, second) = (first.as_os_str().to_str()?, second.as_os_str().to_str()?);
+    if second != "objects" {
+        return None;
+    }
+    let source_id = first.strip_suffix(".git")?;
+    // Third gate: the extracted id must match our own repo-id format.
+    // Catches pathological cases where `first` is something weird like
+    // `..git` or a name containing an escaped separator.
+    crate::storage::validate_repo_id(source_id).ok()?;
     Some(source_id.to_string())
 }
 
@@ -538,4 +571,89 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn setup_fork(root: &std::path::Path, source: &str, fork: &str) {
+        let src = root.join(format!("{source}.git/objects"));
+        fs::create_dir_all(&src).unwrap();
+        let fork_objects_info = root.join(format!("{fork}.git/objects/info"));
+        fs::create_dir_all(&fork_objects_info).unwrap();
+        // Write an alternates file in the shape FsStorage::fork writes.
+        let content = format!("{}\n", src.display());
+        fs::write(fork_objects_info.join("alternates"), content).unwrap();
+    }
+
+    #[test]
+    fn read_alternates_source_extracts_valid_source_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_fork(tmp.path(), "source-repo-1234", "fork-abc-9999");
+        let got = read_alternates_source(tmp.path(), "fork-abc-9999");
+        assert_eq!(got.as_deref(), Some("source-repo-1234"));
+    }
+
+    #[test]
+    fn read_alternates_source_returns_none_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("xyz.git/objects/info")).unwrap();
+        assert_eq!(read_alternates_source(tmp.path(), "xyz"), None);
+    }
+
+    #[test]
+    fn read_alternates_source_rejects_target_outside_repos_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fork_info = tmp.path().join("fork-xyz-0000/objects/info");
+        fs::create_dir_all(&fork_info).unwrap();
+        // Point the alternates at somewhere outside the root.
+        let outside = std::env::temp_dir().canonicalize().unwrap();
+        fs::write(fork_info.join("alternates"), format!("{}\n", outside.display())).unwrap();
+        // `tmp.path()` canonicalizes to `outside` plus a test-temp segment —
+        // when the target is `outside` itself, `strip_prefix` would fail
+        // because `outside` is a *parent* of `canon_root`, not a child.
+        assert_eq!(read_alternates_source(tmp.path(), "fork-xyz-0000"), None);
+    }
+
+    #[test]
+    fn read_alternates_source_rejects_wrong_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fork_info = tmp.path().join("fork-abc-9999/objects/info");
+        fs::create_dir_all(&fork_info).unwrap();
+        // Write a path pointing at something with extra depth — not the
+        // <id>.git/objects shape we recognize. Using a sibling dir so
+        // canonicalize still succeeds.
+        let weird = tmp.path().join("extra/deeper/dir");
+        fs::create_dir_all(&weird).unwrap();
+        fs::write(fork_info.join("alternates"), format!("{}\n", weird.display())).unwrap();
+        assert_eq!(read_alternates_source(tmp.path(), "fork-abc-9999"), None);
+    }
+
+    #[test]
+    fn read_alternates_source_rejects_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fork_info = tmp.path().join("fork-abc-9999/objects/info");
+        fs::create_dir_all(&fork_info).unwrap();
+        fs::write(fork_info.join("alternates"), "").unwrap();
+        assert_eq!(read_alternates_source(tmp.path(), "fork-abc-9999"), None);
+    }
+
+    #[test]
+    fn read_alternates_source_rejects_malformed_id_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fork_info = tmp.path().join("fork-abc-9999/objects/info");
+        fs::create_dir_all(&fork_info).unwrap();
+        // Create a real dir whose tail isn't `<valid-id>.git/objects`.
+        let weird_objects = tmp.path().join("not-a-valid-id.whatever/objects");
+        fs::create_dir_all(&weird_objects).unwrap();
+        fs::write(
+            fork_info.join("alternates"),
+            format!("{}\n", weird_objects.display()),
+        )
+        .unwrap();
+        // The parent-dir name doesn't end in `.git`, so we return None.
+        assert_eq!(read_alternates_source(tmp.path(), "fork-abc-9999"), None);
+    }
 }

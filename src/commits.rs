@@ -410,18 +410,59 @@ pub(crate) async fn run_git(
     Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
+/// Match `git check-ref-format` semantics for a branch-name segment.
+///
+/// The previous impl was a documented "useful subset" that accepted names
+/// git itself later rejected (trailing `.lock`, components beginning with
+/// `.`, the literal `"@"`, …). Pre-flight validation should either match
+/// git's rules or defer to git; a looser check promises commits that then
+/// 500 at `update-ref` time.
+///
+/// Rules, from git-check-ref-format(1), applied to each `/`-separated
+/// component of `s` since we'll prepend `refs/heads/`:
+///
+///   - no empty component (no `foo//bar`, no leading/trailing `/`)
+///   - no component beginning with `.` or ending with `.lock`
+///   - no `..`, `@{`, backslash, or ASCII control/space anywhere
+///   - no `~ ^ : ? * [` anywhere
+///   - may not end with `.` or `/`
+///   - may not be the single character `@`
 pub(crate) fn valid_branch_name(s: &str) -> bool {
-    // A useful subset of git-check-ref-format. Rejects empty, leading/trailing
-    // slashes, double slashes, ".." and "@{", plus any byte below 0x20.
-    if s.is_empty() || s.starts_with('/') || s.ends_with('/') || s.contains("//") {
+    if s.is_empty()
+        || s == "@"
+        || s.starts_with('/')
+        || s.ends_with('/')
+        || s.ends_with('.')
+        || s.contains("//")
+        || s.contains("..")
+        || s.contains("@{")
+        || s.contains('\\')
+    {
         return false;
     }
-    if s.contains("..") || s.contains("@{") || s.contains('\\') {
+    if s.chars().any(|c| {
+        // Control chars (<0x20), DEL (0x7f), space, and the reserved
+        // set. Everything else is allowed by git's rules.
+        let u = c as u32;
+        u < 0x20 || u == 0x7f || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[')
+    }) {
         return false;
     }
-    s.chars().all(|c| c > ' ' && c != '~' && c != '^' && c != ':' && c != '?' && c != '*' && c != '[')
+    // Per-component rules: no component may start with '.' or end with
+    // '.lock'. Git applies this to every slash-separated piece.
+    for part in s.split('/') {
+        if part.is_empty() || part.starts_with('.') || part.ends_with(".lock") {
+            return false;
+        }
+    }
+    true
 }
 
+/// Validate a path-inside-the-repo as it appears in a commit change-set.
+/// Rejects path-traversal, empty/`.`/`..` components, NUL bytes, embedded
+/// `.git`, and ASCII control characters. The extra `Path::components()`
+/// pass is a belt-and-suspenders check against any future change to the
+/// string-level rules that might accidentally let a traversal through.
 fn valid_path(p: &str) -> bool {
     if p.is_empty() || p.starts_with('/') || p.ends_with('/') || p.contains("//") {
         return false;
@@ -429,7 +470,33 @@ fn valid_path(p: &str) -> bool {
     if p.as_bytes().contains(&0) {
         return false;
     }
-    p.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    // Lexical per-component checks.
+    for part in p.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return false;
+        }
+        // `.git` as a path component would let a commit write into the
+        // bare repo's management directory via the client-side checkout.
+        // Git itself rejects this when writing trees; reject early.
+        if part.eq_ignore_ascii_case(".git") {
+            return false;
+        }
+        if part.chars().any(|c| {
+            let u = c as u32;
+            u < 0x20 || u == 0x7f
+        }) {
+            return false;
+        }
+    }
+    // Defensive: Path::components should never yield anything other than
+    // Normal for a well-formed relative path. A RootDir, CurDir, or
+    // ParentDir component means our string checks missed something.
+    for c in std::path::Path::new(p).components() {
+        if !matches!(c, std::path::Component::Normal(_)) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn validate_sha(s: &str) -> Result<()> {
@@ -459,9 +526,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn branch_name_validation() {
+    fn branch_name_validation_accepts_valid() {
         assert!(valid_branch_name("main"));
         assert!(valid_branch_name("feature/foo-bar"));
+        assert!(valid_branch_name("users/alice/wip"));
+        assert!(valid_branch_name("v1.0"));
+    }
+
+    #[test]
+    fn branch_name_validation_rejects_basic_shape() {
         assert!(!valid_branch_name(""));
         assert!(!valid_branch_name("/main"));
         assert!(!valid_branch_name("main/"));
@@ -472,15 +545,50 @@ mod tests {
     }
 
     #[test]
-    fn path_validation() {
+    fn branch_name_validation_rejects_git_specific_cases() {
+        // Things our old impl missed but git-check-ref-format rejects.
+        assert!(!valid_branch_name("@"), "lone @ is reserved");
+        assert!(!valid_branch_name("trailing."), "trailing dot");
+        assert!(!valid_branch_name("main.lock"), "trailing .lock");
+        assert!(!valid_branch_name(".hidden"), "component starts with dot");
+        assert!(!valid_branch_name("feature/.hidden"), "mid-path dot-prefix");
+        assert!(!valid_branch_name("feature/wip.lock"), "mid-path .lock");
+        assert!(!valid_branch_name("foo@{bar}"), "reserved sequence @{{");
+        assert!(!valid_branch_name("with\ttab"), "control chars rejected");
+    }
+
+    #[test]
+    fn path_validation_accepts_valid() {
         assert!(valid_path("README.md"));
         assert!(valid_path("src/main.rs"));
         assert!(valid_path("a/b/c/d.txt"));
+    }
+
+    #[test]
+    fn path_validation_rejects_basic_shape() {
         assert!(!valid_path(""));
         assert!(!valid_path("/abs/path"));
         assert!(!valid_path("trailing/"));
         assert!(!valid_path("a//b"));
         assert!(!valid_path("a/./b"));
         assert!(!valid_path("a/../b"));
+    }
+
+    #[test]
+    fn path_validation_rejects_dot_git_components() {
+        // Writing into .git from a commit would be a sandbox escape on
+        // the client side when checked out. Git rejects this at tree-
+        // write time; we reject earlier for a cleaner error.
+        assert!(!valid_path(".git"));
+        assert!(!valid_path(".git/config"));
+        assert!(!valid_path("subdir/.git/HEAD"));
+        assert!(!valid_path(".GIT"));  // case-insensitive on git itself
+    }
+
+    #[test]
+    fn path_validation_rejects_control_bytes() {
+        assert!(!valid_path("a\0b"), "NUL");
+        assert!(!valid_path("a\tb"), "tab");
+        assert!(!valid_path("a\nb"), "newline");
     }
 }
