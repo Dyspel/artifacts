@@ -168,6 +168,40 @@ fn poll_detail(url: &str, token: &str, repo_id: &str) -> Result<RepoDetail> {
         .context("parse admin/repos/:id response")
 }
 
+/// Lock the shared state, recovering from poisoning.
+///
+/// A poisoned mutex means *a previous thread panicked while holding it*.
+/// The canonical Rust move is to propagate — `.expect()` — which in
+/// this process means the poller thread crashes, the UI silently stops
+/// getting updates, and the user sees an ever-increasing "polled Ns
+/// ago" forever. That's worse than continuing with potentially torn
+/// state: the state is just `Vec<RepoSummary>` + scalars, no invariant
+/// we can observably violate. So we take the inner and keep going.
+///
+/// If a poisoning ever occurs, log once at ERROR so ops sees it.
+fn lock_state(state: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
+    match state.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!(
+                "state mutex was poisoned by an earlier panic; \
+                 continuing with recovered state"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn lock_selection(m: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!("selection mutex was poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn spawn_poller(
     cli: Cli,
     state: Arc<Mutex<AppState>>,
@@ -178,7 +212,7 @@ fn spawn_poller(
         match poll_once(&cli.url, &cli.admin_token) {
             Ok((repos, metrics)) => {
                 let now = Instant::now();
-                let mut s = state.lock().expect("state mutex poisoned");
+                let mut s = lock_state(&state);
                 s.repos = repos;
                 s.metrics = metrics.clone();
                 s.last_poll = Some(now);
@@ -200,7 +234,7 @@ fn spawn_poller(
                 drop(s);
             }
             Err(e) => {
-                let mut s = state.lock().expect("state mutex poisoned");
+                let mut s = lock_state(&state);
                 s.last_error = Some(format!("{e:#}"));
                 // Keep going to the detail fetch anyway — list and
                 // detail have independent failure modes.
@@ -210,29 +244,26 @@ fn spawn_poller(
 
         // Second leg: if a repo is selected, keep its detail fresh.
         // If the user hasn't selected anything, this is skipped.
-        let requested = selected.lock().ok().and_then(|g| g.clone());
+        let requested = lock_selection(&selected).clone();
         if let Some(id) = requested {
             match poll_detail(&cli.url, &cli.admin_token, &id) {
                 Ok(detail) => {
-                    if let Ok(mut s) = state.lock() {
-                        // Stash the detail only if the selection hasn't
-                        // changed underfoot. Otherwise we'd briefly
-                        // show stale data for the previous selection.
-                        if detail.id == id {
-                            s.detail = Some(detail);
-                        }
+                    let mut s = lock_state(&state);
+                    // Stash the detail only if the selection hasn't
+                    // changed underfoot. Otherwise we'd briefly
+                    // show stale data for the previous selection.
+                    if detail.id == id {
+                        s.detail = Some(detail);
                     }
                 }
                 Err(e) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.last_error = Some(format!("detail {id}: {e:#}"));
-                    }
+                    lock_state(&state).last_error = Some(format!("detail {id}: {e:#}"));
                 }
             }
-        } else if let Ok(mut s) = state.lock() {
+        } else {
             // No selection → drop any stale detail so the Detail tab
             // shows "pick a repo" instead of an old one.
-            s.detail = None;
+            lock_state(&state).detail = None;
         }
 
         std::thread::sleep(interval);
@@ -408,7 +439,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(&self.cli.url);
                 ui.separator();
-                let s = self.state.lock().unwrap();
+                let s = lock_state(&self.state);
                 if let Some(t) = s.last_poll {
                     ui.label(format!(
                         "polled {}s ago · n={}",
@@ -437,7 +468,7 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let snapshot = self.state.lock().unwrap().clone_snapshot();
+            let snapshot = lock_state(&self.state).clone_snapshot();
             match self.view {
                 View::Overview => render_overview(ui, &snapshot),
                 View::Repos => {
