@@ -70,6 +70,12 @@ pub trait OwnershipStore: Send + Sync {
     /// intended for the inspection endpoint and the GUI visualizer.
     /// Order is `created_at DESC` so the newest repos show first.
     async fn list_all(&self) -> Result<Vec<RepoRow>>;
+
+    /// List repos owned by a specific user subject. Admin-owned repos
+    /// (owner_subject = NULL) are excluded; they belong to no user's
+    /// fleet. Order is `created_at DESC`. Uses the `idx_repos_owner`
+    /// index so this stays cheap as the table grows.
+    async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>>;
 }
 
 /// One row of the `repos` table. `owner` is `None` for admin-created
@@ -162,6 +168,28 @@ impl OwnershipStore for SqliteOwnershipStore {
              ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
+            Ok(RepoRow {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_subject, created_at
+             FROM repos
+             WHERE owner_subject = ?1
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![subject], |row| {
             Ok(RepoRow {
                 id: row.get(0)?,
                 owner: row.get(1)?,
@@ -427,5 +455,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "admin-repo");
         assert!(rows[0].owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_by_owner_filters_to_subject() {
+        let (_d, store) = fresh_store();
+        store.record_owner("a1", Some("alice")).await.unwrap();
+        store.record_owner("b1", Some("bob")).await.unwrap();
+        store.record_owner("a2", Some("alice")).await.unwrap();
+        store.record_owner("admin", None).await.unwrap();
+        let alice = store.list_by_owner("alice").await.unwrap();
+        let ids: Vec<&str> = alice.iter().map(|r| r.id.as_str()).collect();
+        // Alice sees her own repos, nothing else. Admin-owned rows never
+        // show up on a user's list.
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"a1"));
+        assert!(ids.contains(&"a2"));
+        assert!(!ids.contains(&"b1"));
+        assert!(!ids.contains(&"admin"));
+    }
+
+    #[tokio::test]
+    async fn list_by_owner_empty_when_no_rows() {
+        let (_d, store) = fresh_store();
+        assert!(store.list_by_owner("nobody").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_owner_returns_newest_first() {
+        let (_d, store) = fresh_store();
+        store.record_owner("old", Some("alice")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.record_owner("new", Some("alice")).await.unwrap();
+        let rows = store.list_by_owner("alice").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "new");
+        assert_eq!(rows[1].id, "old");
     }
 }

@@ -270,6 +270,50 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// `GET /v1/repos`
+///
+/// User-facing repo listing. Scoped by who's asking:
+///   - `Admin` → every repo the server knows about.
+///   - `User { subject }` → only repos that user owns.
+///
+/// Kept separate from `/v1/admin/repos` (which is Admin-only and serves
+/// the operator-facing GUI) because the auth model differs: this endpoint
+/// exists so a user's Fleet view can list their own repos without the
+/// backend proxying each request with the admin token. Admin callers get
+/// the same response shape as a convenience for tooling.
+///
+/// Response shape intentionally matches `AdminRepoSummary` so clients
+/// that already parse `/v1/admin/repos` don't need a second parser.
+pub async fn list_repos(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AdminRepoSummary>>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
+
+    let rows = match &principal {
+        crate::auth::Principal::Admin => state.ownership.list_all().await?,
+        crate::auth::Principal::User { subject } => {
+            state.ownership.list_by_owner(subject).await?
+        }
+    };
+    let repos_dir = state.cfg.repos_dir();
+    let summaries = rows
+        .into_iter()
+        .map(|r| AdminRepoSummary {
+            source_id: read_alternates_source(&repos_dir, &r.id),
+            id: r.id,
+            owner: r.owner,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(Json(summaries))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Admin read-only inspection surface
 //

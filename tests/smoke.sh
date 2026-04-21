@@ -608,6 +608,33 @@ echo "    ff-only refuses diverged branches with 400"
 # Admin inspection endpoints. Admin sees every repo; JWT users are 403.
 # The source_id field is populated for forks (from reading the
 # alternates file) and absent for roots.
+# User-scoped repo listing. The new GET /v1/repos endpoint scopes by who's
+# asking: admin sees everything, user JWTs see only their own repos.
+echo "==> [16] user-scoped repo listing (GET /v1/repos)"
+# Alice has repos from earlier ownership tests; pull her list via her JWT.
+alice_list="${WORK_DIR}/alice_list.json"
+curl -fsS "${alice_auth[@]}" "$BASE_URL/v1/repos" -o "$alice_list"
+alice_ids=$(python3 -c 'import json,sys; print(" ".join(r["id"] for r in json.load(sys.stdin)))' < "$alice_list")
+# Must contain her repo from step 11 (alice created repo `alice_repo`).
+echo "$alice_ids" | grep -q "$alice_repo" \
+    || { echo "FAIL: alice's list missing $alice_repo; got: $alice_ids"; exit 1; }
+# Must NOT contain bob's repo from step 12 (cross-user isolation).
+echo "$alice_ids" | grep -qv "$bob_repo" \
+    || { echo "FAIL: alice's list leaked bob's repo $bob_repo"; exit 1; }
+echo "    alice → GET /v1/repos → her repos only, bob's absent"
+
+# Admin sees all repos including ones alice doesn't own.
+admin_repos_list="${WORK_DIR}/admin_repos_list.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos" -o "$admin_repos_list"
+admin_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$admin_repos_list")
+alice_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$alice_list")
+[[ "$admin_count" -gt "$alice_count" ]] \
+    || { echo "FAIL: admin count ($admin_count) should exceed alice's ($alice_count)"; exit 1; }
+echo "    admin → GET /v1/repos → $admin_count repos (alice sees $alice_count)"
+
+# Admin inspection endpoints. Admin sees every repo; JWT users are 403.
+# The source_id field is populated for forks (from reading the
+# alternates file) and absent for roots.
 echo "==> [??] admin inspection endpoints"
 admin_list="${WORK_DIR}/admin_list.json"
 curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/repos" -o "$admin_list"
