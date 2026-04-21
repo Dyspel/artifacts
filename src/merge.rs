@@ -202,11 +202,18 @@ pub async fn merge_branches(
         )));
     }
 
-    // 6. Three-way merge — target_sha is Some here (FF would've covered the
-    // None case above). Use `git merge-tree --write-tree` to produce either
-    // a merged tree SHA or a conflict report, without touching any worktree
-    // or index file on disk.
-    let target_sha = target_sha.expect("FF branch covers new-branch case");
+    // 6. Three-way merge. `target_sha` should be `Some` here — if the
+    // branch didn't exist, the fast-forward branch at step 4 would have
+    // handled it and returned early. But that's a non-trivial invariant
+    // across two match arms, and reviewing it is exactly the kind of
+    // logic that breaks silently when someone inserts an extra
+    // conditional above. Fail loudly with a 500 rather than panic if
+    // we ever get here with `None`.
+    let target_sha = target_sha.ok_or_else(|| {
+        Error::Other(anyhow::anyhow!(
+            "merge reached three-way path with no target sha — control flow invariant broken"
+        ))
+    })?;
     let merge_result = run_merge_tree(&git_dir, &target_sha, &source_sha).await?;
     let merged_tree = match merge_result {
         MergeTreeOutcome::Clean { tree } => tree,
