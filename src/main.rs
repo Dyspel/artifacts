@@ -168,7 +168,18 @@ async fn main() -> anyhow::Result<()> {
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
             tracing::info!(path = %token_db_path.display(), "opening metadata db");
-            let tokens: Arc<dyn TokenStore> = Arc::new(SqliteTokenStore::open(&token_db_path)?);
+            let sqlite_tokens = Arc::new(SqliteTokenStore::open(&token_db_path)?);
+            // Periodic prune of revoked + expired rows. Without this the
+            // tokens table grows monotonically: at 10k tokens/day, a year
+            // of operation = 3.6M rows of dead weight. Runs hourly, with
+            // a 24h grace window after expiry so admins can still audit
+            // recently-expired tokens before they're gone.
+            tokens::spawn_prune_task(
+                sqlite_tokens.clone(),
+                Duration::from_secs(3600),
+                Duration::from_secs(86400),
+            );
+            let tokens: Arc<dyn TokenStore> = sqlite_tokens;
             // Reuses the same SQLite file for a separate `repos` table.
             // Separate table and separate connection keeps the concerns
             // cleanly split; WAL-mode lets them coexist without lock

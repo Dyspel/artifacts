@@ -134,6 +134,57 @@ impl SqliteTokenStore {
             conn: Arc::new(TokioMutex::new(conn)),
         })
     }
+
+    /// Delete rows that are guaranteed to never authorize a request again:
+    /// revoked tokens, and tokens whose expiry has passed by more than a
+    /// grace window. Returns the number of rows removed.
+    ///
+    /// Why not "everything expired"? A short grace window means a
+    /// recently-expired token briefly sticks around with a NULL-only
+    /// row; lets admin/audit tooling see "this token existed and was
+    /// valid until T" for a bit before it's hard-deleted. Default 24h
+    /// is well beyond any normal session turnover.
+    ///
+    /// Called on a timer by `spawn_prune_task` at startup. Also safe to
+    /// invoke manually (e.g., from an admin CLI) — just lock + prune.
+    pub async fn prune(&self, expiry_grace: Duration) -> Result<u64> {
+        let now = now_secs() as i64;
+        let expiry_cutoff = now.saturating_sub(expiry_grace.as_secs() as i64);
+        let conn = self.conn.lock().await;
+        // `<=` not `<` mirrors lookup semantics: a row with
+        // `expires_at == now` is already unusable (lookup uses
+        // `expires_at > now`), so it's logically expired and prunable.
+        let affected = conn.execute(
+            "DELETE FROM tokens
+             WHERE revoked_at IS NOT NULL
+                OR (expires_at IS NOT NULL AND expires_at <= ?1)",
+            params![expiry_cutoff],
+        )?;
+        Ok(affected as u64)
+    }
+}
+
+/// Spawn a background task that calls `prune()` every `tick`. Task
+/// lives for the full process lifetime; first prune fires after the
+/// first `tick` (not immediately) so it doesn't contend with startup.
+pub fn spawn_prune_task(
+    store: Arc<SqliteTokenStore>,
+    tick: Duration,
+    expiry_grace: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Skip the first tick so we don't fire immediately on startup.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match store.prune(expiry_grace).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "token prune"),
+                Err(e) => tracing::error!(error = %e, "token prune failed"),
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -299,5 +350,58 @@ mod tests {
         let stored = &rows[0];
         assert_ne!(stored, &t, "raw token must not appear in db");
         assert_eq!(stored, &sha256_hex(&t));
+    }
+
+    fn count_rows(path: &std::path::Path) -> i64 {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_removes_revoked_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.db");
+        let store = SqliteTokenStore::open(&path).unwrap();
+        let t_live = store.mint("live", Scope::Read, None).await.unwrap();
+        let t_dead = store.mint("dead", Scope::Read, None).await.unwrap();
+        store.revoke(&t_dead).await.unwrap();
+        assert_eq!(count_rows(&path), 2);
+
+        // Grace doesn't apply to revokes — revoked rows are always prunable.
+        let pruned = store.prune(Duration::from_secs(86400)).await.unwrap();
+        assert_eq!(pruned, 1);
+        assert_eq!(count_rows(&path), 1);
+        // The live token still resolves.
+        assert!(store.lookup(&t_live).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn prune_honors_expiry_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.db");
+        let store = SqliteTokenStore::open(&path).unwrap();
+        // Ttl=0 → immediately expired (rows' expires_at == created_at).
+        let _t = store.mint("r", Scope::Read, Some(Duration::from_secs(0))).await.unwrap();
+        assert_eq!(count_rows(&path), 1);
+
+        // With a generous grace, the row survives.
+        let pruned = store.prune(Duration::from_secs(86400)).await.unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(count_rows(&path), 1);
+
+        // With zero grace, the expired row is fair game.
+        let pruned = store.prune(Duration::from_secs(0)).await.unwrap();
+        assert_eq!(pruned, 1);
+        assert_eq!(count_rows(&path), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_leaves_live_never_expiring_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.db");
+        let store = SqliteTokenStore::open(&path).unwrap();
+        let _t = store.mint("r", Scope::Read, None).await.unwrap();
+        store.prune(Duration::from_secs(0)).await.unwrap();
+        assert_eq!(count_rows(&path), 1);
     }
 }
