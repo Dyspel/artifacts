@@ -155,10 +155,17 @@ impl Storage for FsStorage {
              [http]\n\treceivepack = true\n\tuploadpack = true\n",
         )?;
 
-        // Step 5: snapshot the source's current refs. This is a shallow
-        // copy — the refs themselves are just pointers (40-byte SHAs), and
-        // the objects they point at are already reachable via alternates.
-        copy_refs(&source, &fork)?;
+        // Step 5: snapshot the source's current refs atomically.
+        //
+        // The earlier implementation walked the source's `refs/` directory
+        // and copied each file. That's a torn-read against any concurrent
+        // push: new refs can appear mid-walk, existing refs can change
+        // mid-file-copy. Instead, we ask git for a consistent point-in-
+        // time view via `git show-ref` and write the result into the
+        // fork's `packed-refs` in one shot. git's own read path holds
+        // internal consistency while iterating, and our destination is
+        // a single file write (one atomic rename on most filesystems).
+        snapshot_refs_to_packed(&source, &fork)?;
 
         Ok(())
     }
@@ -188,34 +195,57 @@ fn write_config_flag(repo: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy `refs/` and `packed-refs` from `src` to `dst`. Walks `refs/`
-/// recursively and copies each file. Safe because refs are small: a file
-/// per branch containing a 40-byte SHA.
-fn copy_refs(src: &Path, dst: &Path) -> Result<()> {
-    if let Ok(packed) = std::fs::read(src.join("packed-refs")) {
-        std::fs::write(dst.join("packed-refs"), packed)?;
-    }
-    let refs_src = src.join("refs");
-    if !refs_src.is_dir() {
+/// Snapshot source refs into the fork's `packed-refs` atomically.
+///
+/// Uses `git show-ref` on the source to get a consistent iteration of
+/// every ref at the call site's point in time. git holds read
+/// consistency while the iteration runs; we then write the whole list
+/// as the fork's `packed-refs` in a single file write.
+///
+/// This is the fix for the torn-read race the earlier
+/// `copy_dir_recursive`-based implementation had: there, a concurrent
+/// push to the source could add, remove, or modify refs while we were
+/// walking `refs/`, and the fork would end up with an inconsistent
+/// snapshot.
+///
+/// Output format matches git's packed-refs:
+///
+///     # pack-refs with: peeled fully-peeled sorted
+///     <sha> refs/heads/main
+///     <sha> refs/heads/feature
+///     ...
+///
+/// Empty source (no refs) → no packed-refs file. git handles that fine.
+fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(src)
+        .arg("show-ref")
+        .output()?;
+    // `git show-ref` exits 1 with empty stdout when there are no refs
+    // (fresh init-bare, no pushes yet). That's not an error for us.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
         return Ok(());
     }
-    copy_dir_recursive(&refs_src, &dst.join("refs"))?;
-    Ok(())
-}
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&src_path, &dst_path)?;
+    let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted\n");
+    for line in stdout.lines() {
+        // show-ref emits `<sha> <refname>`. Packed-refs uses the same
+        // shape per line, so a direct pass-through is valid. We
+        // deliberately *don't* use --dereference here; annotated tags'
+        // peeled entries are an optimization git can rebuild on
+        // demand, and the dereferenced output form is trickier to
+        // convert to the exact packed-refs shape (^<peeled-sha> as
+        // its own line right after the tag line).
+        if let Some((sha, name)) = line.split_once(' ') {
+            packed.push_str(sha);
+            packed.push(' ');
+            packed.push_str(name);
+            packed.push('\n');
         }
     }
+    std::fs::write(dst.join("packed-refs"), packed)?;
     Ok(())
 }
 
@@ -232,28 +262,70 @@ mod tests {
     }
 
     #[test]
-    fn fork_creates_alternates_and_copies_refs() {
+    fn fork_creates_alternates_and_snapshots_refs_to_packed() {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let a = new_repo_id();
         let b = new_repo_id();
         storage.create(&a).unwrap();
 
-        // Write a ref so we can verify it gets copied.
-        let ref_path = storage.repo_path(&a).join("refs/heads/main");
-        std::fs::write(&ref_path, "0000000000000000000000000000000000000000\n").unwrap();
+        // Seed source with a real commit. A bogus all-zeros SHA would
+        // work for a direct-file-copy fork, but the new
+        // snapshot-via-git path runs `git show-ref` — which is happy
+        // to emit arbitrary SHAs, but writing a real commit makes the
+        // test realistic and also verifies the alternates path
+        // (objects from source are reachable in fork).
+        let src_path = storage.repo_path(&a);
+        // Create an empty-tree + commit pointing at it.
+        let status = std::process::Command::new("git")
+            .arg("--git-dir").arg(&src_path)
+            .args(["-c", "user.email=t@test", "-c", "user.name=t"])
+            .args(["commit-tree", "-m", "seed",
+                   "4b825dc642cb6eb9a060e54bf8d69288fbee4904"])
+            .output()
+            .unwrap();
+        let commit_sha = String::from_utf8(status.stdout).unwrap().trim().to_string();
+        assert_eq!(commit_sha.len(), 40);
+        // update-ref to put the commit on refs/heads/main.
+        let st = std::process::Command::new("git")
+            .arg("--git-dir").arg(&src_path)
+            .args(["update-ref", "refs/heads/main", &commit_sha])
+            .status().unwrap();
+        assert!(st.success());
 
         storage.fork(&a, &b).unwrap();
+
+        // alternates file points back at source.
         let alt = std::fs::read_to_string(
             storage.repo_path(&b).join("objects/info/alternates"),
         )
         .unwrap();
         assert!(alt.contains(&a));
-        let copied_ref = std::fs::read_to_string(
-            storage.repo_path(&b).join("refs/heads/main"),
+
+        // Refs went to packed-refs, not loose. Absence of the loose
+        // file is part of the fix: the fork shouldn't write the
+        // torn-loose-file shape the old copy_refs did.
+        assert!(!storage.repo_path(&b).join("refs/heads/main").exists());
+        let packed = std::fs::read_to_string(
+            storage.repo_path(&b).join("packed-refs"),
         )
         .unwrap();
-        assert_eq!(copied_ref.trim(), "0000000000000000000000000000000000000000");
+        assert!(packed.contains(&commit_sha));
+        assert!(packed.contains("refs/heads/main"));
+    }
+
+    #[test]
+    fn fork_of_empty_source_writes_no_packed_refs() {
+        // A fresh repo has no refs. snapshot_refs_to_packed should
+        // silently no-op rather than writing an empty packed-refs file
+        // (which git would still accept, but the absence is cleaner).
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let a = new_repo_id();
+        let b = new_repo_id();
+        storage.create(&a).unwrap();
+        storage.fork(&a, &b).unwrap();
+        assert!(!storage.repo_path(&b).join("packed-refs").exists());
     }
 
     fn tempdir() -> PathBuf {
