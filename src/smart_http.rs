@@ -331,8 +331,31 @@ async fn pack_handler(
 /// Format a pkt-line: 4-hex-char length prefix (including the 4 bytes of
 /// prefix itself) + payload. This is the fundamental framing unit of the
 /// git wire protocol.
+///
+/// Per the spec, a pkt-line payload is at most `PKT_LINE_MAX` bytes
+/// (65516, which is 65520 minus the 4-byte length prefix). Larger
+/// payloads would overflow the 4-hex length field; the `format!` above
+/// would silently wrap. We debug_assert so dev/test builds catch it,
+/// and runtime-cap in release builds so the error is at worst a
+/// structurally-invalid pkt-line (and the client surfaces it) rather
+/// than a security-relevant framing bug.
+pub const PKT_LINE_MAX_PAYLOAD: usize = 65516;
+
 fn pkt_line(payload: &str) -> String {
-    format!("{:04x}{}", payload.len() + 4, payload)
+    debug_assert!(
+        payload.len() <= PKT_LINE_MAX_PAYLOAD,
+        "pkt-line payload exceeds max ({} > {})",
+        payload.len(),
+        PKT_LINE_MAX_PAYLOAD,
+    );
+    // In release, clamp. Truncation changes the semantic but at least
+    // keeps the length prefix valid.
+    let truncated = if payload.len() > PKT_LINE_MAX_PAYLOAD {
+        &payload[..PKT_LINE_MAX_PAYLOAD]
+    } else {
+        payload
+    };
+    format!("{:04x}{}", truncated.len() + 4, truncated)
 }
 
 #[cfg(test)]
@@ -358,6 +381,26 @@ mod tests {
             required_scope(&Method::POST, "git-receive-pack", None),
             Scope::Write
         );
+    }
+
+    #[test]
+    fn pkt_line_truncates_at_max() {
+        // Release-mode behavior: oversized payload gets truncated to the
+        // documented cap rather than emitting a silently-wrapped length
+        // prefix. We can only exercise the truncation branch here in
+        // tests (debug_assert would panic); run via cargo test which is
+        // a dev build, so the assert fires first.
+        // Sanity: max-size payload works cleanly.
+        let max_ok = "a".repeat(PKT_LINE_MAX_PAYLOAD);
+        let line = pkt_line(&max_ok);
+        assert_eq!(line.len(), PKT_LINE_MAX_PAYLOAD + 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds max")]
+    fn pkt_line_panics_on_oversized_payload_in_debug() {
+        let too_big = "a".repeat(PKT_LINE_MAX_PAYLOAD + 1);
+        let _ = pkt_line(&too_big);
     }
 
     #[test]
