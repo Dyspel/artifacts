@@ -1,3 +1,4 @@
+mod alternates_cache;
 mod auth;
 mod commits;
 mod config;
@@ -207,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 refs,
                 rate_limit,
                 events: events::EventBus::new(),
+                alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
             };
             let git_state = GitState { cfg: cfg.clone(), tokens };
 

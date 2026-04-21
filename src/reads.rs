@@ -110,13 +110,16 @@ pub async fn get_repo(
     let refs = list_refs_native(&git_dir).await?;
     let size_bytes = dir_size(&git_dir).unwrap_or(0);
     let head_sha = resolve_ref_sha(&git_dir, "HEAD").await.ok().flatten();
-    let source_id = crate::rest::read_alternates_source(
+    let source_id = state
+        .alternates_cache
+        .lookup(&state.cfg.repos_dir(), &repo_id);
+    let commit_count = count_commits_from_head(&git_dir).await.unwrap_or(0);
+    let fork_count = count_forks_of(
         &state.cfg.repos_dir(),
         &repo_id,
-    );
-    let commit_count = count_commits_from_head(&git_dir).await.unwrap_or(0);
-    let fork_count =
-        count_forks_of(&state.cfg.repos_dir(), &repo_id).unwrap_or(0);
+        &state.alternates_cache,
+    )
+    .unwrap_or(0);
     Ok(Json(RepoDetail {
         id: row.id,
         owner: row.owner,
@@ -816,7 +819,15 @@ async fn count_commits_from_head(git_dir: &Path) -> Result<u64> {
 /// target. Cheap for small repo counts (O(repos) filesystem reads, each
 /// a ~32-byte alternates file); if we grow past thousands of repos per
 /// host we'd want this indexed by the OwnershipStore instead.
-fn count_forks_of(repos_dir: &Path, repo_id: &str) -> std::io::Result<u64> {
+///
+/// Uses the alternates cache so that repeat calls (e.g. the Detail tab
+/// polled by the GUI) only pay the full resolve cost on files that
+/// actually changed since the last call.
+fn count_forks_of(
+    repos_dir: &Path,
+    repo_id: &str,
+    cache: &crate::alternates_cache::AlternatesCache,
+) -> std::io::Result<u64> {
     let mut n = 0u64;
     for entry in std::fs::read_dir(repos_dir)? {
         let entry = entry?;
@@ -832,7 +843,7 @@ fn count_forks_of(repos_dir: &Path, repo_id: &str) -> std::io::Result<u64> {
         if sibling_id == repo_id {
             continue;
         }
-        if let Some(parent) = crate::rest::read_alternates_source(repos_dir, sibling_id) {
+        if let Some(parent) = cache.lookup(repos_dir, sibling_id) {
             if parent == repo_id {
                 n += 1;
             }
