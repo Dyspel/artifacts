@@ -84,6 +84,17 @@ pub struct RepoDetail {
     /// without a second ref lookup.
     #[serde(rename = "headSha", skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
+    /// Total commits reachable from HEAD. `0` when the repo has no HEAD
+    /// yet (freshly created, never pushed). Cheap: `rev-list --count`
+    /// walks the graph once and reports an integer.
+    #[serde(rename = "commitCount")]
+    pub commit_count: u64,
+    /// Number of other repos that fork *this* one. Derived by scanning
+    /// sibling repos for an `objects/info/alternates` pointing back — so
+    /// the cost is O(repos in namespace). Acceptable on a single-repo
+    /// detail endpoint; we don't attempt this for the list view.
+    #[serde(rename = "forkCount")]
+    pub fork_count: u64,
 }
 
 /// GET /v1/repos/:id — full repo detail for an owner or admin.
@@ -103,6 +114,9 @@ pub async fn get_repo(
         &state.cfg.repos_dir(),
         &repo_id,
     );
+    let commit_count = count_commits_from_head(&git_dir).await.unwrap_or(0);
+    let fork_count =
+        count_forks_of(&state.cfg.repos_dir(), &repo_id).unwrap_or(0);
     Ok(Json(RepoDetail {
         id: row.id,
         owner: row.owner,
@@ -111,6 +125,8 @@ pub async fn get_repo(
         refs,
         size_bytes,
         head_sha,
+        commit_count,
+        fork_count,
     }))
 }
 
@@ -773,4 +789,54 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+/// `git rev-list --count HEAD` — returns the total number of commits
+/// reachable from HEAD. Empty repos (no HEAD) return 0 cleanly instead
+/// of an error; a repo with orphan branches but no HEAD is rare enough
+/// that we don't count those.
+async fn count_commits_from_head(git_dir: &Path) -> Result<u64> {
+    let (rc, stdout, _stderr) = run_git(
+        git_dir,
+        &["rev-list", "--count", "HEAD"],
+        &[],
+        None,
+    )
+    .await?;
+    if rc != 0 {
+        return Ok(0);
+    }
+    Ok(String::from_utf8(stdout)?
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0))
+}
+
+/// Count how many sibling repos have `this` one as their alternates
+/// target. Cheap for small repo counts (O(repos) filesystem reads, each
+/// a ~32-byte alternates file); if we grow past thousands of repos per
+/// host we'd want this indexed by the OwnershipStore instead.
+fn count_forks_of(repos_dir: &Path, repo_id: &str) -> std::io::Result<u64> {
+    let mut n = 0u64;
+    for entry in std::fs::read_dir(repos_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name_str.ends_with(".git") {
+            continue;
+        }
+        let sibling_id = &name_str[..name_str.len() - 4]; // strip ".git"
+        if sibling_id == repo_id {
+            continue;
+        }
+        if let Some(parent) = crate::rest::read_alternates_source(repos_dir, sibling_id) {
+            if parent == repo_id {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
 }

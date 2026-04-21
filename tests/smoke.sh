@@ -639,16 +639,32 @@ echo "    admin → GET /v1/repos → $admin_count repos (alice sees $alice_coun
 echo "==> [17] per-repo read endpoints (GET /v1/repos/:id/{detail,commits,refs,tree,blob,diff,notes})"
 
 # Detail — should echo the owner (null for admin-created), created_at,
-# HEAD sha, and list the main branch ref.
+# HEAD sha, list the main branch ref, and now report commitCount +
+# forkCount (Phase 3a). `rest_id` has c1 + c2 from section [8], so
+# commitCount must be ≥ 2. No forks of rest_id, so forkCount = 0.
 det="${WORK_DIR}/read_detail.json"
 curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${rest_id}" -o "$det"
 det_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' < "$det")
 det_head=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("headSha",""))' < "$det")
 det_ref_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["refs"]))' < "$det")
+det_commit_count=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["commitCount"])' < "$det")
+det_fork_count=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["forkCount"])' < "$det")
 [[ "$det_id" == "$rest_id" ]] || { echo "FAIL: detail id mismatch: $det_id vs $rest_id"; exit 1; }
 [[ "$det_head" == "$c2_sha" ]] || { echo "FAIL: detail headSha=$det_head, expected $c2_sha"; exit 1; }
 [[ "$det_ref_count" -ge 1 ]] || { echo "FAIL: detail refs count=$det_ref_count"; exit 1; }
-echo "    detail → id=$det_id head=$det_head refs=$det_ref_count"
+[[ "$det_commit_count" -ge 2 ]] || { echo "FAIL: detail commitCount=$det_commit_count, expected ≥ 2"; exit 1; }
+[[ "$det_fork_count" == "0" ]] || { echo "FAIL: detail forkCount=$det_fork_count, expected 0 (no forks of rest_id)"; exit 1; }
+echo "    detail → id=$det_id head=$det_head refs=$det_ref_count commits=$det_commit_count forks=$det_fork_count"
+
+# Fork-count sanity: repo_id (from section [1]) has a writable fork + a
+# read-only fork from sections [4] and [6]. forkCount should be ≥ 2.
+# Verified only on a root repo so alternates-scanning picks up both.
+root_det="${WORK_DIR}/read_detail_root.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/repos/${repo_id}" -o "$root_det"
+root_fork_count=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["forkCount"])' < "$root_det")
+[[ "$root_fork_count" -ge 2 ]] \
+    || { echo "FAIL: root forkCount=$root_fork_count, expected ≥ 2"; exit 1; }
+echo "    detail on root repo → forkCount=$root_fork_count (two forks from earlier steps)"
 
 # Commits — returns c1 and c2 (orphan + delete+add). Most-recent first.
 commits_body="${WORK_DIR}/read_commits.json"
