@@ -27,7 +27,6 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use dashmap::DashMap;
 use rand::Rng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -92,70 +91,6 @@ pub trait TokenStore: Send + Sync {
     /// Revoke a token. Returns `Ok(true)` if the token existed and wasn't
     /// already revoked, `Ok(false)` otherwise. Idempotent.
     async fn revoke(&self, token: &str) -> Result<bool>;
-}
-
-/// In-memory `TokenStore` for tests. State evaporates on drop.
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryTokenStore {
-    inner: Arc<DashMap<String, InMemoryEntry>>,
-}
-
-#[derive(Debug, Clone)]
-struct InMemoryEntry {
-    record: TokenRecord,
-    revoked: bool,
-}
-
-impl InMemoryTokenStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl TokenStore for InMemoryTokenStore {
-    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
-        let token = random_token();
-        let expires_at = ttl.map(|d| now_secs() + d.as_secs());
-        self.inner.insert(
-            sha256_hex(&token),
-            InMemoryEntry {
-                record: TokenRecord {
-                    repo_id: repo_id.to_string(),
-                    scope,
-                    expires_at,
-                },
-                revoked: false,
-            },
-        );
-        Ok(token)
-    }
-
-    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
-        let Some(entry) = self.inner.get(&sha256_hex(token)) else {
-            return Ok(None);
-        };
-        if entry.revoked {
-            return Ok(None);
-        }
-        if let Some(exp) = entry.record.expires_at {
-            if now_secs() >= exp {
-                return Ok(None);
-            }
-        }
-        Ok(Some(entry.record.clone()))
-    }
-
-    async fn revoke(&self, token: &str) -> Result<bool> {
-        let key = sha256_hex(token);
-        match self.inner.get_mut(&key) {
-            Some(mut entry) if !entry.revoked => {
-                entry.revoked = true;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
 }
 
 /// SQLite-backed `TokenStore`.
