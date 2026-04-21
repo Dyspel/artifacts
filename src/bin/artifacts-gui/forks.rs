@@ -3,11 +3,110 @@
 //!
 //! Layout is a classic tree layout (post-order, leaves get consecutive
 //! x, parents center over children). Pure functions here; the caller
-//! (`main::App`) owns the persistent pan/zoom state.
+//! (`main::App`) owns the persistent pan/zoom state and a layout cache.
+//!
+//! The layout depends only on `(id, source_id)` pairs, which change at
+//! most once per poll (every ~2s). Recomputing every frame means ~60
+//! Hz of tree-walking + HashMap inserts during drag/zoom, which at
+//! 1000+ repos shows up as dropped frames. `ForkLayoutCache` keeps the
+//! last `positions` + ids-set behind an order-invariant fingerprint so
+//! we only rebuild when the repo list actually changes.
 
 use crate::state::{RepoSummary, StateSnapshot};
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+/// Cached, layout-frozen view of the repo list. Owned by `App`,
+/// updated in place at the top of `render_forks`.
+#[derive(Default)]
+pub(crate) struct ForkLayoutCache {
+    /// Order-invariant hash of (id, source_id) pairs. When this matches
+    /// the current snapshot we skip the rebuild.
+    fingerprint: u64,
+    positions: HashMap<String, (f64, f64)>,
+    ids: HashSet<String>,
+    max_x: f64,
+    max_depth: f64,
+}
+
+impl ForkLayoutCache {
+    /// Rebuild the cache from `repos` if the fingerprint changed.
+    /// No-op otherwise — which is the 99% case between polls.
+    fn refresh(&mut self, repos: &[RepoSummary]) {
+        let fp = fingerprint(repos);
+        // The first-frame-with-data case: the default cache has
+        // `fingerprint=0` and an empty `positions`. A real repo list's
+        // fingerprint could collide with zero, so additionally require
+        // that we've populated at least once (or that the input is
+        // itself empty — then no rebuild is needed regardless).
+        let populated = !self.positions.is_empty() || repos.is_empty();
+        if fp == self.fingerprint && populated {
+            return;
+        }
+
+        self.positions.clear();
+        self.ids.clear();
+        self.max_x = 0.0;
+        self.max_depth = 0.0;
+        self.fingerprint = fp;
+
+        if repos.is_empty() {
+            return;
+        }
+
+        for r in repos {
+            self.ids.insert(r.id.clone());
+        }
+
+        let mut children: HashMap<String, Vec<&RepoSummary>> = HashMap::new();
+        let mut roots: Vec<&RepoSummary> = Vec::new();
+        for r in repos {
+            match &r.source_id {
+                Some(parent) if self.ids.contains(parent.as_str()) => {
+                    children.entry(parent.clone()).or_default().push(r);
+                }
+                Some(_) | None => roots.push(r),
+            }
+        }
+        // Stable sort so layout doesn't jitter when the server returns
+        // rows in a different order between polls.
+        for kids in children.values_mut() {
+            kids.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        roots.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut next_x: f64 = 0.0;
+        for root in &roots {
+            layout_subtree(root, &children, 0, &mut next_x, &mut self.positions);
+            next_x += 1.5;
+        }
+        self.max_depth = self
+            .positions
+            .values()
+            .map(|(_, y)| *y)
+            .fold(0.0_f64, f64::max);
+        self.max_x = self
+            .positions
+            .values()
+            .map(|(x, _)| *x)
+            .fold(0.0_f64, f64::max);
+    }
+}
+
+/// Order-invariant hash over `(id, source_id)` pairs. XOR folding so
+/// the same hash comes out no matter which order the server returns
+/// rows. O(n), no allocation.
+fn fingerprint(repos: &[RepoSummary]) -> u64 {
+    let mut fp = repos.len() as u64;
+    for r in repos {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        r.id.hash(&mut h);
+        r.source_id.hash(&mut h);
+        fp ^= h.finish();
+    }
+    fp
+}
 
 /// Graphical fork-network. Returns `Some(id)` if the user clicked a node.
 pub(crate) fn render_forks(
@@ -16,6 +115,7 @@ pub(crate) fn render_forks(
     selected: Option<&str>,
     pan: &mut egui::Vec2,
     zoom: &mut f32,
+    cache: &mut ForkLayoutCache,
 ) -> Option<String> {
     ui.heading("Fork network");
     ui.add_space(4.0);
@@ -32,25 +132,6 @@ pub(crate) fn render_forks(
     });
     ui.add_space(8.0);
 
-    // Build children map + roots + orphans.
-    let ids: std::collections::HashSet<&str> = s.repos.iter().map(|r| r.id.as_str()).collect();
-    let mut children: HashMap<String, Vec<&RepoSummary>> = HashMap::new();
-    let mut roots: Vec<&RepoSummary> = Vec::new();
-    for r in &s.repos {
-        match &r.source_id {
-            Some(parent) if ids.contains(parent.as_str()) => {
-                children.entry(parent.clone()).or_default().push(r);
-            }
-            Some(_) | None => roots.push(r),
-        }
-    }
-    // Stable sort by id so layout doesn't jitter between polls when the
-    // server returns rows in a different order.
-    for kids in children.values_mut() {
-        kids.sort_by(|a, b| a.id.cmp(&b.id));
-    }
-    roots.sort_by(|a, b| a.id.cmp(&b.id));
-
     if s.repos.is_empty() {
         ui.label(
             egui::RichText::new("(no repos yet)")
@@ -60,16 +141,13 @@ pub(crate) fn render_forks(
         return None;
     }
 
-    // Tree layout: post-order traversal assigning integer x to leaves,
-    // averaging child xs for parents.
-    let mut positions: HashMap<String, (f64, f64)> = HashMap::new();
-    let mut next_x: f64 = 0.0;
-    for root in &roots {
-        layout_subtree(root, &children, 0, &mut next_x, &mut positions);
-        next_x += 1.5; // gap between separate root subtrees
-    }
-    let max_depth = positions.values().map(|(_, y)| *y).fold(0.0_f64, f64::max);
-    let max_x = positions.values().map(|(x, _)| *x).fold(0.0_f64, f64::max);
+    // Rebuild only if the repo list actually changed. The cache carries
+    // `positions`, the ids-set (for orphan detection), and max extents.
+    cache.refresh(&s.repos);
+    let positions = &cache.positions;
+    let ids = &cache.ids;
+    let max_x = cache.max_x;
+    let max_depth = cache.max_depth;
 
     // Reserve the rest of the central panel for the graph canvas.
     let (response, painter) =
@@ -297,6 +375,77 @@ mod tests {
         assert_eq!(positions["c2"], (1.0, 1.0));
         assert_eq!(positions["c3"], (2.0, 1.0));
         assert_eq!(positions["r"], (1.0, 0.0));
+    }
+
+    #[test]
+    fn fingerprint_is_order_invariant() {
+        let a = sm("a", None);
+        let b = sm("b", Some("a"));
+        let c = sm("c", Some("a"));
+        assert_eq!(
+            fingerprint(&[a.clone(), b.clone(), c.clone()]),
+            fingerprint(&[c, b, a]),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_new_repo_arrives() {
+        let a = sm("a", None);
+        let b = sm("b", Some("a"));
+        let c = sm("c", Some("a"));
+        assert_ne!(
+            fingerprint(&[a.clone(), b.clone()]),
+            fingerprint(&[a, b, c]),
+        );
+    }
+
+    #[test]
+    fn cache_skips_rebuild_when_fingerprint_matches() {
+        let a = sm("a", None);
+        let b = sm("b", Some("a"));
+        let mut cache = ForkLayoutCache::default();
+        let repos = vec![a, b];
+        cache.refresh(&repos);
+        let positions_ptr = cache.positions.values().next().copied();
+        let fp1 = cache.fingerprint;
+
+        // Mutate positions to "stale" values; if refresh no-ops on an
+        // unchanged fingerprint, our mutation survives. If it rebuilds,
+        // it'll be overwritten.
+        for v in cache.positions.values_mut() {
+            *v = (99.0, 99.0);
+        }
+        cache.refresh(&repos);
+        assert_eq!(cache.fingerprint, fp1);
+        assert!(cache.positions.values().all(|v| *v == (99.0, 99.0)));
+        assert!(positions_ptr.is_some());
+    }
+
+    #[test]
+    fn cache_rebuilds_when_repo_added() {
+        let a = sm("a", None);
+        let b = sm("b", Some("a"));
+        let mut cache = ForkLayoutCache::default();
+        cache.refresh(&[a.clone(), b.clone()]);
+        assert_eq!(cache.positions.len(), 2);
+
+        let c = sm("c", Some("a"));
+        cache.refresh(&[a, b, c]);
+        assert_eq!(cache.positions.len(), 3);
+        assert!(cache.ids.contains("c"));
+    }
+
+    #[test]
+    fn cache_populates_ids_and_handles_empty() {
+        let mut cache = ForkLayoutCache::default();
+        cache.refresh(&[]);
+        assert!(cache.positions.is_empty());
+        assert!(cache.ids.is_empty());
+
+        let a = sm("a", None);
+        cache.refresh(&[a]);
+        assert_eq!(cache.positions.len(), 1);
+        assert!(cache.ids.contains("a"));
     }
 
     #[test]
