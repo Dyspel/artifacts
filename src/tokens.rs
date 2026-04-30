@@ -67,6 +67,29 @@ pub struct TokenRecord {
     pub scope: Scope,
     /// Unix epoch seconds. `None` means the token never expires.
     pub expires_at: Option<u64>,
+    /// JWT subject the token was minted for. `None` for tokens
+    /// minted by the admin path (no per-user binding) and for
+    /// rows that predate the M4b subject column. Audit / listing
+    /// surfaces this so users can see "who minted what".
+    pub subject: Option<String>,
+}
+
+/// One row of the listing surface. Public so REST handlers can return
+/// it as JSON without re-shaping. The token itself is NEVER in this
+/// shape — listing returns the row's metadata, never the raw secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenSummary {
+    /// Stable per-row id (the SHA-256 hex of the token, truncated to
+    /// 16 chars for compactness in CLI output). Same value for the
+    /// same token across calls. Lets a caller cross-reference
+    /// `revoke` operations without ever holding the raw token.
+    pub id: String,
+    pub repo_id: String,
+    pub scope: Scope,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    pub subject: Option<String>,
 }
 
 /// The token-store contract.
@@ -79,9 +102,17 @@ pub struct TokenRecord {
 #[async_trait]
 pub trait TokenStore: Send + Sync {
     /// Mint a new token authorizing `scope` on `repo_id`, optionally
-    /// expiring after `ttl`. Returns the raw token (clients get this once
-    /// and only once — the store holds only the hash).
-    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String>;
+    /// expiring after `ttl`, optionally bound to `subject` (a JWT
+    /// principal — `None` when the admin path mints). Returns the
+    /// raw token (clients get this once and only once — the store
+    /// holds only the hash).
+    async fn mint(
+        &self,
+        repo_id: &str,
+        scope: Scope,
+        ttl: Option<Duration>,
+        subject: Option<&str>,
+    ) -> Result<String>;
 
     /// Resolve a token. `Ok(None)` means unknown, revoked, or expired —
     /// no distinction is made, since from the caller's perspective all
@@ -104,6 +135,19 @@ pub trait TokenStore: Send + Sync {
     async fn revoke_all_for_repo(&self, _repo_id: &str) -> Result<u64> {
         Err(Error::Other(anyhow::anyhow!(
             "TokenStore::revoke_all_for_repo not implemented"
+        )))
+    }
+
+    /// List token rows for a repo. Optionally scope to one subject
+    /// (None = all subjects, including admin-minted rows). Excludes
+    /// revoked + expired rows. Default impl errors.
+    async fn list_for_repo(
+        &self,
+        _repo_id: &str,
+        _subject_filter: Option<&str>,
+    ) -> Result<Vec<TokenSummary>> {
+        Err(Error::Other(anyhow::anyhow!(
+            "TokenStore::list_for_repo not implemented"
         )))
     }
 }
@@ -145,6 +189,19 @@ impl SqliteTokenStore {
              );
              CREATE INDEX IF NOT EXISTS idx_tokens_repo_id ON tokens(repo_id);",
         )?;
+        // M4b-account migration: add `subject` column if absent. Idempotent
+        // because we swallow the duplicate-column error from sqlite. We
+        // can't `CREATE TABLE IF NOT EXISTS` with the new column because
+        // existing databases may have the old shape; ALTER is the
+        // forward-only path that works for both new and legacy DBs.
+        match conn.execute("ALTER TABLE tokens ADD COLUMN subject TEXT", []) {
+            Ok(_) => {
+                tracing::info!("token store migrated: added `subject` column");
+            }
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(Error::from(e)),
+        }
         Ok(Self {
             conn: Arc::new(TokioMutex::new(conn)),
         })
@@ -204,16 +261,22 @@ pub fn spawn_prune_task(
 
 #[async_trait]
 impl TokenStore for SqliteTokenStore {
-    async fn mint(&self, repo_id: &str, scope: Scope, ttl: Option<Duration>) -> Result<String> {
+    async fn mint(
+        &self,
+        repo_id: &str,
+        scope: Scope,
+        ttl: Option<Duration>,
+        subject: Option<&str>,
+    ) -> Result<String> {
         let token = random_token();
         let hash = sha256_hex(&token);
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![hash, repo_id, scope.as_str(), now, expires_at],
+            "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at, subject)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![hash, repo_id, scope.as_str(), now, expires_at, subject],
         )?;
         Ok(token)
     }
@@ -223,7 +286,7 @@ impl TokenStore for SqliteTokenStore {
         let now = now_secs() as i64;
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare_cached(
-            "SELECT repo_id, scope, expires_at FROM tokens
+            "SELECT repo_id, scope, expires_at, subject FROM tokens
              WHERE token_hash = ?1
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?2)",
@@ -235,10 +298,12 @@ impl TokenStore for SqliteTokenStore {
         let repo_id: String = row.get(0)?;
         let scope: String = row.get(1)?;
         let expires_at: Option<i64> = row.get(2)?;
+        let subject: Option<String> = row.get(3)?;
         Ok(Some(TokenRecord {
             repo_id,
             scope: Scope::parse(&scope)?,
             expires_at: expires_at.map(|v| v as u64),
+            subject,
         }))
     }
 
@@ -269,6 +334,51 @@ impl TokenStore for SqliteTokenStore {
             params![now, repo_id],
         )?;
         Ok(affected as u64)
+    }
+
+    async fn list_for_repo(
+        &self,
+        repo_id: &str,
+        subject_filter: Option<&str>,
+    ) -> Result<Vec<TokenSummary>> {
+        let now = now_secs() as i64;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject
+             FROM tokens
+             WHERE repo_id = ?1
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?2)
+               AND (?3 IS NULL OR subject = ?3)
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![repo_id, now, subject_filter],
+            |row| {
+                let token_hash: String = row.get(0)?;
+                let repo_id: String = row.get(1)?;
+                let scope: String = row.get(2)?;
+                let created_at: i64 = row.get(3)?;
+                let expires_at: Option<i64> = row.get(4)?;
+                let revoked_at: Option<i64> = row.get(5)?;
+                let subject: Option<String> = row.get(6)?;
+                Ok((token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject))
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (hash, repo_id, scope_s, created, expires, revoked, subject) = row?;
+            out.push(TokenSummary {
+                id: hash.chars().take(16).collect(),
+                repo_id,
+                scope: Scope::parse(&scope_s)?,
+                created_at: created as u64,
+                expires_at: expires.map(|v| v as u64),
+                revoked_at: revoked.map(|v| v as u64),
+                subject,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -310,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn mint_then_lookup_roundtrip() {
         let (_d, store) = open_store();
-        let t = store.mint("repo-a", Scope::Write, None).await.unwrap();
+        let t = store.mint("repo-a", Scope::Write, None, None).await.unwrap();
         let rec = store.lookup(&t).await.unwrap().unwrap();
         assert_eq!(rec.repo_id, "repo-a");
         assert_eq!(rec.scope, Scope::Write);
@@ -326,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_makes_lookup_return_none() {
         let (_d, store) = open_store();
-        let t = store.mint("r", Scope::Read, None).await.unwrap();
+        let t = store.mint("r", Scope::Read, None, None).await.unwrap();
         assert!(store.lookup(&t).await.unwrap().is_some());
         assert!(store.revoke(&t).await.unwrap());
         assert!(store.lookup(&t).await.unwrap().is_none());
@@ -339,7 +449,7 @@ mod tests {
         let (_d, store) = open_store();
         // TTL of zero seconds means "expires_at = created_at", and the
         // lookup predicate is `expires_at > now`, so it's immediately dead.
-        let t = store.mint("r", Scope::Read, Some(Duration::from_secs(0))).await.unwrap();
+        let t = store.mint("r", Scope::Read, Some(Duration::from_secs(0)), None).await.unwrap();
         assert!(
             store.lookup(&t).await.unwrap().is_none(),
             "expected TTL=0 token to be unresolvable"
@@ -352,7 +462,7 @@ mod tests {
         let path = dir.path().join("tokens.db");
         let t = {
             let s = SqliteTokenStore::open(&path).unwrap();
-            s.mint("persistent", Scope::Write, None).await.unwrap()
+            s.mint("persistent", Scope::Write, None, None).await.unwrap()
         };
         // Drop the first store, reopen on the same path.
         let s2 = SqliteTokenStore::open(&path).unwrap();
@@ -367,7 +477,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let t = store.mint("r", Scope::Read, None).await.unwrap();
+        let t = store.mint("r", Scope::Read, None, None).await.unwrap();
 
         let conn = Connection::open(&path).unwrap();
         let mut stmt = conn
@@ -394,8 +504,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let t_live = store.mint("live", Scope::Read, None).await.unwrap();
-        let t_dead = store.mint("dead", Scope::Read, None).await.unwrap();
+        let t_live = store.mint("live", Scope::Read, None, None).await.unwrap();
+        let t_dead = store.mint("dead", Scope::Read, None, None).await.unwrap();
         store.revoke(&t_dead).await.unwrap();
         assert_eq!(count_rows(&path), 2);
 
@@ -413,7 +523,7 @@ mod tests {
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
         // Ttl=0 → immediately expired (rows' expires_at == created_at).
-        let _t = store.mint("r", Scope::Read, Some(Duration::from_secs(0))).await.unwrap();
+        let _t = store.mint("r", Scope::Read, Some(Duration::from_secs(0)), None).await.unwrap();
         assert_eq!(count_rows(&path), 1);
 
         // With a generous grace, the row survives.
@@ -428,11 +538,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_records_subject_and_lookup_returns_it() {
+        let (_d, store) = open_store();
+        let t = store
+            .mint("r-acct", Scope::Read, None, Some("alice@example"))
+            .await
+            .unwrap();
+        let rec = store.lookup(&t).await.unwrap().unwrap();
+        assert_eq!(rec.subject.as_deref(), Some("alice@example"));
+    }
+
+    #[tokio::test]
+    async fn list_for_repo_filters_by_subject_when_set() {
+        let (_d, store) = open_store();
+        let _alice = store
+            .mint("r1", Scope::Read, None, Some("alice"))
+            .await
+            .unwrap();
+        let _bob = store
+            .mint("r1", Scope::Read, None, Some("bob"))
+            .await
+            .unwrap();
+        let _admin_minted = store.mint("r1", Scope::Read, None, None).await.unwrap();
+
+        // No filter: every live row.
+        let all = store.list_for_repo("r1", None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Filtered by subject: only that user's rows.
+        let alice_only = store.list_for_repo("r1", Some("alice")).await.unwrap();
+        assert_eq!(alice_only.len(), 1);
+        assert_eq!(alice_only[0].subject.as_deref(), Some("alice"));
+
+        // Subject that never minted anything → empty.
+        let chuck = store.list_for_repo("r1", Some("chuck")).await.unwrap();
+        assert!(chuck.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_for_repo_excludes_revoked_rows() {
+        let (_d, store) = open_store();
+        let t = store
+            .mint("r1", Scope::Read, None, Some("alice"))
+            .await
+            .unwrap();
+        let _ = store
+            .mint("r1", Scope::Read, None, Some("alice"))
+            .await
+            .unwrap();
+        store.revoke(&t).await.unwrap();
+        let live = store.list_for_repo("r1", None).await.unwrap();
+        assert_eq!(live.len(), 1, "revoked row must not be in listing");
+    }
+
+    #[tokio::test]
+    async fn list_for_repo_returns_token_id_not_raw() {
+        // Belt-and-suspenders: the listing must never carry the raw
+        // token. The id field should be the SHA-256 hex prefix, not
+        // the URL-safe base64 token bytes.
+        let (_d, store) = open_store();
+        let t = store
+            .mint("r1", Scope::Read, None, Some("alice"))
+            .await
+            .unwrap();
+        let listed = store.list_for_repo("r1", None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let id = &listed[0].id;
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(id.as_str(), &t[..16.min(t.len())]);
+    }
+
+    #[tokio::test]
+    async fn open_migrates_legacy_db_without_subject_column() {
+        // Simulate a database written by a pre-M4b-account version:
+        // create the schema by hand without the `subject` column,
+        // insert a row, then open() should ALTER it in place and
+        // mint() / lookup() should work afterward.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tokens (
+                 token_hash TEXT PRIMARY KEY,
+                 repo_id    TEXT NOT NULL,
+                 scope      TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 expires_at INTEGER,
+                 revoked_at INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokens(token_hash, repo_id, scope, created_at)
+             VALUES (?1, 'r1', 'read', 0)",
+            params!["fakehash"],
+        )
+        .unwrap();
+        drop(conn);
+
+        // open() should add the subject column without complaining.
+        let store = SqliteTokenStore::open(&path).unwrap();
+        // Now mint succeeds with a subject (column is there) and
+        // lookup returns subject=None for the legacy row.
+        let listing = store.list_for_repo("r1", None).await.unwrap();
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].subject.is_none());
+        // Reopening is idempotent — second open mustn't error
+        // because the column already exists.
+        let _ = SqliteTokenStore::open(&path).unwrap();
+    }
+
+    #[tokio::test]
     async fn revoke_all_for_repo_kills_every_live_token_for_that_repo() {
         let (_d, store) = open_store();
-        let t1 = store.mint("r1", Scope::Read, None).await.unwrap();
-        let t2 = store.mint("r1", Scope::Write, None).await.unwrap();
-        let t3 = store.mint("r2", Scope::Read, None).await.unwrap();
+        let t1 = store.mint("r1", Scope::Read, None, None).await.unwrap();
+        let t2 = store.mint("r1", Scope::Write, None, None).await.unwrap();
+        let t3 = store.mint("r2", Scope::Read, None, None).await.unwrap();
 
         // Sanity: all three resolve.
         assert!(store.lookup(&t1).await.unwrap().is_some());
@@ -451,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_all_for_repo_is_idempotent() {
         let (_d, store) = open_store();
-        let _t = store.mint("r1", Scope::Read, None).await.unwrap();
+        let _t = store.mint("r1", Scope::Read, None, None).await.unwrap();
         let first = store.revoke_all_for_repo("r1").await.unwrap();
         let second = store.revoke_all_for_repo("r1").await.unwrap();
         assert_eq!(first, 1);
@@ -465,9 +687,9 @@ mod tests {
         // "explicitly revoked". Verified by checking that prune (with
         // zero grace) sees one expired row before and after the call.
         let (_d, store) = open_store();
-        let _t_live = store.mint("r1", Scope::Read, None).await.unwrap();
+        let _t_live = store.mint("r1", Scope::Read, None, None).await.unwrap();
         let _t_dead = store
-            .mint("r1", Scope::Write, Some(Duration::from_secs(0)))
+            .mint("r1", Scope::Write, Some(Duration::from_secs(0)), None)
             .await
             .unwrap();
         let revoked = store.revoke_all_for_repo("r1").await.unwrap();
@@ -479,7 +701,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let _t = store.mint("r", Scope::Read, None).await.unwrap();
+        let _t = store.mint("r", Scope::Read, None, None).await.unwrap();
         store.prune(Duration::from_secs(0)).await.unwrap();
         assert_eq!(count_rows(&path), 1);
     }

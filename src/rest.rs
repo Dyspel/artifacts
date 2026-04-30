@@ -114,7 +114,10 @@ pub async fn create_repo(
         .ownership
         .record_owner(&id, principal.subject())
         .await?;
-    let token = state.tokens.mint(&id, Scope::Write, None).await?;
+    let token = state
+        .tokens
+        .mint(&id, Scope::Write, None, principal.subject())
+        .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     // Emit a status transition so subscribers pick up brand-new repos
     // without polling. "unknown → idle" matches the repo's initial
@@ -173,7 +176,10 @@ pub async fn fork_repo(
         .record_owner(&fork_id, principal.subject())
         .await?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
-    let token = state.tokens.mint(&fork_id, scope, None).await?;
+    let token = state
+        .tokens
+        .mint(&fork_id, scope, None, principal.subject())
+        .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
     state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
@@ -214,7 +220,10 @@ pub async fn mint_token(
     }
     enforce_owner(&*state.ownership, &principal, &id).await?;
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state.tokens.mint(&id, body.scope, ttl).await?;
+    let token = state
+        .tokens
+        .mint(&id, body.scope, ttl, principal.subject())
+        .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     let expires_at = ttl.map(|d| {
         std::time::SystemTime::now()
@@ -380,6 +389,37 @@ pub async fn delete_webhook(
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
+/// GET /v1/repos/:id/tokens
+///
+/// Lists every live token bound to the repo. Admin sees all; a repo
+/// owner sees their own (filtered by JWT subject). Returns
+/// `TokenSummary` rows — never the raw token. The id field is the
+/// SHA-256 hex of the token, truncated to 16 chars: stable, useful
+/// for cross-referencing with `revoke`, but not enough to use as
+/// auth.
+pub async fn list_tokens(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::tokens::TokenSummary>>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    if !state.storage.exists(&id) {
+        return Err(Error::RepoNotFound(id));
+    }
+    enforce_owner(&*state.ownership, &principal, &id).await?;
+    let subject_filter = match &principal {
+        // Admins see every row; users see rows they minted.
+        crate::auth::Principal::Admin => None,
+        crate::auth::Principal::User { subject } => Some(subject.as_str()),
+    };
+    let rows = state.tokens.list_for_repo(&id, subject_filter).await?;
+    Ok(Json(rows))
+}
+
 /// POST /v1/repos/:id/tokens/rotate
 ///
 /// Atomic-ish "kill-everything-and-re-mint" for a repo's tokens.
@@ -415,7 +455,10 @@ pub async fn rotate_tokens(
     let revoked = state.tokens.revoke_all_for_repo(&id).await?;
     let scope = body.scope.unwrap_or(Scope::Write);
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state.tokens.mint(&id, scope, ttl).await?;
+    let token = state
+        .tokens
+        .mint(&id, scope, ttl, principal.subject())
+        .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     Ok(Json(RotateTokenResponse {
         revoked,
