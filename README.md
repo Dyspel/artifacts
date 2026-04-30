@@ -90,12 +90,13 @@ end-to-end in a day, not a quarter.
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Native v2 `command=ls-refs` + `command=fetch` (pack generation)  | 🟡 M1b-next |
-| Native `git-receive-pack` equivalent (pack parsing + ref CAS)    | 🟡 M1b-next |
-| Chunked-KV / object-store `Storage` impl (trait exists but impl needs native protocol) | 🟡 M2b |
-| Multi-node distributed `RefStore` impl (trait exists; impl needs consensus layer)      | 🟡 M3b |
-| Per-token self-revocation, key rotation, account-level auth      | 🟡 M4b |
-| LFS, replication, PITR, webhooks, metrics                        | 🟡 M6  |
+| Native pack indexing via gix-pack (replaces `git unpack-objects` on push) | 🟡 M1b-3-gix |
+| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait scaffolded | 🟡 M2b |
+| Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
+| Per-token self-revocation, bulk rotate     | ✅ M4b |
+| Account-level credentials + token listing  | 🟡 M4b-next |
+| Webhooks (HMAC-signed) + Prometheus metrics | ✅ M6 |
+| LFS, replication, PITR | 🟡 M6-other |
 
 ## What's next
 
@@ -104,38 +105,37 @@ process that parsed CGI env vars and re-spawned `git upload-pack` or
 `git receive-pack` internally. We now spawn the pack handlers directly,
 which cut clone-latency p99 by ~27% and max by ~63%.
 
-**Native v2 `info/refs` is in (M1b step 1).** Modern git clients default
-to v2, and the v2 capability advertisement is static text — no refs
-appear in the discovery response, clients fetch them via a subsequent
-`command=ls-refs` POST. We now build that advertisement in-process
-instead of forking to `git upload-pack --advertise-refs`. Modest perf
-win (info/refs is the cheap half of the roundtrip), but structurally
-important: we have a working native-protocol path that handles *part*
-of a real git operation.
-
-**The upload-pack / receive-pack POST still shells out.** That's where
-most of the remaining subprocess cost lives — walking the commit DAG,
-building the pack, parsing the incoming pack. Going native here is
-genuinely multi-session work.
+**The full v2 native protocol layer is in (M1b-1 / M1b-2 / M1b-3).**
+`info/refs`, `command=ls-refs`, `command=fetch`, and `git-receive-pack`
+are all served from in-process Rust — pkt-line + sideband framing,
+ref enumeration off disk, ref CAS via the `RefStore` trait. The fetch
+path's pack generation is fully native via `gix-pack` (M1b-2c). The
+push path's pack indexing still calls `git unpack-objects --stdin` as
+the sole remaining subprocess on the protocol hot path; that swap is
+the next-logical commit (M1b-3-gix).
 
 Remaining, in order:
 
-1. **M1b-next — native v2 `command=ls-refs` + `command=fetch`.** The
-   hard part of the fetch path. `ls-refs` is short (format refs in
-   v2 syntax); `fetch` is the real work: want/have negotiation, DAG
-   traversal, pack generation. This is where `gix-pack` /
-   `gix-traverse` earn their keep.
-2. **M1b-next — native `git-receive-pack`.** Parse incoming pack
-   (via `gix-pack`), write objects, CAS ref update through the
-   existing `RefStore` trait.
-3. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
-   Blocked on M1b completion (chunked store is only useful with
-   native pack streaming).
-4. **M3b — distributed `RefStore` impl.** Per-repo state machine
-   for multi-node CAS.
-5. **M4b — per-token self-revoke, account-level credentials, key
-   rotation.** Extensions on top of the SQLite-backed token store.
-6. **M6** — replication, snapshots, PITR, LFS, webhooks, metrics.
+1. **M1b-3-gix — native pack indexing via `gix-pack`.** The leaf
+   subprocess on the push path. Same architectural shape as
+   M1b-2c (which swapped `git pack-objects` for native gix-pack
+   on the fetch side); the receive side gets the same treatment.
+2. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
+   `ObjectStore` trait scaffolded; full chunked-KV
+   `Storage` lifecycle waits on M1b-3-gix so no production
+   subprocess assumes a `<repo>/objects/` directory exists on disk.
+3. **M3b — distributed `RefStore` impl.** `MemRefStore` + concurrent
+   CAS conformance test landed; consensus log (openraft) + per-repo
+   state machine + leader election + snapshot install remain.
+4. **M4b-next — account-level credentials.** Token-subject column
+   on the SQLite store + per-repo `GET /v1/repos/:id/tokens`
+   listing. Self-revoke and bulk rotate already shipped.
+5. **M6-deliver — durable webhook subscriptions + retries.**
+   In-memory `MemRegistry` + best-effort delivery is in;
+   SQLite-backed registry + retry-with-backoff + per-delivery
+   metrics are the next slice.
+6. **M6-other — LFS, replication, PITR.** Each is genuinely
+   multi-week.
 
 ## Numbers we just measured
 
@@ -617,12 +617,17 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M4a** | ✅ done | `TokenStore` trait + SQLite-backed persistent store with TTL, revocation, hash-at-rest; `POST /v1/tokens/revoke` endpoint | in-memory token map |
 | **M1a** | ✅ done | `git http-backend` CGI removed — direct `git upload-pack`/`git receive-pack` shell-outs. Clone p99 −27%, max −63%. | CGI wrapper + extra fork |
 | **M1b-1** | ✅ done | Native v2 `info/refs` advertisement — discovery endpoint no longer spawns a subprocess when the client uses protocol v2 (almost all modern clients). | upload-pack `--advertise-refs` fork |
-| **M1b-2** | 🟡 next | Native v2 `command=fetch` + `command=ls-refs` on POST; pack generation via gitoxide | upload-pack fetch fork |
-| **M1b-3** | 🟡 next | Native receive-pack: parse incoming pack, CAS ref via `RefStore` | receive-pack fork |
-| **M2b** | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. Blocked on M1b. | bare repos on disk |
-| **M3b** | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO) | single-node CAS |
-| **M4b** | 🟡 | per-token self-revoke, account-level auth, key rotation | admin-only token management |
-| **M6**  | 🟡 | replication, snapshots, PITR, LFS, webhooks, metrics | — |
+| **M1b-2a** | ✅ done | Native v2 `command=ls-refs` POST — refs read directly off disk (packed-refs + loose) by `RefStore::list`/`read_head`. No upload-pack subprocess on the discovery half. | upload-pack ls-refs fork |
+| **M1b-2b** | ✅ done | Native v2 `command=fetch` POST — protocol layer + sideband-1 framing in-process; pack generation via `git pack-objects --stdout`. | upload-pack fetch fork |
+| **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
+| **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`; `git unpack-objects --stdin` writes loose objects from the incoming pack. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
+| **M1b-3-gix** | 🟡 next | Replace `git unpack-objects` with `gix-pack`'s native pack indexing — same architectural seam as M1b-2c. | unpack-objects subprocess |
+| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait scaffolded; full impl unblocked once M1b-3-gix ships and the unpack-objects subprocess is gone. | bare repos on disk |
+| **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
+| **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
+| **M6 — webhooks** | ✅ done | Outbound HTTP webhook delivery with HMAC-SHA256 signing. In-memory `MemRegistry`; SQLite-backed registry + delivery retries are the remaining slice. | — |
+| **M6 — metrics**  | ✅ done | Prometheus `/metrics` with per-route counters + latency histograms + rate-limit / quota counters. | — |
+| **M6 — other**    | 🟡 | LFS, replication, PITR — genuinely multi-week each. | — |
 
 Each milestone is designed to land without breaking the API surface at the
 edge. A caller written against M0 should keep working against M6 with no
