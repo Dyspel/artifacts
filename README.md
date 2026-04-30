@@ -105,14 +105,18 @@ process that parsed CGI env vars and re-spawned `git upload-pack` or
 `git receive-pack` internally. We now spawn the pack handlers directly,
 which cut clone-latency p99 by ~27% and max by ~63%.
 
-**The full v2 native protocol layer is in and subprocess-free
-(M1b-1 / M1b-2 / M1b-3).** Every endpoint under `/git/:id.git/*` —
-`info/refs`, `command=ls-refs`, `command=fetch`, and
-`git-receive-pack` — is served from in-process Rust. Both pack
-operations (generation on fetch, indexing on push) go through
-`gix-pack` instead of `git pack-objects` / `git unpack-objects`
-subprocesses. p50 clone latency is 10.2 ms vs 13.0 ms after M1b-1
-(see the table above).
+**The full v2 native protocol layer is in (M1b-1 / M1b-2 / M1b-3).**
+Every endpoint under `/git/:id.git/*` — `info/refs`,
+`command=ls-refs`, `command=fetch`, and `git-receive-pack` — is
+served from in-process Rust: pkt-line parsing, sideband framing,
+ref CAS through `RefStore`. Pack generation on the fetch side
+goes through `gix-pack` natively (M1b-2c) — p50 clone latency
+is 10.4 ms vs 13.0 ms after M1b-1. Pack indexing on the push side
+defaults to `git unpack-objects` after a bench showed `gix-pack`
+is currently ~4× slower for typical small pushes; the native
+indexer (M1b-3-gix) is opt-in via `ARTIFACTS_NATIVE_INDEX_PACK=1`
+so a future chunked-KV `Storage` impl has a working native path
+when subprocess isn't an option.
 
 Remaining, in order:
 
@@ -156,22 +160,43 @@ the source.
 
 ### Clone latency (sequential clones of a 28 KB seed repo)
 
-Measured via `scripts/bench_clone.sh`:
+Measured via `scripts/bench_clone.sh` (200 iterations, release build):
 
-|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) | M1b-2c+3-gix (full native via gix-pack) |
-| ------ | -------: | -----------: | ----------------------------: | --------------------------------------: |
-| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       | 10.2 ms                                 |
-| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       | 11.4 ms                                 |
-| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       | 12.6 ms                                 |
-| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       | 17.5 ms                                 |
+|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) | M1b-2c (+ gix-pack on fetch) |
+| ------ | -------: | -----------: | ----------------------------: | ---------------------------: |
+| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       | 10.4 ms                      |
+| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       | 12.3 ms                      |
+| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       | 12.8 ms                      |
+| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       | 13.2 ms                      |
 
 M1a killed the CGI wrapper — that's where the big tail-latency win
 lives (p99 −27%, max −63%). M1b-1 went native on the discovery
 response; a small p50 nudge because that endpoint was the cheaper
-of the two git subprocesses. M1b-2c (gix-pack on the fetch side)
-+ M1b-3-gix (gix-pack on the push side) replaced the last two
-subprocesses on the protocol hot path: p50 −22%, p95 −24%, p99 −22%
-versus M1b-1, with no behavior change observable to clients.
+of the two git subprocesses. M1b-2c swapped `git pack-objects` for
+`gix-pack`: another p50 −22% on the fetch hot path.
+
+### Push latency (sequential pushes of a small commit)
+
+Measured via `scripts/bench_push.sh` (200 iterations, release
+build, A/B'd against the legacy paths via `ARTIFACTS_DISABLE_NATIVE`):
+
+|        | All-subprocess (legacy) | Native protocol + subprocess pack-indexing (current default) |
+| ------ | ----------------------: | -----------------------------------------------------------: |
+| p50    | 14.7 ms                 | 12.1 ms                                                      |
+| p95    | 16.3 ms                 | 13.3 ms                                                      |
+| p99    | 18.2 ms                 | 14.1 ms                                                      |
+| max    | 18.4 ms                 | 16.3 ms                                                      |
+
+The push path's protocol layer (M1b-3) is fully native — pkt-line
+parsing, sideband framing, ref CAS through `RefStore`, native
+deletes. The pack-indexing leaf (M1b-3-gix) is available natively
+via `gix-pack`, but the bench shows `gix-pack`'s
+`Bundle::write_to_directory` is ~4× slower than `git unpack-objects`
+on typical small pushes (gix has substantial per-call setup; the
+crossover is well past anything an interactive push generates). So
+the default is the subprocess for now, with the native indexer
+available behind `ARTIFACTS_NATIVE_INDEX_PACK=1` for backends that
+genuinely can't shell out (a future chunked-KV `Storage` impl).
 
 ## Quickstart
 
@@ -622,7 +647,7 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M1b-2b** | ✅ done | Native v2 `command=fetch` POST — protocol layer + sideband-1 framing in-process; pack generation via `git pack-objects --stdout`. | upload-pack fetch fork |
 | **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
 | **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
-| **M1b-3-gix** | ✅ done | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Writes pack-`<hash>`.pack + .idx into `objects/pack/`; thin-pack deltas resolved against the existing odb. The protocol layer is now subprocess-free end to end. | unpack-objects subprocess |
+| **M1b-3-gix** | 🟡 opt-in | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Available behind `ARTIFACTS_NATIVE_INDEX_PACK=1`; the bench (see Push latency above) showed `gix-pack` is ~4× slower than `git unpack-objects` on typical small pushes, so the default is the subprocess until the crossover improves upstream. The dispatch + helper are wired so a future chunked-KV `Storage` impl (which can't shell out) gets a working native path on day one. | n/a (default subprocess) |
 | **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait scaffolded; full impl unblocked once M1b-3-gix ships and the unpack-objects subprocess is gone. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
