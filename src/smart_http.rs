@@ -889,12 +889,35 @@ async fn native_receive_pack_response(
 ) -> Result<Response<Body>> {
     // Unpack first. If it fails, every ref-update reports "ng <ref>
     // unpacker error" — that's git's real receive-pack behavior too.
+    //
+    // M1b-3-gix: prefer the native gix-pack indexer over the
+    // `git unpack-objects --stdin` subprocess. gix's
+    // `Bundle::write_to_directory` writes pack-<hash>.pack +
+    // pack-<hash>.idx into <repo>/objects/pack/ in one call,
+    // resolving thin-pack deltas against existing objects via the
+    // odb handle. Falls back to the subprocess if that errors —
+    // we'd rather a working push via unpack-objects than a 500.
     let unpack_outcome: std::result::Result<(), String> = if req.pack.is_empty() {
         Ok(())
     } else {
-        unpack_objects_via_subprocess(repo_path, &req.pack)
-            .await
-            .map_err(|e| format!("{e}"))
+        let repo_path_buf = repo_path.to_path_buf();
+        let pack = req.pack.clone();
+        let native = tokio::task::spawn_blocking(move || {
+            crate::native_pack::index_pack_into_repo(&repo_path_buf, &pack)
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("native index join: {e}")));
+        match native {
+            Ok(Ok(())) => Ok(()),
+            other => {
+                if let Ok(Err(e)) = &other {
+                    tracing::warn!(error = %e, "native pack index failed; falling back to unpack-objects");
+                }
+                unpack_objects_via_subprocess(repo_path, &req.pack)
+                    .await
+                    .map_err(|e| format!("{e}"))
+            }
+        }
     };
 
     let mut report = Vec::with_capacity(64 * (req.updates.len() + 1));

@@ -36,6 +36,66 @@ use gix_pack::data::output;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+/// Index a pack from `pack_bytes` into `<repo>/objects/pack/`. Used
+/// by native receive-pack (M1b-3-gix) to replace the
+/// `git unpack-objects --stdin` subprocess: instead of unpacking
+/// loose, we write the pack file + index next to it. Git reads
+/// packed and loose equivalently, so this is observably the same
+/// outcome with one fewer subprocess on the push hot path.
+///
+/// We pass the repo's existing `objects` handle as the
+/// `thin_pack_base_object_lookup` so deltas referring to objects
+/// already in the repo (the "thin pack" case — what clients
+/// normally send) resolve correctly. Without that, thin pushes
+/// would bail with a missing-base error.
+///
+/// Empty pack: returns `Ok(())` without writing anything. An empty
+/// pack on the push side means a delete-only ref-update, which is
+/// already handled before this function is called; defensive here
+/// so a future caller doesn't accidentally feed us 32 bytes and
+/// get a confusing "wrote a pack with zero objects" file.
+pub fn index_pack_into_repo(
+    repo_path: &Path,
+    pack_bytes: &[u8],
+) -> Result<()> {
+    if pack_bytes.len() <= 32 {
+        return Ok(());
+    }
+    let pack_dir = repo_path.join("objects/pack");
+    std::fs::create_dir_all(&pack_dir)?;
+
+    let repo = gix::open(repo_path)
+        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open({}): {e}", repo_path.display())))?;
+
+    let mut buf = std::io::Cursor::new(pack_bytes);
+    let mut progress = prodash::progress::Discard;
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+
+    // Pass the repo's odb handle as the thin-pack base resolver.
+    // gix's odb handle implements gix_object::Find, which is what
+    // the bundle writer expects for resolving deltas against
+    // already-existing objects.
+    let outcome = gix_pack::Bundle::write_to_directory(
+        &mut buf,
+        Some(&pack_dir),
+        &mut progress,
+        &interrupt,
+        Some(repo.objects.clone()),
+        gix_pack::bundle::write::Options {
+            thread_limit: Some(1),
+            iteration_mode: gix_pack::data::input::Mode::Verify,
+            index_version: gix_pack::index::Version::default(),
+            object_hash: gix_hash::Kind::Sha1,
+        },
+    )
+    .map_err(|e| Error::Other(anyhow::anyhow!("Bundle::write_to_directory: {e}")))?;
+    tracing::debug!(
+        objects = outcome.index.num_objects,
+        "indexed pack via gix-pack"
+    );
+    Ok(())
+}
+
 /// Build a packfile containing every object reachable from `wants`
 /// but not from `haves`, suitable for the v2 fetch response.
 pub fn generate_pack(
