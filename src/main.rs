@@ -304,6 +304,10 @@ async fn main() -> anyhow::Result<()> {
                     "/v1/admin/repos/:id/gc-preview",
                     get(rest::admin_gc_preview),
                 )
+                .route(
+                    "/v1/admin/repos/:id/gc",
+                    post(rest::admin_gc_run),
+                )
                 .with_state(rest_state)
                 // Metrics middleware only wraps the REST surface (not
                 // /git, which streams large bodies where per-request

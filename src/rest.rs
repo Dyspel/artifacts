@@ -812,6 +812,46 @@ pub async fn admin_gc_preview(
     Ok(Json(preview))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct GcRunQuery {
+    /// Minimum age (in seconds) of a loose object before gc will
+    /// delete it. Defaults to 7200 (2 hours) — conservative, mirrors
+    /// `git gc`'s spirit of refusing to prune objects that might
+    /// belong to an in-flight write. Pass `min_age_secs=0` to
+    /// disable the guard (useful in tests / one-shot cleanups
+    /// where you know nothing is in flight).
+    #[serde(rename = "minAgeSecs")]
+    pub min_age_secs: Option<u64>,
+}
+
+/// POST /v1/admin/repos/:id/gc
+///
+/// Run a real GC pass on the repo. Returns the same shape as
+/// preview plus actual deletion counts. Admin-only.
+pub async fn admin_gc_run(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<GcRunQuery>,
+    headers: HeaderMap,
+) -> Result<Json<crate::gc::GcResult>> {
+    require_admin(&state, &headers)?;
+    state.rate_limit.check(
+        &crate::auth::Principal::Admin,
+        crate::rate_limit::Class::Default,
+    )?;
+    if !state.storage.exists(&id) {
+        return Err(Error::RepoNotFound(id));
+    }
+    let result = crate::gc::run(
+        &state.cfg.repos_dir(),
+        &id,
+        &state.alternates_cache,
+        q.min_age_secs.unwrap_or(7200),
+    )?;
+    Ok(Json(result))
+}
+
 fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
     let principal = authorize_rest(
         headers,

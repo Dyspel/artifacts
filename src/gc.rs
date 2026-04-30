@@ -85,6 +85,33 @@ pub struct GcPreview {
 
 const SAMPLE_CAP: usize = 32;
 
+/// Result of an actual GC pass (Phase 2). Same general shape as
+/// `GcPreview` plus the counts of what was actually deleted —
+/// useful when an mtime guard or a race against a concurrent push
+/// prevents the deletion of an object the analyzer flagged.
+#[derive(Debug, serde::Serialize)]
+pub struct GcResult {
+    /// Same fields as the preview, surfacing the analyzer state at
+    /// the moment we ran. Lets the caller verify that the delete
+    /// matched what they'd expect from a prior preview call.
+    #[serde(flatten)]
+    pub preview: GcPreview,
+    /// How many loose objects were actually unlinked. ≤
+    /// `preview.unreachable_loose` because the mtime guard skips
+    /// recently-created candidates (anti-race).
+    pub deleted: u64,
+    /// Total bytes reclaimed by the unlinks above.
+    #[serde(rename = "deletedBytes")]
+    pub deleted_bytes: u64,
+    /// Number of unreachable candidates we skipped because they
+    /// were younger than `min_age_secs`. Surfaces the race-guard's
+    /// effect so an admin can see "you had 76 unreachable but 12
+    /// were too fresh to safely delete; rerun later to clean those
+    /// up."
+    #[serde(rename = "skippedTooYoung")]
+    pub skipped_too_young: u64,
+}
+
 /// Compute the GC preview. Subprocess cost: one `git rev-list` per
 /// repo in the network. For a typical repo with no forks, that's
 /// one subprocess. For a repo with N forks, it's N+1.
@@ -129,6 +156,112 @@ pub fn preview(
         unreachable_bytes,
         sample,
     })
+}
+
+/// Run a real garbage-collection pass on `repo_id`'s loose object
+/// store. Algorithm:
+///
+///   1. Compute reachability via [`preview`] (alternates-aware).
+///   2. For each unreachable candidate, stat the loose-object
+///      file. Skip if its mtime is within `min_age_secs` of now —
+///      this is the anti-race guard. A push that landed objects
+///      seconds ago might be in the middle of writing the ref
+///      that points at them; deleting them would break the
+///      not-yet-committed state. Two hours is the conservative
+///      default (matches `git gc`'s `gc.pruneExpire=2.weeks`
+///      default's spirit at our scale).
+///   3. Unlink each remaining candidate.
+///
+/// Concurrency caveat: between step (1) and step (3) someone could
+/// push to a repo in the network and create a ref pointing at one
+/// of our about-to-delete OIDs. The mtime guard catches the common
+/// case (recently-created objects); a sub-second race against a
+/// commit that arrives between our reachability scan and the
+/// unlink call is theoretically possible but vanishingly unlikely
+/// — push latency dominates by orders of magnitude.
+pub fn run(
+    repos_dir: &Path,
+    repo_id: &str,
+    cache: &AlternatesCache,
+    min_age_secs: u64,
+) -> Result<GcResult> {
+    let preview = preview(repos_dir, repo_id, cache)?;
+    let target_repo = repos_dir.join(format!("{repo_id}.git"));
+    let now = std::time::SystemTime::now();
+    let cutoff = now
+        .checked_sub(std::time::Duration::from_secs(min_age_secs))
+        .unwrap_or(std::time::UNIX_EPOCH);
+
+    // Re-walk loose objects: cheaper than threading the full list
+    // through the preview return (which only carries a sample).
+    // The preview-then-walk pair is each O(N); doing the walk
+    // twice is fine at our repo size.
+    let loose = loose_objects(&target_repo)?;
+
+    // Recompute reachable here so we don't have to plumb it through
+    // GcPreview's public shape (which is intentionally bounded).
+    let mut reachable: HashSet<String> = HashSet::new();
+    for member in &preview.network {
+        for oid in rev_list_objects(repos_dir, member)? {
+            reachable.insert(oid);
+        }
+    }
+
+    let mut deleted = 0u64;
+    let mut deleted_bytes = 0u64;
+    let mut skipped_too_young = 0u64;
+    for (oid, _size) in &loose {
+        if reachable.contains(oid) {
+            continue;
+        }
+        let path = loose_path(&target_repo, oid);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            // Already gone — possibly a concurrent gc or a race.
+            // Either way, nothing to do.
+            Err(_) => continue,
+        };
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if mtime > cutoff {
+            skipped_too_young += 1;
+            tracing::debug!(
+                oid = %oid, age_secs = ?now.duration_since(mtime).map(|d| d.as_secs()),
+                "gc: skipping young loose object"
+            );
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(_) => {
+                deleted += 1;
+                deleted_bytes += meta.len();
+                tracing::debug!(oid = %oid, bytes = meta.len(), "gc: removed");
+            }
+            Err(e) => {
+                // Soft-fail per object — a permission error or
+                // racy unlink shouldn't abort the whole pass.
+                tracing::warn!(oid = %oid, error = %e, "gc: remove failed");
+            }
+        }
+    }
+    tracing::info!(
+        repo = %repo_id, deleted, deleted_bytes,
+        skipped_too_young,
+        "gc: pass complete"
+    );
+    Ok(GcResult {
+        preview,
+        deleted,
+        deleted_bytes,
+        skipped_too_young,
+    })
+}
+
+/// `<git_dir>/objects/<aa>/<bbbb…>` — the canonical loose-object
+/// path, sharded by the first two hex chars. Caller must have
+/// already validated `oid` as 40-char hex.
+fn loose_path(git_dir: &Path, oid: &str) -> std::path::PathBuf {
+    let (a, b) = oid.split_at(2);
+    git_dir.join("objects").join(a).join(b)
 }
 
 /// BFS over the alternates relation to find every repo connected
@@ -396,5 +529,79 @@ mod tests {
 
     fn storage_repos_dir(tmp: &tempfile::TempDir, _storage: &FsStorage) -> std::path::PathBuf {
         tmp.path().join("repos")
+    }
+
+    #[test]
+    fn run_deletes_unreachable_loose_object_when_old_enough() {
+        // Same setup as the dangling-blob preview test, then run gc
+        // with min_age_secs=0 so the mtime guard never fires.
+        let (tmp, storage, repo_id) = seed_repo();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut p = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        p.stdin.as_mut().unwrap().write_all(b"orphan").unwrap();
+        let dangler = String::from_utf8(p.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // The loose file exists.
+        let dpath = loose_path(&git_dir, &dangler);
+        assert!(dpath.exists(), "dangler should be on disk before gc");
+
+        let cache = AlternatesCache::new();
+        let result = run(&repos_dir, &repo_id, &cache, 0).unwrap();
+        assert_eq!(result.deleted, 1, "exactly the dangler");
+        assert!(result.deleted_bytes > 0);
+        assert_eq!(result.skipped_too_young, 0);
+        assert!(!dpath.exists(), "dangler should be gone after gc");
+
+        // A second run is a no-op — already cleaned.
+        let result2 = run(&repos_dir, &repo_id, &cache, 0).unwrap();
+        assert_eq!(result2.deleted, 0);
+        assert_eq!(result2.skipped_too_young, 0);
+    }
+
+    #[test]
+    fn run_skips_too_young_objects_so_anti_race_guard_works() {
+        // Drop a dangling blob *now*, then run gc with a 1-hour
+        // min-age. The blob is seconds old, so the guard should
+        // refuse to delete it.
+        let (tmp, storage, repo_id) = seed_repo();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut p = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        p.stdin.as_mut().unwrap().write_all(b"young-orphan").unwrap();
+        let dangler = String::from_utf8(p.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let cache = AlternatesCache::new();
+        let result = run(&repos_dir, &repo_id, &cache, 3600).unwrap();
+        assert_eq!(result.deleted, 0, "young object should not be deleted");
+        assert_eq!(result.skipped_too_young, 1);
+        // File still on disk.
+        assert!(loose_path(&git_dir, &dangler).exists());
     }
 }
