@@ -75,6 +75,12 @@ pub fn index_pack_into_repo(
     // gix's odb handle implements gix_object::Find, which is what
     // the bundle writer expects for resolving deltas against
     // already-existing objects.
+    //
+    // Performance note: this call has ~50ms of fixed overhead from
+    // tempfile + fsync regardless of pack size — that's why
+    // ARTIFACTS_NATIVE_INDEX_PACK is opt-in (see scripts/bench_push.sh
+    // numbers in the README). Profile run: gix::open ~180us,
+    // Bundle::write_to_directory ~50ms for a 3-object pack.
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut buf,
         Some(&pack_dir),
