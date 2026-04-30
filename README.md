@@ -60,7 +60,8 @@ end-to-end in a day, not a quarter.
 | `POST /v1/repos` — create empty repo, get `{ remote, token }`    | ✅     |
 | `POST /v1/repos/:id/forks` — O(1) fork via `alternates`          | ✅     |
 | `POST /v1/repos/:id/tokens` — mint additional scoped tokens      | ✅     |
-| `DELETE /v1/repos/:id` — delete a repo                           | ✅     |
+| `DELETE /v1/repos/:id` — alternates-aware (refuses if forks live) | ✅     |
+| `DELETE /v1/repos/:id?cascade=true` — delete repo + all dependent forks | ✅     |
 | `git clone https://x:$TOKEN@host/git/:id.git`                    | ✅     |
 | `git push` / `git fetch` / `git pull`                            | ✅     |
 | `git clone` of a fork — objects transparently via `alternates`   | ✅     |
@@ -84,6 +85,7 @@ end-to-end in a day, not a quarter.
 | Prometheus `/metrics` endpoint (request counts, latencies, errors) | ✅   |
 | `X-Request-Id` header roundtrip + structured per-request log     | ✅     |
 | `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
+| `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
@@ -368,13 +370,49 @@ Revocation is idempotent. A second revoke of the same token returns
 ### Delete a repo
 
 ```
-DELETE /v1/repos/:id
+DELETE /v1/repos/:id              # safe default: refuses if forks exist
+DELETE /v1/repos/:id?force=true   # admin override: orphans dependent forks
+DELETE /v1/repos/:id?cascade=true # delete this repo + every transitive fork
+Authorization: Bearer <admin>     # or owner JWT
+```
+
+Response (no flags / `?force=true`): `{"ok":true}`. Response
+(`?cascade=true`): `{"ok":true,"deleted":[<id>, ...]}` — the order is
+deepest-first so no fork is briefly orphaned mid-cascade.
+
+If the repo has live forks (other repos whose `alternates` source is
+this repo), the default `DELETE` returns `409 fork_dependency` with
+the list of dependent IDs in the body so the caller can decide
+whether to delete those first or pass `?force=true` /
+`?cascade=true`. `force` and `cascade` are mutually exclusive
+(asking for both is `400`).
+
+### Garbage-collect unreachable loose objects
+
+```
+GET  /v1/admin/repos/:id/gc-preview                 # read-only analysis
+POST /v1/admin/repos/:id/gc?minAgeSecs=7200         # actually delete
 Authorization: Bearer <admin>
 ```
 
-Response: `{"ok":true}`. In the prototype this is a raw `rm -rf` on the
-repo directory. Production needs soft-delete + alternates-aware GC so you
-can't tombstone a repo that's still the object source for a live fork.
+The preview walks the full alternates network around the repo
+(both ancestors and descendants), unions every reachable OID via
+`git rev-list --objects --all` per member, and diffs against the
+analyzed repo's loose objects on disk. Returns
+`{ network, reachableOids, looseOnDisk, unreachableLoose,
+unreachableBytes, sample }` where `sample` is the first ≤32
+unreachable OIDs.
+
+The run endpoint applies the same analysis, then unlinks each
+candidate older than `minAgeSecs` (default 7200 — 2 hours,
+conservative). The mtime guard is the anti-race: a push that
+landed seconds ago might be in the middle of writing the ref
+that points at the new objects, and deleting them would break
+the in-flight state. Pass `minAgeSecs=0` to disable the guard
+for one-shot cleanups where you know nothing is in flight.
+
+Response shape (run): the GcPreview fields plus
+`{ deleted, deletedBytes, skippedTooYoung }`.
 
 ### Create a commit (no git client required)
 
