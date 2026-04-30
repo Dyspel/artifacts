@@ -290,6 +290,21 @@ async fn pack_handler(
             tracing::debug!(repo = %repo_id, "native v2 ls-refs (no subprocess)");
             return native_ls_refs_response(repo_id, refs, args).await;
         }
+        if let Some(req) = parse_v2_fetch(&body_bytes) {
+            // Validate the request shape is one we natively handle
+            // (clone or basic fetch — no shallow/deepen/filter yet).
+            // Anything we don't fully support falls through to git
+            // upload-pack so behavior is preserved.
+            if req.is_simple() {
+                tracing::debug!(
+                    repo = %repo_id,
+                    wants = req.wants.len(),
+                    haves = req.haves.len(),
+                    "native v2 fetch (no upload-pack)"
+                );
+                return native_v2_fetch_response(repo_path, req).await;
+            }
+        }
     }
 
     let mut cmd = Command::new("git");
@@ -463,6 +478,237 @@ fn is_known_capability(line: &str) -> bool {
     line.starts_with("agent=")
         || line.starts_with("object-format=")
         || line.starts_with("session-id=")
+}
+
+/// Parsed shape of a v2 fetch request body. Mirrors the subset of args
+/// `git` actually emits during clone + non-shallow fetch. Anything
+/// unfamiliar trips `simple = false` and we fall back to upload-pack
+/// rather than guess the right protocol response.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct V2FetchRequest {
+    wants: Vec<String>,
+    haves: Vec<String>,
+    done: bool,
+    /// Set when the client sent any arg we don't fully implement yet
+    /// (shallow, deepen, filter, sideband-all, ...). Used to gate the
+    /// native dispatch — we'd rather defer to `git upload-pack` than
+    /// produce a subtly-wrong response.
+    has_unsupported: bool,
+    /// True if we saw `no-progress`; we suppress sideband band-2 in that
+    /// case. Currently we never emit progress, so this is informational.
+    no_progress: bool,
+}
+
+impl V2FetchRequest {
+    fn is_simple(&self) -> bool {
+        // Native path only handles fetches the client has explicitly
+        // closed with `done` (single-round negotiation, no acks needed)
+        // and without any feature flag we haven't audited.
+        self.done && !self.has_unsupported
+    }
+}
+
+/// Returns `Some(req)` iff `body` is a v2 fetch command. Conservative:
+/// we accept the well-known capabilities and arguments and tag any
+/// unfamiliar one via `has_unsupported`. Multi-command bodies, malformed
+/// pkt-lines, or non-fetch commands return `None`.
+fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
+    let mut iter = PktIter::new(body);
+
+    let first = match iter.next()? {
+        Ok(PktLine::Data(d)) => d,
+        _ => return None,
+    };
+    let first = std::str::from_utf8(first).ok()?.trim_end_matches('\n');
+    if first != "command=fetch" {
+        return None;
+    }
+
+    let mut saw_delim = false;
+    for item in iter.by_ref() {
+        match item.ok()? {
+            PktLine::Delim => {
+                saw_delim = true;
+                break;
+            }
+            PktLine::Flush => {
+                // No args at all is malformed for fetch — reject.
+                return None;
+            }
+            PktLine::Data(d) => {
+                let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
+                if !is_known_capability(s) {
+                    return None;
+                }
+            }
+            PktLine::RespEnd => return None,
+        }
+    }
+    if !saw_delim {
+        return None;
+    }
+
+    let mut req = V2FetchRequest::default();
+    for item in iter.by_ref() {
+        match item.ok()? {
+            PktLine::Flush => return Some(req),
+            PktLine::Data(d) => {
+                let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
+                if let Some(oid) = s.strip_prefix("want ") {
+                    if !is_hex40(oid) {
+                        return None;
+                    }
+                    req.wants.push(oid.to_string());
+                } else if let Some(oid) = s.strip_prefix("have ") {
+                    if !is_hex40(oid) {
+                        return None;
+                    }
+                    req.haves.push(oid.to_string());
+                } else if s == "done" {
+                    req.done = true;
+                } else if s == "no-progress" {
+                    req.no_progress = true;
+                } else if matches!(s, "thin-pack" | "ofs-delta" | "include-tag") {
+                    // Standard caps `git pack-objects --thin
+                    // --delta-base-offset` already produces; nothing
+                    // for us to do beyond knowing the client wants
+                    // them.
+                } else {
+                    // Anything else (shallow, deepen, deepen-since,
+                    // filter, sideband-all, packfile-uris, ...) needs
+                    // protocol work we haven't done. Mark as
+                    // unsupported and let the simple-check fall
+                    // through to upload-pack.
+                    req.has_unsupported = true;
+                }
+            }
+            PktLine::Delim | PktLine::RespEnd => return None,
+        }
+    }
+    None
+}
+
+fn is_hex40(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Native v2 fetch response. Generates a packfile via
+/// `git pack-objects --stdout --revs --thin --delta-base-offset` and
+/// wraps it in the v2 fetch response framing:
+///
+///     PKT-LINE("packfile\n")
+///     *PKT-LINE([0x01]<chunk>)        -- band-1 sideband (pack data)
+///     PKT-LINE flush
+///
+/// Why pack-objects (subprocess) here, when M1b-2b's headline is
+/// "native fetch via gitoxide"? Pragmatic split: this commit lands the
+/// native v2 protocol layer (parsing, sideband framing, pkt-line
+/// response) — that's the structurally important part. Pack generation
+/// is a leaf operation we can swap to gix-pack in M1b-2c without
+/// touching anything else. Replacing `git upload-pack` (which spawns
+/// pack-objects internally anyway) with a direct pack-objects call
+/// already cuts a process layer and gives us a much smaller surface
+/// to migrate.
+async fn native_v2_fetch_response(
+    repo_path: &Path,
+    req: V2FetchRequest,
+) -> Result<Response<Body>> {
+    let pack = generate_pack_via_pack_objects(repo_path, &req.wants, &req.haves).await?;
+
+    let mut body = Vec::with_capacity(pack.len() + 256);
+    pkt::write_data(&mut body, b"packfile\n");
+    // Sideband-1: each pkt-line in the packfile section starts with a
+    // 1-byte band marker (0x01 = pack data). Max payload is 65516
+    // bytes including the band byte, so chunks of 65515 of pack data.
+    const BAND_DATA: u8 = 0x01;
+    const CHUNK: usize = pkt::PKT_LINE_MAX_PAYLOAD - 1;
+    for chunk in pack.chunks(CHUNK) {
+        let mut framed = Vec::with_capacity(chunk.len() + 1);
+        framed.push(BAND_DATA);
+        framed.extend_from_slice(chunk);
+        pkt::write_data(&mut body, &framed);
+    }
+    pkt::write_flush(&mut body);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+}
+
+/// Drive `git pack-objects --stdout --revs --thin --delta-base-offset`
+/// with the given wants (one OID per line) and haves (each prefixed
+/// with `^` to exclude its closure). Returns the raw pack bytes.
+///
+/// Empty wants → empty pack (still a valid 32-byte pack with zero
+/// entries); pack-objects handles that case for free.
+async fn generate_pack_via_pack_objects(
+    repo_path: &Path,
+    wants: &[String],
+    haves: &[String],
+) -> Result<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir").arg(repo_path).args([
+        "pack-objects",
+        "--stdout",
+        "--revs",
+        "--thin",
+        "--delta-base-offset",
+    ]);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+
+    // Write `<want>\n` and `^<have>\n` lines.
+    let mut input = String::with_capacity(42 * (wants.len() + haves.len()));
+    for w in wants {
+        input.push_str(w);
+        input.push('\n');
+    }
+    for h in haves {
+        input.push('^');
+        input.push_str(h);
+        input.push('\n');
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = input.into_bytes();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let status = child.wait().await?;
+    let pack = stdout_task.await.map_err(|e| anyhow::anyhow!(e))?;
+    let err = stderr_task.await.map_err(|e| anyhow::anyhow!(e))?;
+    if !status.success() {
+        tracing::error!(
+            stderr = %String::from_utf8_lossy(&err),
+            "pack-objects failed"
+        );
+        return Err(Error::Other(anyhow::anyhow!(
+            "pack-objects failed: {}",
+            String::from_utf8_lossy(&err).trim()
+        )));
+    }
+    Ok(pack)
 }
 
 /// One row of the ls-refs response: `<oid> <name>[<extra>]\n`. The
@@ -865,6 +1111,193 @@ mod tests {
         assert!(s.contains(&ref_pkt), "missing refs/test/x line in {s:?}");
         // Trailing flush-pkt.
         assert!(s.ends_with("0000"), "missing trailing flush-pkt in {s:?}");
+    }
+
+    fn build_fetch_body(args: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(&mut buf, b"command=fetch\n");
+        crate::pkt_line::write_data(&mut buf, b"agent=git/test\n");
+        crate::pkt_line::write_data(&mut buf, b"object-format=sha1\n");
+        crate::pkt_line::write_delim(&mut buf);
+        for a in args {
+            let mut line = (*a).to_string();
+            line.push('\n');
+            crate::pkt_line::write_data(&mut buf, line.as_bytes());
+        }
+        crate::pkt_line::write_flush(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn parse_v2_fetch_typical_clone() {
+        // Clone of one ref: thin-pack + ofs-delta + one want + done.
+        let body = build_fetch_body(&[
+            "thin-pack",
+            "ofs-delta",
+            "no-progress",
+            "want 0123456789abcdef0123456789abcdef01234567",
+            "done",
+        ]);
+        let req = parse_v2_fetch(&body).expect("should parse");
+        assert!(req.is_simple());
+        assert_eq!(req.wants.len(), 1);
+        assert!(req.haves.is_empty());
+        assert!(req.done);
+        assert!(req.no_progress);
+        assert!(!req.has_unsupported);
+    }
+
+    #[test]
+    fn parse_v2_fetch_with_haves_for_incremental_fetch() {
+        let body = build_fetch_body(&[
+            "thin-pack",
+            "want 0123456789abcdef0123456789abcdef01234567",
+            "have 89abcdef0123456789abcdef0123456789abcdef",
+            "done",
+        ]);
+        let req = parse_v2_fetch(&body).expect("should parse");
+        assert!(req.is_simple());
+        assert_eq!(req.wants.len(), 1);
+        assert_eq!(req.haves.len(), 1);
+    }
+
+    #[test]
+    fn parse_v2_fetch_marks_shallow_unsupported() {
+        // We don't natively handle shallow yet; the request must
+        // fall through to upload-pack so the response is correct.
+        let body = build_fetch_body(&[
+            "thin-pack",
+            "want 0123456789abcdef0123456789abcdef01234567",
+            "shallow 89abcdef0123456789abcdef0123456789abcdef",
+            "done",
+        ]);
+        let req = parse_v2_fetch(&body).expect("should parse");
+        assert!(req.has_unsupported);
+        assert!(!req.is_simple());
+    }
+
+    #[test]
+    fn parse_v2_fetch_rejects_non_hex_want() {
+        let body = build_fetch_body(&["want not-a-sha", "done"]);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_rejects_ls_refs_command() {
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_v2_fetch_response_pack_framing_with_real_repo() {
+        use crate::storage::{new_repo_id, FsStorage, Storage};
+
+        let tmp = std::env::temp_dir().join(format!("nat-fetch-{}", new_repo_id()));
+        let repos_dir = tmp.join("repos");
+        let storage = FsStorage::new(&repos_dir).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+
+        // Create a minimal commit so we have something to pack.
+        // Use git plumbing — same approach as the smoke test, just
+        // inline.
+        use std::process::Command as StdCmd;
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(&git_dir)
+            .args(["config", "user.email", "t@t"])
+            .status()
+            .unwrap();
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(&git_dir)
+            .args(["config", "user.name", "t"])
+            .status()
+            .unwrap();
+        let blob_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"hello\n")
+                    .unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let blob = String::from_utf8(blob_out.stdout).unwrap().trim().to_string();
+        let mktree_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                let line = format!("100644 blob {blob}\thello.txt\n");
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(line.as_bytes())
+                    .unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let tree = String::from_utf8(mktree_out.stdout).unwrap().trim().to_string();
+        let commit_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "initial", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit_out.stdout).unwrap().trim().to_string();
+
+        let req = V2FetchRequest {
+            wants: vec![commit.clone()],
+            haves: Vec::new(),
+            done: true,
+            has_unsupported: false,
+            no_progress: true,
+        };
+        let resp = native_v2_fetch_response(&git_dir, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-result"
+        );
+
+        let body = futures::executor::block_on(axum::body::to_bytes(
+            resp.into_body(),
+            16 * 1024 * 1024,
+        ))
+        .unwrap();
+        // Header pkt-line is "packfile\n" (9 bytes) → "000Dpackfile\n".
+        assert!(body.starts_with(b"000dpackfile\n"));
+        // Trailing flush.
+        assert!(body.ends_with(b"0000"));
+        // Pack must contain the PACK header magic somewhere in the
+        // sideband body (after a 5-byte pkt-line + band-byte prefix).
+        // We don't know the exact offset because it depends on chunk
+        // size; just assert PACK appears as expected.
+        let pack_marker = b"PACK\x00\x00\x00\x02";
+        assert!(
+            body.windows(pack_marker.len()).any(|w| w == pack_marker),
+            "no pack header found in response body"
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,12 @@ subtle = "2"
 jsonwebtoken = "9"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+# gitoxide: native git protocol layer. Default features include sha1 +
+# zlib + parallel pack-cache, which is what we need for M1b-2b/M1b-3.
+# We only depend on the umbrella crate to avoid coupling to the
+# evolving sub-crate version matrix; pulling individual gix-* crates
+# directly tends to break on every release.
+gix = "0.83"
 
 # GUI-only deps; opt-in via `--features gui` so the server binary stays lean.
 eframe = { version = "0.27", optional = true }
