@@ -206,9 +206,9 @@ pub async fn merge_branches(
 
     // 5. Strategy gate: ff-only refuses non-FF merges.
     if body.strategy == Strategy::FfOnly {
-        return Err(Error::BadRequest(format!(
-            "not a fast-forward: target has diverged from source",
-        )));
+        return Err(Error::BadRequest(
+            "not a fast-forward: target has diverged from source".to_string(),
+        ));
     }
 
     // 6. Three-way merge. `target_sha` should be `Some` here — if the

@@ -49,6 +49,12 @@ use std::path::PathBuf;
 /// have a method yet — receive-pack writes go through
 /// `git unpack-objects` (M1b-3 leaf). When that subprocess is
 /// replaced with native code, we'll add `write_loose` here.
+///
+/// Production paths don't route through this yet — the trait + impl
+/// exist as M2b foundation per the README. Annotated `#[allow(dead_code)]`
+/// so the unused warning doesn't drift into a real signal once
+/// real callers land.
+#[allow(dead_code)]
 pub trait ObjectStore: Send + Sync {
     /// Read a loose object by its 40-char hex SHA-1. Returns the raw
     /// loose-object bytes (zlib-deflated header+payload). `Ok(None)`
@@ -61,11 +67,13 @@ pub trait ObjectStore: Send + Sync {
 
 /// Filesystem-backed `ObjectStore`. Reads from
 /// `<root>/<id>.git/objects/<aa>/<bbbb...>`.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct FsObjectStore {
     root: PathBuf,
 }
 
+#[allow(dead_code)]
 impl FsObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }

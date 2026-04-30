@@ -241,6 +241,11 @@ impl RefStore for FsRefStore {
 
 /// In-process `RefStore` impl backed by HashMaps under a Mutex.
 ///
+/// Not wired into production today — held as M3b foundation per
+/// the README. `#[allow(dead_code)]` on the type and its impls
+/// keeps the unused warning off the trait scaffolding so a real
+/// signal (e.g. a dead helper) isn't lost in the noise.
+///
 /// Why this exists (M3b foundation): the production `FsRefStore` shells
 /// out to `git update-ref` for CAS — that's a single-node guarantee that
 /// breaks the moment two `artifacts serve` processes share a repos dir.
@@ -263,10 +268,12 @@ impl RefStore for FsRefStore {
 /// Mutex. That's strict serializability, not just linearizability —
 /// stronger than what `FsRefStore` gives you (which is per-ref flock).
 /// Stronger is fine; tests don't notice.
+#[allow(dead_code)]
 pub struct MemRefStore {
     inner: std::sync::Mutex<MemState>,
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 struct MemState {
     /// `(repo_id, ref_name) -> oid`.
@@ -284,6 +291,7 @@ impl Default for MemRefStore {
     }
 }
 
+#[allow(dead_code)]
 impl MemRefStore {
     pub fn new() -> Self {
         Self {

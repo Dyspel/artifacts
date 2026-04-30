@@ -215,14 +215,11 @@ impl std::error::Error for BoxStdErr {
 /// haves — we return a structurally valid pack so the response
 /// frame stays well-formed.
 fn empty_pack_bytes() -> Vec<u8> {
-    use sha2::Digest as _; // not actually used here, just keeping the trait visible
-    let _ = sha2::Sha256::new();
     let header: [u8; 12] = [
         b'P', b'A', b'C', b'K', // magic
         0, 0, 0, 2, // version 2
         0, 0, 0, 0, // count 0
     ];
-    // git's pack trailer is SHA1, not SHA256.
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     h.update(header);

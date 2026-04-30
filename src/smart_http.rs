@@ -159,10 +159,7 @@ fn wants_v2(headers: &HeaderMap) -> bool {
     headers
         .get("git-protocol")
         .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(|c: char| c == ':' || c == ',')
-                .any(|s| s.trim() == "version=2")
-        })
+        .map(|v| v.split([':', ',']).any(|s| s.trim() == "version=2"))
         .unwrap_or(false)
 }
 
