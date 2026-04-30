@@ -90,12 +90,12 @@ end-to-end in a day, not a quarter.
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Native pack indexing via gix-pack (replaces `git unpack-objects` on push) | 🟡 M1b-3-gix |
 | Chunked-KV / object-store `Storage` impl — `ObjectStore` trait scaffolded | 🟡 M2b |
 | Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
-| Per-token self-revocation, bulk rotate     | ✅ M4b |
-| Account-level credentials + token listing  | 🟡 M4b-next |
-| Webhooks (HMAC-signed) + Prometheus metrics | ✅ M6 |
+| Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
+| Admin-token rotation (in-process) | 🟡 M4b-key-rotation |
+| Webhooks (HMAC-signed) + Prometheus metrics + retries + SQLite registry | ✅ M6 |
+| KMS-backed webhook secrets | 🟡 M6-deliver-secrets |
 | LFS, replication, PITR | 🟡 M6-other |
 
 ## What's next
@@ -105,36 +105,35 @@ process that parsed CGI env vars and re-spawned `git upload-pack` or
 `git receive-pack` internally. We now spawn the pack handlers directly,
 which cut clone-latency p99 by ~27% and max by ~63%.
 
-**The full v2 native protocol layer is in (M1b-1 / M1b-2 / M1b-3).**
-`info/refs`, `command=ls-refs`, `command=fetch`, and `git-receive-pack`
-are all served from in-process Rust — pkt-line + sideband framing,
-ref enumeration off disk, ref CAS via the `RefStore` trait. The fetch
-path's pack generation is fully native via `gix-pack` (M1b-2c). The
-push path's pack indexing still calls `git unpack-objects --stdin` as
-the sole remaining subprocess on the protocol hot path; that swap is
-the next-logical commit (M1b-3-gix).
+**The full v2 native protocol layer is in and subprocess-free
+(M1b-1 / M1b-2 / M1b-3).** Every endpoint under `/git/:id.git/*` —
+`info/refs`, `command=ls-refs`, `command=fetch`, and
+`git-receive-pack` — is served from in-process Rust. Both pack
+operations (generation on fetch, indexing on push) go through
+`gix-pack` instead of `git pack-objects` / `git unpack-objects`
+subprocesses. p50 clone latency is 10.2 ms vs 13.0 ms after M1b-1
+(see the table above).
 
 Remaining, in order:
 
-1. **M1b-3-gix — native pack indexing via `gix-pack`.** The leaf
-   subprocess on the push path. Same architectural shape as
-   M1b-2c (which swapped `git pack-objects` for native gix-pack
-   on the fetch side); the receive side gets the same treatment.
-2. **M2b — chunked-KV `Storage` impl.** Second impl of the trait.
-   `ObjectStore` trait scaffolded; full chunked-KV
-   `Storage` lifecycle waits on M1b-3-gix so no production
-   subprocess assumes a `<repo>/objects/` directory exists on disk.
-3. **M3b — distributed `RefStore` impl.** `MemRefStore` + concurrent
-   CAS conformance test landed; consensus log (openraft) + per-repo
-   state machine + leader election + snapshot install remain.
-4. **M4b-next — account-level credentials.** Token-subject column
-   on the SQLite store + per-repo `GET /v1/repos/:id/tokens`
-   listing. Self-revoke and bulk rotate already shipped.
-5. **M6-deliver — durable webhook subscriptions + retries.**
-   In-memory `MemRegistry` + best-effort delivery is in;
-   SQLite-backed registry + retry-with-backoff + per-delivery
-   metrics are the next slice.
-6. **M6-other — LFS, replication, PITR.** Each is genuinely
+1. **M2b — chunked-KV `Storage` impl.** The `ObjectStore` trait
+   is scaffolded; the protocol layer no longer assumes a
+   `<repo>/objects/` directory on disk for hot-path reads. The
+   chunked-KV impl + lifecycle ops (which still call `git init
+   --bare`) is the remaining work.
+2. **M3b — distributed `RefStore` impl.** `MemRefStore` + a
+   concurrent-CAS conformance test landed; the consensus log
+   (openraft) + per-repo state machine + leader election +
+   snapshot install remain.
+3. **M4b-key-rotation — admin-token rotation surface.**
+   Subject column + listing + self-revoke + bulk-rotate
+   shipped; in-process admin-token rotation (vs env-var-on-restart)
+   is the remaining slice.
+4. **M6-deliver-secrets — KMS-backed webhook secrets.**
+   SQLite-backed subscriptions + retries + delivery metrics
+   shipped; today the per-subscription HMAC secret is stored
+   plaintext in SQLite. A KMS swap is the next refinement.
+5. **M6-other — LFS, replication, PITR.** Each is genuinely
    multi-week.
 
 ## Numbers we just measured
@@ -159,18 +158,20 @@ the source.
 
 Measured via `scripts/bench_clone.sh`:
 
-|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) |
-| ------ | -------: | -----------: | ----------------------------: |
-| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       |
-| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       |
-| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       |
-| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       |
+|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) | M1b-2c+3-gix (full native via gix-pack) |
+| ------ | -------: | -----------: | ----------------------------: | --------------------------------------: |
+| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       | 10.2 ms                                 |
+| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       | 11.4 ms                                 |
+| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       | 12.6 ms                                 |
+| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       | 17.5 ms                                 |
 
-M1a killed the CGI wrapper — that's where the big tail-latency win lives
-(p99 −27%, max −63%). M1b-1 went native on the discovery response; a
-small p50 nudge because that endpoint was the cheaper of the two git
-subprocesses. The remaining M1b steps (native fetch / receive-pack via
-gitoxide) hit the expensive half.
+M1a killed the CGI wrapper — that's where the big tail-latency win
+lives (p99 −27%, max −63%). M1b-1 went native on the discovery
+response; a small p50 nudge because that endpoint was the cheaper
+of the two git subprocesses. M1b-2c (gix-pack on the fetch side)
++ M1b-3-gix (gix-pack on the push side) replaced the last two
+subprocesses on the protocol hot path: p50 −22%, p95 −24%, p99 −22%
+versus M1b-1, with no behavior change observable to clients.
 
 ## Quickstart
 
@@ -620,8 +621,8 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M1b-2a** | ✅ done | Native v2 `command=ls-refs` POST — refs read directly off disk (packed-refs + loose) by `RefStore::list`/`read_head`. No upload-pack subprocess on the discovery half. | upload-pack ls-refs fork |
 | **M1b-2b** | ✅ done | Native v2 `command=fetch` POST — protocol layer + sideband-1 framing in-process; pack generation via `git pack-objects --stdout`. | upload-pack fetch fork |
 | **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
-| **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`; `git unpack-objects --stdin` writes loose objects from the incoming pack. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
-| **M1b-3-gix** | 🟡 next | Replace `git unpack-objects` with `gix-pack`'s native pack indexing — same architectural seam as M1b-2c. | unpack-objects subprocess |
+| **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
+| **M1b-3-gix** | ✅ done | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Writes pack-`<hash>`.pack + .idx into `objects/pack/`; thin-pack deltas resolved against the existing odb. The protocol layer is now subprocess-free end to end. | unpack-objects subprocess |
 | **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait scaffolded; full impl unblocked once M1b-3-gix ships and the unpack-objects subprocess is gone. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
