@@ -223,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id", delete(rest::delete_repo).get(reads::get_repo))
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
+                .route("/v1/repos/:id/tokens/rotate", post(rest::rotate_tokens))
                 .route("/v1/repos/:id/commits", post(commits::create_commit).get(reads::list_commits))
                 .route("/v1/repos/:id/merge", post(merge::merge_branches))
                 .route("/v1/repos/:id/refs", get(reads::list_refs))

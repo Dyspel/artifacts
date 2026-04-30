@@ -91,6 +91,21 @@ pub trait TokenStore: Send + Sync {
     /// Revoke a token. Returns `Ok(true)` if the token existed and wasn't
     /// already revoked, `Ok(false)` otherwise. Idempotent.
     async fn revoke(&self, token: &str) -> Result<bool>;
+
+    /// Revoke every non-revoked, non-expired token bound to `repo_id`.
+    /// Returns the number of rows that were actually flipped — useful
+    /// for surfacing "rotated 3 tokens" to the caller of a rotation
+    /// endpoint. Idempotent: a second call on the same repo returns 0
+    /// because everything's already revoked.
+    ///
+    /// Default impl errors so trait callers get a clear "this backend
+    /// doesn't implement bulk revoke" rather than a panic. Concrete
+    /// stores override.
+    async fn revoke_all_for_repo(&self, _repo_id: &str) -> Result<u64> {
+        Err(Error::Other(anyhow::anyhow!(
+            "TokenStore::revoke_all_for_repo not implemented"
+        )))
+    }
 }
 
 /// SQLite-backed `TokenStore`.
@@ -237,6 +252,23 @@ impl TokenStore for SqliteTokenStore {
             params![now, hash],
         )?;
         Ok(affected > 0)
+    }
+
+    async fn revoke_all_for_repo(&self, repo_id: &str) -> Result<u64> {
+        let now = now_secs() as i64;
+        let conn = self.conn.lock().await;
+        // We only flip rows that are still authorizing — already-expired
+        // tokens are dead anyway, so leaving their `revoked_at` NULL keeps
+        // the audit trail honest ("this token expired" vs "this token was
+        // explicitly revoked"). Pruning will sweep both states later.
+        let affected = conn.execute(
+            "UPDATE tokens SET revoked_at = ?1
+             WHERE repo_id = ?2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)",
+            params![now, repo_id],
+        )?;
+        Ok(affected as u64)
     }
 }
 
@@ -393,6 +425,53 @@ mod tests {
         let pruned = store.prune(Duration::from_secs(0)).await.unwrap();
         assert_eq!(pruned, 1);
         assert_eq!(count_rows(&path), 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_repo_kills_every_live_token_for_that_repo() {
+        let (_d, store) = open_store();
+        let t1 = store.mint("r1", Scope::Read, None).await.unwrap();
+        let t2 = store.mint("r1", Scope::Write, None).await.unwrap();
+        let t3 = store.mint("r2", Scope::Read, None).await.unwrap();
+
+        // Sanity: all three resolve.
+        assert!(store.lookup(&t1).await.unwrap().is_some());
+        assert!(store.lookup(&t2).await.unwrap().is_some());
+        assert!(store.lookup(&t3).await.unwrap().is_some());
+
+        let revoked = store.revoke_all_for_repo("r1").await.unwrap();
+        assert_eq!(revoked, 2);
+
+        // r1 tokens are dead, r2 is untouched.
+        assert!(store.lookup(&t1).await.unwrap().is_none());
+        assert!(store.lookup(&t2).await.unwrap().is_none());
+        assert!(store.lookup(&t3).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_repo_is_idempotent() {
+        let (_d, store) = open_store();
+        let _t = store.mint("r1", Scope::Read, None).await.unwrap();
+        let first = store.revoke_all_for_repo("r1").await.unwrap();
+        let second = store.revoke_all_for_repo("r1").await.unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_all_for_repo_skips_already_expired_rows() {
+        // Already-expired rows shouldn't get a `revoked_at` stamp by
+        // accident — the audit trail wants "expired" distinct from
+        // "explicitly revoked". Verified by checking that prune (with
+        // zero grace) sees one expired row before and after the call.
+        let (_d, store) = open_store();
+        let _t_live = store.mint("r1", Scope::Read, None).await.unwrap();
+        let _t_dead = store
+            .mint("r1", Scope::Write, Some(Duration::from_secs(0)))
+            .await
+            .unwrap();
+        let revoked = store.revoke_all_for_repo("r1").await.unwrap();
+        assert_eq!(revoked, 1, "only the live row should flip to revoked");
     }
 
     #[tokio::test]

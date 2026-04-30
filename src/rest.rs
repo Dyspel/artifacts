@@ -237,11 +237,11 @@ pub struct RevokeResponse {
 /// Takes the token in the request body so it doesn't get captured in
 /// access logs, URL history, or any other place URL paths usually land.
 ///
-/// **Admin-only for now.** To let a `User` revoke only their own
-/// tokens, we'd need the `TokenStore` to expose "what repo is this
-/// token bound to" so we could `enforce_owner` against that. That's a
-/// trait extension and belongs in M4b alongside `GET /v1/tokens`
-/// listing. Until then, non-admin callers get 403.
+/// Authorization (M4b): admins always pass. Non-admins (JWT user) may
+/// revoke a token iff they own the repo that token is bound to — i.e.
+/// they could have minted it themselves. This is the "I think my
+/// repo's token leaked, kill it" path that previously required an
+/// admin to do.
 pub async fn revoke_token(
     State(state): State<RestState>,
     headers: HeaderMap,
@@ -252,14 +252,90 @@ pub async fn revoke_token(
         &state.cfg.admin_token,
         state.cfg.jwt_secret.as_deref(),
     )?;
-    if !matches!(principal, crate::auth::Principal::Admin) {
-        return Err(Error::Forbidden("token revocation is admin-only"));
-    }
-    // Admin-only; rate-limit skipped (admin is exempt anyway). Left
-    // here as a no-op call for symmetry with the other handlers.
     state.rate_limit.check(&principal, Class::Token)?;
+
+    if !matches!(principal, crate::auth::Principal::Admin) {
+        // Look up the token's bound repo and require ownership. Any
+        // failure to resolve the token (unknown / expired / already
+        // revoked) is reported as a 403 rather than a 404, because the
+        // alternative leaks "this token doesn't exist" to anyone with
+        // a JWT — slight oracle for token-fishing.
+        let rec = state
+            .tokens
+            .lookup(&body.token)
+            .await?
+            .ok_or(Error::Forbidden("not your token"))?;
+        enforce_owner(&*state.ownership, &principal, &rec.repo_id).await?;
+    }
+
     let revoked = state.tokens.revoke(&body.token).await?;
     Ok(Json(RevokeResponse { revoked }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct RotateTokenBody {
+    /// Scope for the freshly-minted replacement token. Defaults to
+    /// `write` to mirror the create-repo / fork mint defaults — the
+    /// most useful scope for an interactive client recovering after a
+    /// suspected token leak.
+    pub scope: Option<Scope>,
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateTokenResponse {
+    /// How many tokens for this repo were marked revoked. Useful for
+    /// surfacing "rotated 3 tokens" in CLI output / audit logs.
+    pub revoked: u64,
+    /// The fresh token, the same way `mint_token` would surface it.
+    /// Caller stores it — we never hold the raw form server-side.
+    pub token: String,
+    pub remote: String,
+}
+
+/// POST /v1/repos/:id/tokens/rotate
+///
+/// Atomic-ish "kill-everything-and-re-mint" for a repo's tokens.
+/// Useful when a token leaks: the caller doesn't have to enumerate
+/// individual tokens to kill, and they get a fresh one in one round
+/// trip.
+///
+/// "Atomic-ish" because there's a tiny window between the bulk
+/// revoke and the new mint where a request authorized by an
+/// already-validated cached token could still succeed; given each
+/// request re-validates against the SQLite store on every call,
+/// that window is on the order of the time between two SQL
+/// statements (microseconds). For a stronger guarantee we'd run
+/// both in one transaction — TokenStore doesn't expose that
+/// today, and at our qps it's not necessary.
+pub async fn rotate_tokens(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RotateTokenBody>,
+) -> Result<Json<RotateTokenResponse>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token,
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, Class::Token)?;
+    if !state.storage.exists(&id) {
+        return Err(Error::RepoNotFound(id));
+    }
+    enforce_owner(&*state.ownership, &principal, &id).await?;
+
+    let revoked = state.tokens.revoke_all_for_repo(&id).await?;
+    let scope = body.scope.unwrap_or(Scope::Write);
+    let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
+    let token = state.tokens.mint(&id, scope, ttl).await?;
+    let remote = remote_url(&state.cfg, &id, &token);
+    Ok(Json(RotateTokenResponse {
+        revoked,
+        token,
+        remote,
+    }))
 }
 
 /// DELETE /v1/repos/:id
