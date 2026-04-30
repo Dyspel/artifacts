@@ -185,6 +185,126 @@ impl RefStore for FsRefStore {
     }
 }
 
+/// In-process `RefStore` impl backed by HashMaps under a Mutex.
+///
+/// Why this exists (M3b foundation): the production `FsRefStore` shells
+/// out to `git update-ref` for CAS — that's a single-node guarantee that
+/// breaks the moment two `artifacts serve` processes share a repos dir.
+/// Real distributed CAS belongs in a consensus log (Raft, in something
+/// like `openraft`/`raft-rs`), which is multi-week work and not in scope
+/// for this session.
+///
+/// What this *is* good for:
+///   - tests (no fork+exec on every CAS makes test suites way faster);
+///   - validating that the trait shape is sufficient for non-FS impls;
+///   - a stand-in for the eventual replicated impl during integration
+///     work — the two will be swap-in compatible.
+///
+/// What this is **NOT** good for:
+///   - production. Loses all state on restart, and there's no
+///     replication. A second process with its own MemRefStore can't see
+///     these refs.
+///
+/// CAS is implemented as a check-and-update under a single per-store
+/// Mutex. That's strict serializability, not just linearizability —
+/// stronger than what `FsRefStore` gives you (which is per-ref flock).
+/// Stronger is fine; tests don't notice.
+pub struct MemRefStore {
+    inner: std::sync::Mutex<MemState>,
+}
+
+#[derive(Default)]
+struct MemState {
+    /// `(repo_id, ref_name) -> oid`.
+    refs: std::collections::HashMap<(String, String), String>,
+    /// `repo_id -> head_state`. Defaults to the same `Unborn { target:
+    /// "refs/heads/main" }` that `git init --bare --initial-branch=main`
+    /// produces, so callers can treat MemRefStore as drop-in for a
+    /// freshly-initialized FsRefStore.
+    heads: std::collections::HashMap<String, HeadState>,
+}
+
+impl Default for MemRefStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemRefStore {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(MemState::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemState> {
+        // Poison recovery: we never violate an invariant under a panic
+        // (a panic mid-CAS leaves the map in either the pre- or post-
+        // state, both of which are valid). So treating the lock as
+        // never-poisoned is safe.
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[async_trait]
+impl RefStore for MemRefStore {
+    async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
+        let g = self.lock();
+        Ok(g.refs.get(&(repo_id.to_string(), ref_name.to_string())).cloned())
+    }
+
+    async fn cas_update(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        expected: Option<&str>,
+        new_sha: &str,
+    ) -> Result<CasOutcome> {
+        let mut g = self.lock();
+        let key = (repo_id.to_string(), ref_name.to_string());
+        let current = g.refs.get(&key).cloned();
+        let matches = match (expected, current.as_deref()) {
+            (None, None) => true,
+            (Some(e), Some(c)) => e == c,
+            _ => false,
+        };
+        if !matches {
+            return Ok(CasOutcome::Conflict { current });
+        }
+        g.refs.insert(key, new_sha.to_string());
+        Ok(CasOutcome::Updated)
+    }
+
+    async fn list(&self, repo_id: &str, prefixes: &[String]) -> Result<Vec<RefEntry>> {
+        let g = self.lock();
+        let mut out: Vec<RefEntry> = g
+            .refs
+            .iter()
+            .filter(|((r, _), _)| r == repo_id)
+            .filter(|((_, name), _)| {
+                prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p))
+            })
+            .map(|((_, name), oid)| RefEntry {
+                name: name.clone(),
+                oid: oid.clone(),
+                peeled: None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn read_head(&self, repo_id: &str) -> Result<HeadState> {
+        let g = self.lock();
+        Ok(g.heads
+            .get(repo_id)
+            .cloned()
+            .unwrap_or_else(|| HeadState::Unborn {
+                target: "refs/heads/main".to_string(),
+            }))
+    }
+}
+
 async fn run_git(git_dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     let mut cmd = Command::new("git");
     cmd.arg("--git-dir").arg(git_dir).args(args);
@@ -419,6 +539,122 @@ mod tests {
         assert_eq!(out, CasOutcome::Updated);
         let r = refs.read(&repo, "refs/test/t").await.unwrap();
         assert_eq!(r.as_deref(), Some(sha.as_str()));
+    }
+
+    /// Conformance: any `RefStore` impl must satisfy the same CAS
+    /// invariants. We exercise the in-memory impl here so the trait's
+    /// expectations are explicit; when a future ReplicatedRefStore
+    /// arrives, point it at the same suite.
+    mod mem_conformance {
+        use super::*;
+
+        #[tokio::test]
+        async fn cas_create_then_update_then_stale_conflicts() {
+            let s = MemRefStore::new();
+            // create
+            assert_eq!(
+                s.cas_update("r", "refs/heads/x", None, "0123456789012345678901234567890123456789").await.unwrap(),
+                CasOutcome::Updated,
+            );
+            // update under matching expected
+            assert_eq!(
+                s.cas_update(
+                    "r",
+                    "refs/heads/x",
+                    Some("0123456789012345678901234567890123456789"),
+                    "abcabcabcabcabcabcabcabcabcabcabcabcabca",
+                )
+                .await
+                .unwrap(),
+                CasOutcome::Updated,
+            );
+            // stale expected → conflict, current returned
+            match s
+                .cas_update(
+                    "r",
+                    "refs/heads/x",
+                    Some("0123456789012345678901234567890123456789"),
+                    "ffffffffffffffffffffffffffffffffffffffff",
+                )
+                .await
+                .unwrap()
+            {
+                CasOutcome::Conflict { current } => {
+                    assert_eq!(
+                        current.as_deref(),
+                        Some("abcabcabcabcabcabcabcabcabcabcabcabcabca"),
+                    );
+                }
+                other => panic!("expected Conflict, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn read_returns_none_for_missing_ref() {
+            let s = MemRefStore::new();
+            assert!(s.read("r", "refs/heads/nope").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn read_head_defaults_to_unborn_main() {
+            let s = MemRefStore::new();
+            match s.read_head("r").await.unwrap() {
+                HeadState::Unborn { target } => assert_eq!(target, "refs/heads/main"),
+                other => panic!("expected Unborn, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn list_filters_by_prefix() {
+            let s = MemRefStore::new();
+            s.cas_update("r", "refs/heads/main", None, "0".repeat(40).as_str())
+                .await
+                .unwrap();
+            s.cas_update("r", "refs/tags/v1", None, "0".repeat(40).as_str())
+                .await
+                .unwrap();
+            let heads = s.list("r", &["refs/heads/".into()]).await.unwrap();
+            assert_eq!(heads.len(), 1);
+            assert_eq!(heads[0].name, "refs/heads/main");
+        }
+
+        #[tokio::test]
+        async fn concurrent_cas_only_one_winner() {
+            // Property test: if two writers race a create-from-None,
+            // exactly one Updated and exactly one Conflict come out.
+            // Repeated rounds shake out timing-dependent bugs.
+            let s = std::sync::Arc::new(MemRefStore::new());
+            for round in 0..50 {
+                let s1 = s.clone();
+                let s2 = s.clone();
+                let oid_a = format!("a{:039}", round);
+                let oid_b = format!("b{:039}", round);
+                let ref_name = format!("refs/round/{round}");
+
+                let h1 = tokio::spawn({
+                    let r = ref_name.clone();
+                    let oid = oid_a.clone();
+                    async move {
+                        s1.cas_update("r", &r, None, &oid).await.unwrap()
+                    }
+                });
+                let h2 = tokio::spawn({
+                    let r = ref_name.clone();
+                    let oid = oid_b.clone();
+                    async move {
+                        s2.cas_update("r", &r, None, &oid).await.unwrap()
+                    }
+                });
+                let r1 = h1.await.unwrap();
+                let r2 = h2.await.unwrap();
+                let updates = matches!(r1, CasOutcome::Updated) as u32
+                    + matches!(r2, CasOutcome::Updated) as u32;
+                let conflicts = matches!(r1, CasOutcome::Conflict { .. }) as u32
+                    + matches!(r2, CasOutcome::Conflict { .. }) as u32;
+                assert_eq!(updates, 1, "round {round} got {updates} updates");
+                assert_eq!(conflicts, 1, "round {round} got {conflicts} conflicts");
+            }
+        }
     }
 
     #[tokio::test]

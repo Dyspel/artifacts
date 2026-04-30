@@ -43,7 +43,7 @@
 //!   doesn't route through this yet.
 
 use crate::error::{Error, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Read-only view into a repo's git object database. Writes don't
 /// have a method yet — receive-pack writes go through
@@ -107,6 +107,7 @@ impl ObjectStore for FsObjectStore {
 mod tests {
     use super::*;
     use crate::storage::{new_repo_id, FsStorage, Storage};
+    use std::path::Path;
 
     fn write_blob(git_dir: &Path, bytes: &[u8]) -> String {
         use std::io::Write as _;
