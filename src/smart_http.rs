@@ -959,19 +959,20 @@ async fn apply_ref_update(
     repo_id: &str,
     u: &RefUpdate,
 ) -> std::result::Result<(), String> {
-    if u.is_delete() {
-        // RefStore today only models create/update via cas_update.
-        // Deletes don't have a clean trait method yet — rather than
-        // half-implement it, mark deletes as unsupported so push
-        // falls through to receive-pack subprocess.
-        return Err("native delete not implemented".to_string());
-    }
-    let expected = if u.is_create() {
-        None
+    let outcome = if u.is_delete() {
+        // CAS delete with the client's expected old-OID. If the ref
+        // moved between the client's last fetch and this push,
+        // RefStore returns Conflict and we report non-fast-forward.
+        refs.cas_delete(repo_id, &u.name, Some(u.old.as_str())).await
     } else {
-        Some(u.old.as_str())
+        let expected = if u.is_create() {
+            None
+        } else {
+            Some(u.old.as_str())
+        };
+        refs.cas_update(repo_id, &u.name, expected, &u.new).await
     };
-    match refs.cas_update(repo_id, &u.name, expected, &u.new).await {
+    match outcome {
         Ok(crate::refs::CasOutcome::Updated) => Ok(()),
         Ok(crate::refs::CasOutcome::Conflict { current }) => {
             // Mirror git's wording. The client surfaces "non-fast-forward"

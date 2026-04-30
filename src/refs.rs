@@ -86,6 +86,32 @@ pub trait RefStore: Send + Sync {
         new_sha: &str,
     ) -> Result<CasOutcome>;
 
+    /// Atomically delete `ref_name`. The CAS variant prevents
+    /// surprise-races: a delete that arrives after some other writer
+    /// updated the ref reports `Conflict { current }` so the caller
+    /// can return the wire-protocol "non-fast-forward" / "stale info"
+    /// error instead of silently dropping the more-recent commit.
+    ///
+    /// `expected = None` means "delete unconditionally" — only
+    /// callers that have already validated freshness elsewhere
+    /// should pass this. The HTTP push path always has an expected
+    /// (the OID the client thought the ref had), so it threads it
+    /// through.
+    ///
+    /// Default impl errors so trait callers see a clear "this
+    /// backend doesn't implement deletes" instead of silently
+    /// no-op'ing. Concrete stores override.
+    async fn cas_delete(
+        &self,
+        _repo_id: &str,
+        _ref_name: &str,
+        _expected: Option<&str>,
+    ) -> Result<CasOutcome> {
+        Err(Error::Other(anyhow::anyhow!(
+            "RefStore::cas_delete not implemented for this backend"
+        )))
+    }
+
     /// Enumerate refs whose name starts with any of `prefixes`. An empty
     /// `prefixes` slice means "all refs". Order is unspecified — the
     /// caller (e.g. ls-refs) sorts as needed.
@@ -179,6 +205,34 @@ impl RefStore for FsRefStore {
             repo = %repo_id, ref_name = %ref_name,
             stderr = %String::from_utf8_lossy(&stderr),
             "update-ref non-zero; treating as conflict"
+        );
+        let current = self.read(repo_id, ref_name).await.ok().flatten();
+        Ok(CasOutcome::Conflict { current })
+    }
+
+    async fn cas_delete(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        expected: Option<&str>,
+    ) -> Result<CasOutcome> {
+        let git_dir = self.repo_path(repo_id);
+        // `git update-ref -d <ref> [old-sha]` deletes; with
+        // expected, requires the ref to currently equal old-sha
+        // (CAS). Without expected we pass no extra arg, which makes
+        // git delete unconditionally.
+        let (rc, _, stderr) = if let Some(exp) = expected {
+            run_git(&git_dir, &["update-ref", "-d", ref_name, exp]).await?
+        } else {
+            run_git(&git_dir, &["update-ref", "-d", ref_name]).await?
+        };
+        if rc == 0 {
+            return Ok(CasOutcome::Updated);
+        }
+        tracing::debug!(
+            repo = %repo_id, ref_name = %ref_name,
+            stderr = %String::from_utf8_lossy(&stderr),
+            "update-ref -d non-zero; treating as conflict"
         );
         let current = self.read(repo_id, ref_name).await.ok().flatten();
         Ok(CasOutcome::Conflict { current })
@@ -302,6 +356,27 @@ impl RefStore for MemRefStore {
             .unwrap_or_else(|| HeadState::Unborn {
                 target: "refs/heads/main".to_string(),
             }))
+    }
+
+    async fn cas_delete(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        expected: Option<&str>,
+    ) -> Result<CasOutcome> {
+        let mut g = self.lock();
+        let key = (repo_id.to_string(), ref_name.to_string());
+        let current = g.refs.get(&key).cloned();
+        let matches = match (expected, current.as_deref()) {
+            (None, _) => true, // unconditional delete
+            (Some(e), Some(c)) => e == c,
+            (Some(_), None) => false,
+        };
+        if !matches {
+            return Ok(CasOutcome::Conflict { current });
+        }
+        g.refs.remove(&key);
+        Ok(CasOutcome::Updated)
     }
 }
 
@@ -616,6 +691,52 @@ mod tests {
             let heads = s.list("r", &["refs/heads/".into()]).await.unwrap();
             assert_eq!(heads.len(), 1);
             assert_eq!(heads[0].name, "refs/heads/main");
+        }
+
+        #[tokio::test]
+        async fn cas_delete_removes_when_expected_matches() {
+            let s = MemRefStore::new();
+            let oid = "0".repeat(40);
+            s.cas_update("r", "refs/heads/x", None, &oid).await.unwrap();
+            assert!(s.read("r", "refs/heads/x").await.unwrap().is_some());
+            assert_eq!(
+                s.cas_delete("r", "refs/heads/x", Some(&oid)).await.unwrap(),
+                CasOutcome::Updated,
+            );
+            assert!(s.read("r", "refs/heads/x").await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn cas_delete_conflicts_when_expected_stale() {
+            let s = MemRefStore::new();
+            let oid_old = "0".repeat(40);
+            let oid_new = "1".repeat(40);
+            s.cas_update("r", "refs/heads/x", None, &oid_old).await.unwrap();
+            s.cas_update("r", "refs/heads/x", Some(&oid_old), &oid_new).await.unwrap();
+            // Try deleting with the stale oid — should conflict and
+            // return current.
+            match s.cas_delete("r", "refs/heads/x", Some(&oid_old)).await.unwrap() {
+                CasOutcome::Conflict { current } => {
+                    assert_eq!(current.as_deref(), Some(oid_new.as_str()));
+                }
+                other => panic!("expected Conflict, got {other:?}"),
+            }
+            // Ref is still present — delete didn't happen.
+            assert!(s.read("r", "refs/heads/x").await.unwrap().is_some());
+        }
+
+        #[tokio::test]
+        async fn cas_delete_unconditional_when_expected_none() {
+            let s = MemRefStore::new();
+            s.cas_update("r", "refs/heads/x", None, &"0".repeat(40))
+                .await
+                .unwrap();
+            // expected=None bypasses the equality check.
+            assert_eq!(
+                s.cas_delete("r", "refs/heads/x", None).await.unwrap(),
+                CasOutcome::Updated,
+            );
+            assert!(s.read("r", "refs/heads/x").await.unwrap().is_none());
         }
 
         #[tokio::test]
