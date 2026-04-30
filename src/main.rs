@@ -17,6 +17,7 @@ mod rest;
 mod smart_http;
 mod storage;
 mod tokens;
+mod webhooks;
 
 use crate::{
     config::Config,
@@ -201,6 +202,15 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(3600),
             );
 
+            let event_bus = events::EventBus::new();
+            let webhook_registry: Arc<dyn webhooks::WebhookRegistry> =
+                Arc::new(webhooks::MemRegistry::new());
+            // Spawn the webhook dispatcher *before* any handler can
+            // publish, so the broadcast subscriber registers before
+            // events start flying. Otherwise the first commit/fork on
+            // boot wouldn't reach any subscribers.
+            webhooks::spawn_dispatcher(webhook_registry.clone(), event_bus.clone());
+
             let rest_state = RestState {
                 cfg: cfg.clone(),
                 storage,
@@ -208,8 +218,9 @@ async fn main() -> anyhow::Result<()> {
                 ownership,
                 refs: refs.clone(),
                 rate_limit,
-                events: events::EventBus::new(),
+                events: event_bus,
                 alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
+                webhooks: webhook_registry,
             };
             let git_state = GitState {
                 cfg: cfg.clone(),
@@ -224,6 +235,14 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
                 .route("/v1/repos/:id/tokens", post(rest::mint_token))
                 .route("/v1/repos/:id/tokens/rotate", post(rest::rotate_tokens))
+                .route(
+                    "/v1/repos/:id/webhooks",
+                    post(rest::create_webhook).get(rest::list_webhooks),
+                )
+                .route(
+                    "/v1/repos/:id/webhooks/:hook_id",
+                    delete(rest::delete_webhook),
+                )
                 .route("/v1/repos/:id/commits", post(commits::create_commit).get(reads::list_commits))
                 .route("/v1/repos/:id/merge", post(merge::merge_branches))
                 .route("/v1/repos/:id/refs", get(reads::list_refs))

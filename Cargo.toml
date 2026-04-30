@@ -46,14 +46,21 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # directly tends to break on every release.
 gix = "0.83"
 
+# Webhook delivery over HTTP/HTTPS. ureq is the smallest sync HTTP
+# client we can plausibly take a dep on; we wrap it in spawn_blocking
+# so it doesn't tie up tokio worker threads. Was previously
+# `optional = true` and gated behind the GUI feature; M6 uses it for
+# webhook fan-out so it has to be in the default build.
+ureq = { version = "2", features = ["json", "tls"] }
+hmac = "0.12"
+
 # GUI-only deps; opt-in via `--features gui` so the server binary stays lean.
 eframe = { version = "0.27", optional = true }
 egui_plot = { version = "0.27", optional = true }
-ureq = { version = "2", features = ["json"], optional = true }
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:egui_plot", "dep:ureq"]
+gui = ["dep:eframe", "dep:egui_plot"]
 
 [[bin]]
 name = "artifacts-gui"
