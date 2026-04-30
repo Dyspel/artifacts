@@ -59,6 +59,13 @@ pub struct GitState {
     /// the REST commits path uses; the trait gives us `list` +
     /// `read_head` without going through git subprocesses.
     pub refs: Arc<dyn RefStore>,
+    /// When `true`, every native dispatcher (ls-refs / fetch /
+    /// receive-pack / pack-indexing) is short-circuited and the
+    /// request falls through to the legacy subprocess path. Wired
+    /// from the `ARTIFACTS_DISABLE_NATIVE` env var at startup.
+    /// Used by `scripts/bench_*.sh` to A/B native vs subprocess on
+    /// the same binary; production should never have this set.
+    pub disable_native: bool,
 }
 
 /// Axum entry point for everything under `/git/:id.git/*rest`. Authorizes,
@@ -81,32 +88,35 @@ pub async fn git_handler(
     let scope = required_scope(&method, &rest, Some(&query));
     authorize_git(&*state.tokens, request.headers(), &repo_id, scope).await?;
 
+    let native_ctx = if state.disable_native {
+        None
+    } else {
+        Some((repo_id.as_str(), state.refs.as_ref()))
+    };
     match (method.as_str(), rest.as_str()) {
         ("GET", "info/refs") => {
             let service = service_from_query(&query)?;
-            info_refs(&repo_path, service, request.headers()).await
-        }
-        ("POST", "git-upload-pack") => {
-            pack_handler(
+            // The v2 info/refs response is small + fully static —
+            // we always serve it natively unless the kill-switch
+            // is on, in which case we shell out for parity with
+            // the v0/v1 path.
+            info_refs(
                 &repo_path,
-                "upload-pack",
-                request,
-                Some((&repo_id, state.refs.as_ref())),
+                service,
+                request.headers(),
+                state.disable_native,
             )
             .await
+        }
+        ("POST", "git-upload-pack") => {
+            pack_handler(&repo_path, "upload-pack", request, native_ctx).await
         }
         ("POST", "git-receive-pack") => {
             // Native receive-pack is gated behind the same `refs_for_native`
             // tuple as upload-pack — both want a `&dyn RefStore` to do CAS
             // (push) or read (fetch). The function then decides per-request
             // whether the body shape is one we natively handle.
-            pack_handler(
-                &repo_path,
-                "receive-pack",
-                request,
-                Some((&repo_id, state.refs.as_ref())),
-            )
-            .await
+            pack_handler(&repo_path, "receive-pack", request, native_ctx).await
         }
         _ => Err(Error::BadRequest(format!(
             "unsupported git endpoint: {method} /{rest}"
@@ -220,8 +230,9 @@ async fn info_refs(
     repo_path: &Path,
     service: &'static str,
     headers: &HeaderMap,
+    force_subprocess: bool,
 ) -> Result<Response<Body>> {
-    if wants_v2(headers) {
+    if !force_subprocess && wants_v2(headers) {
         return native_v2_info_refs(service);
     }
 
@@ -887,37 +898,57 @@ async fn native_receive_pack_response(
     refs: &dyn RefStore,
     req: ReceivePackRequest,
 ) -> Result<Response<Body>> {
-    // Unpack first. If it fails, every ref-update reports "ng <ref>
-    // unpacker error" — that's git's real receive-pack behavior too.
+    // Pack-indexing leaf. Two paths exist:
     //
-    // M1b-3-gix: prefer the native gix-pack indexer over the
-    // `git unpack-objects --stdin` subprocess. gix's
-    // `Bundle::write_to_directory` writes pack-<hash>.pack +
-    // pack-<hash>.idx into <repo>/objects/pack/ in one call,
-    // resolving thin-pack deltas against existing objects via the
-    // odb handle. Falls back to the subprocess if that errors —
-    // we'd rather a working push via unpack-objects than a 500.
+    //   1. `git unpack-objects --stdin` — writes loose objects into
+    //      `<repo>/objects/<aa>/<bbbb…>`. One subprocess.
+    //   2. `gix-pack`'s `Bundle::write_to_directory` — writes a
+    //      pack file + index into `<repo>/objects/pack/`. No
+    //      subprocess.
+    //
+    // M1b-3-gix landed (2) and made it the default. Bench
+    // (`scripts/bench_push.sh`) then showed (2) is ~4× SLOWER on
+    // typical small pushes (p50 62ms vs 14ms): the gix-pack
+    // indexer's per-call setup cost (gix::open + tempfile + index
+    // computation) dominates for tiny inputs. (1) wins until pack
+    // sizes grow well past anything an interactive `git push` would
+    // generate.
+    //
+    // So default is back to (1). gix-pack stays as opt-in via
+    // ARTIFACTS_NATIVE_INDEX_PACK=1 — useful for testing or for
+    // backends that genuinely can't shell out (a future chunked-KV
+    // Storage impl, where on-disk objects/ doesn't exist).
+    //
+    // The branch + the helper module remain so the M1b-3-gix work
+    // isn't lost; we'll re-enable the native default when the
+    // crossover point makes it worth it (or when gix-pack
+    // performance improves upstream).
+    let prefer_native_index = std::env::var("ARTIFACTS_NATIVE_INDEX_PACK")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
     let unpack_outcome: std::result::Result<(), String> = if req.pack.is_empty() {
         Ok(())
-    } else {
+    } else if prefer_native_index {
         let repo_path_buf = repo_path.to_path_buf();
         let pack = req.pack.clone();
-        let native = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             crate::native_pack::index_pack_into_repo(&repo_path_buf, &pack)
         })
         .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("native index join: {e}")));
-        match native {
+        {
             Ok(Ok(())) => Ok(()),
-            other => {
-                if let Ok(Err(e)) = &other {
-                    tracing::warn!(error = %e, "native pack index failed; falling back to unpack-objects");
-                }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "native pack index failed; falling back to unpack-objects");
                 unpack_objects_via_subprocess(repo_path, &req.pack)
                     .await
                     .map_err(|e| format!("{e}"))
             }
+            Err(e) => Err(format!("native index join: {e}")),
         }
+    } else {
+        unpack_objects_via_subprocess(repo_path, &req.pack)
+            .await
+            .map_err(|e| format!("{e}"))
     };
 
     let mut report = Vec::with_capacity(64 * (req.updates.len() + 1));

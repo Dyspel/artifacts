@@ -249,10 +249,25 @@ async fn main() -> anyhow::Result<()> {
                 alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
                 webhooks: webhook_registry,
             };
+            // Bench A/B kill-switch. Production never sets this; the
+            // bench scripts toggle it to compare native vs subprocess
+            // on the same release binary. Any non-empty value enables
+            // the legacy paths (chosen so `=0` and `=1` are both
+            // explicit).
+            let disable_native = std::env::var("ARTIFACTS_DISABLE_NATIVE")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false);
+            if disable_native {
+                tracing::warn!(
+                    "ARTIFACTS_DISABLE_NATIVE set: native protocol paths disabled \
+                     (bench / parity mode)",
+                );
+            }
             let git_state = GitState {
                 cfg: cfg.clone(),
                 tokens,
                 refs,
+                disable_native,
             };
 
             let rest_router = Router::new()
