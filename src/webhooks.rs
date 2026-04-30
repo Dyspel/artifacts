@@ -64,6 +64,137 @@ pub trait WebhookRegistry: Send + Sync {
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription>;
 }
 
+/// SQLite-backed `WebhookRegistry`. Subscriptions persist across
+/// restarts, which is what the in-memory `MemRegistry` does NOT do.
+///
+/// Schema (created on open if absent):
+///   id          TEXT PRIMARY KEY    — UUIDv4
+///   repo_id     TEXT NOT NULL       — repo this subscription fires for
+///   url         TEXT NOT NULL
+///   secret      TEXT                — plaintext HMAC key (we have to
+///                                      keep it round-trippable so the
+///                                      dispatcher can sign every body;
+///                                      a KMS-backed swap would be a
+///                                      separate commit).
+///   events_json TEXT NOT NULL       — JSON array of event-kind strings
+///   created_at  INTEGER NOT NULL
+///   revoked_at  INTEGER             — set on remove() so an admin can
+///                                      audit the lifecycle; matching()
+///                                      filters out revoked rows.
+///
+/// Same trait as MemRegistry. Wire choice happens in main.rs based on
+/// whether `ARTIFACTS_WEBHOOK_DB` is set (defaults to in-memory).
+pub struct SqliteWebhookRegistry {
+    conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+}
+
+impl SqliteWebhookRegistry {
+    pub fn open(path: &std::path::Path) -> crate::error::Result<Self> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS webhooks (
+                 id          TEXT PRIMARY KEY,
+                 repo_id     TEXT NOT NULL,
+                 url         TEXT NOT NULL,
+                 secret      TEXT,
+                 events_json TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 revoked_at  INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_webhooks_repo ON webhooks(repo_id);",
+        )?;
+        Ok(Self {
+            conn: Arc::new(std::sync::Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl WebhookRegistry for SqliteWebhookRegistry {
+    fn add(&self, mut sub: Subscription) -> String {
+        if sub.id.is_empty() {
+            sub.id = Uuid::new_v4().to_string();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let events = serde_json::to_string(&sub.events).unwrap_or_else(|_| "[]".into());
+        let _ = self.lock().execute(
+            "INSERT INTO webhooks (id, repo_id, url, secret, events_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![sub.id, sub.repo_id, sub.url, sub.secret, events, now],
+        );
+        sub.id
+    }
+
+    fn list(&self, repo_id: &str) -> Vec<Subscription> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare_cached(
+            "SELECT id, repo_id, url, secret, events_json
+             FROM webhooks
+             WHERE repo_id = ?1 AND revoked_at IS NULL",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(rusqlite::params![repo_id], row_to_sub);
+        let rows = match rows {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten().collect()
+    }
+
+    fn remove(&self, repo_id: &str, hook_id: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE webhooks SET revoked_at = ?1
+                 WHERE id = ?2 AND repo_id = ?3 AND revoked_at IS NULL",
+                rusqlite::params![now, hook_id, repo_id],
+            )
+            .unwrap_or(0);
+        n > 0
+    }
+
+    fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription> {
+        // Filter in Rust rather than embed the JSON LIKE in SQL so
+        // we don't depend on JSON1 being compiled in. Subscription
+        // counts per repo are small (dozens at most), so this is
+        // fine.
+        self.list(repo_id)
+            .into_iter()
+            .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
+            .collect()
+    }
+}
+
+fn row_to_sub(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
+    let id: String = row.get(0)?;
+    let repo_id: String = row.get(1)?;
+    let url: String = row.get(2)?;
+    let secret: Option<String> = row.get(3)?;
+    let events_json: String = row.get(4)?;
+    let events: Vec<String> = serde_json::from_str(&events_json).unwrap_or_default();
+    Ok(Subscription {
+        id,
+        repo_id,
+        url,
+        secret,
+        events,
+    })
+}
+
 /// In-memory `WebhookRegistry`. `Mutex<Vec>` is plenty for the
 /// subscription cardinality we'd see on a single machine (dozens, not
 /// thousands).
@@ -155,38 +286,90 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
     for sub in subs {
         let body = body.clone();
         // ureq is sync — push it onto the blocking pool so a slow
-        // webhook target can't stall the tokio runtime. The handle
-        // is dropped immediately; no retries, no result inspection.
-        // M6-deliver layers backoff + at-least-once on top.
+        // webhook target can't stall the tokio runtime. We retry
+        // up to MAX_ATTEMPTS times with exponential backoff so a
+        // brief receiver outage doesn't drop events; permanent
+        // failures still log and give up.
         tokio::task::spawn_blocking(move || {
+            const MAX_ATTEMPTS: u32 = 3;
+            // 0.5s, 1s, 2s — total worst-case wall time ~3.5s
+            // on top of per-attempt timeout. Picked low because a
+            // running event bus shouldn't queue events behind a
+            // single dead subscription for a minute+.
+            const BACKOFF_BASE_MS: u64 = 500;
+
             let signature = sign_body(sub.secret.as_deref(), &body);
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(5))
-                .build();
-            let mut req = agent.post(&sub.url)
-                .set("Content-Type", "application/json")
-                .set("X-Artifacts-Hook-Id", &sub.id)
-                .set("X-Artifacts-Event", &kind_str(&body));
-            if let Some(sig) = signature.as_deref() {
-                req = req.set("X-Artifacts-Signature", sig);
-            }
-            match req.send_bytes(&body) {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !(200..400).contains(&status) {
-                        tracing::warn!(
-                            hook = %sub.id, url = %sub.url, status,
-                            "webhook delivery non-2xx",
-                        );
+            let kind = kind_str(&body);
+            for attempt in 1..=MAX_ATTEMPTS {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build();
+                let mut req = agent
+                    .post(&sub.url)
+                    .set("Content-Type", "application/json")
+                    .set("X-Artifacts-Hook-Id", &sub.id)
+                    .set("X-Artifacts-Event", &kind)
+                    .set("X-Artifacts-Attempt", &attempt.to_string());
+                if let Some(sig) = signature.as_deref() {
+                    req = req.set("X-Artifacts-Signature", sig);
+                }
+                let outcome = match req.send_bytes(&body) {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if (200..400).contains(&status) {
+                            metrics::counter!(
+                                "artifacts_webhook_deliveries_total",
+                                "outcome" => "success",
+                            )
+                            .increment(1);
+                            return;
+                        }
+                        // Treat 5xx as retryable, 4xx as terminal —
+                        // the receiver is telling us the request is
+                        // wrong, retrying won't help. Mirrors what
+                        // most webhook frameworks do.
+                        if (500..600).contains(&status) {
+                            tracing::warn!(
+                                hook = %sub.id, url = %sub.url, status, attempt,
+                                "webhook 5xx; will retry"
+                            );
+                            "retry"
+                        } else {
+                            tracing::warn!(
+                                hook = %sub.id, url = %sub.url, status, attempt,
+                                "webhook 4xx; not retrying"
+                            );
+                            metrics::counter!(
+                                "artifacts_webhook_deliveries_total",
+                                "outcome" => "client_error",
+                            )
+                            .increment(1);
+                            return;
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        hook = %sub.id, url = %sub.url, error = %e,
-                        "webhook delivery failed",
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            hook = %sub.id, url = %sub.url, attempt, error = %e,
+                            "webhook delivery failed; will retry"
+                        );
+                        "retry"
+                    }
+                };
+
+                if attempt < MAX_ATTEMPTS && outcome == "retry" {
+                    let delay_ms = BACKOFF_BASE_MS * (1u64 << (attempt - 1));
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 }
             }
+            metrics::counter!(
+                "artifacts_webhook_deliveries_total",
+                "outcome" => "exhausted",
+            )
+            .increment(1);
+            tracing::warn!(
+                hook = %sub.id, url = %sub.url,
+                "webhook delivery gave up after {} attempts", MAX_ATTEMPTS,
+            );
         });
     }
 }
@@ -351,5 +534,91 @@ mod tests {
     #[test]
     fn kind_str_returns_unknown_on_garbage() {
         assert_eq!(kind_str(b"not json"), "unknown");
+    }
+
+    fn open_sqlite_registry() -> (tempfile::TempDir, SqliteWebhookRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let r = SqliteWebhookRegistry::open(&path).unwrap();
+        (dir, r)
+    }
+
+    #[test]
+    fn sqlite_add_then_list_round_trip() {
+        let (_d, r) = open_sqlite_registry();
+        let id = r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://example".into(),
+            secret: Some("s".into()),
+            events: vec!["commit".into()],
+        });
+        let listed = r.list("r1");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].secret.as_deref(), Some("s"));
+        assert_eq!(listed[0].events, vec!["commit".to_string()]);
+    }
+
+    #[test]
+    fn sqlite_remove_marks_revoked_and_drops_from_list() {
+        let (_d, r) = open_sqlite_registry();
+        let id = r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: None,
+            events: vec![],
+        });
+        assert!(r.remove("r1", &id));
+        assert!(r.list("r1").is_empty());
+        // Idempotent: a second remove finds no live row.
+        assert!(!r.remove("r1", &id));
+    }
+
+    #[test]
+    fn sqlite_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let id = {
+            let r = SqliteWebhookRegistry::open(&path).unwrap();
+            r.add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "u".into(),
+                secret: Some("k".into()),
+                events: vec![],
+            })
+        };
+        // Drop, reopen on the same path. Must see the row.
+        let r = SqliteWebhookRegistry::open(&path).unwrap();
+        let listed = r.list("r1");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].secret.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn sqlite_matching_filters_by_kind() {
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u-all".into(),
+            secret: None,
+            events: vec![],
+        });
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u-commit".into(),
+            secret: None,
+            events: vec!["commit".into()],
+        });
+        let m_commit = r.matching("r1", "commit");
+        assert_eq!(m_commit.len(), 2);
+        let m_fork = r.matching("r1", "fork");
+        assert_eq!(m_fork.len(), 1);
+        assert_eq!(m_fork[0].url, "u-all");
     }
 }

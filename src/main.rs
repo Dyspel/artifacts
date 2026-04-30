@@ -205,8 +205,33 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let event_bus = events::EventBus::new();
+            // Webhook subscription store: SQLite-backed if
+            // ARTIFACTS_WEBHOOK_DB is set (or implicitly when a
+            // webhooks.db file already exists in data_dir), in-memory
+            // otherwise. Both impls satisfy the same trait, so the
+            // dispatcher and REST endpoints don't care which is in
+            // play. Picking SQLite by default once the data_dir
+            // contains the file means an admin can flip persistence
+            // on by creating an empty webhooks.db; nice for
+            // upgrade-in-place without env-var ceremony.
+            let webhook_db_path = std::env::var("ARTIFACTS_WEBHOOK_DB")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    let p = data_dir.join("webhooks.db");
+                    p.exists().then_some(p)
+                });
             let webhook_registry: Arc<dyn webhooks::WebhookRegistry> =
-                Arc::new(webhooks::MemRegistry::new());
+                match webhook_db_path {
+                    Some(p) => {
+                        tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry");
+                        Arc::new(webhooks::SqliteWebhookRegistry::open(&p)?)
+                    }
+                    None => {
+                        tracing::info!("webhooks: in-memory registry (subscriptions lost on restart)");
+                        Arc::new(webhooks::MemRegistry::new())
+                    }
+                };
             // Spawn the webhook dispatcher *before* any handler can
             // publish, so the broadcast subscriber registers before
             // events start flying. Otherwise the first commit/fork on
