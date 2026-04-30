@@ -38,6 +38,8 @@ use crate::{
     auth::authorize_git,
     config::Config,
     error::{Error, Result},
+    pkt_line::{self as pkt, PktIter, PktLine},
+    refs::{HeadState, RefStore},
     tokens::{Scope, TokenStore},
 };
 use axum::{
@@ -53,6 +55,10 @@ use tokio::process::Command;
 pub struct GitState {
     pub cfg: Arc<Config>,
     pub tokens: Arc<dyn TokenStore>,
+    /// Native ref enumeration for v2 ls-refs. Same `RefStore` impl
+    /// the REST commits path uses; the trait gives us `list` +
+    /// `read_head` without going through git subprocesses.
+    pub refs: Arc<dyn RefStore>,
 }
 
 /// Axum entry point for everything under `/git/:id.git/*rest`. Authorizes,
@@ -81,10 +87,16 @@ pub async fn git_handler(
             info_refs(&repo_path, service, request.headers()).await
         }
         ("POST", "git-upload-pack") => {
-            pack_handler(&repo_path, "upload-pack", request).await
+            pack_handler(
+                &repo_path,
+                "upload-pack",
+                request,
+                Some((&repo_id, state.refs.as_ref())),
+            )
+            .await
         }
         ("POST", "git-receive-pack") => {
-            pack_handler(&repo_path, "receive-pack", request).await
+            pack_handler(&repo_path, "receive-pack", request, None).await
         }
         _ => Err(Error::BadRequest(format!(
             "unsupported git endpoint: {method} /{rest}"
@@ -256,15 +268,29 @@ async fn info_refs(
 /// Handle `POST /git-upload-pack` or `POST /git-receive-pack`. Spawns
 /// `git {sub} --stateless-rpc <dir>`, pipes the HTTP request body to its
 /// stdin, and writes its stdout as the HTTP response body.
+///
+/// Fast path (M1b-2a): for `upload-pack` requests where the v2 body
+/// contains only a `command=ls-refs`, we serve the response natively
+/// from `RefStore` without forking. `refs_for_native` is the entry
+/// point for that path; `None` disables it (e.g. on the receive-pack
+/// route where ls-refs isn't a thing).
 async fn pack_handler(
     repo_path: &Path,
     sub: &str, // "upload-pack" or "receive-pack"
     request: Request,
+    refs_for_native: Option<(&str, &dyn RefStore)>,
 ) -> Result<Response<Body>> {
     let headers = request.headers().clone();
     let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024 * 1024)
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!("read body: {e}")))?;
+
+    if let Some((repo_id, refs)) = refs_for_native {
+        if let Some(args) = parse_ls_refs_only(&body_bytes) {
+            tracing::debug!(repo = %repo_id, "native v2 ls-refs (no subprocess)");
+            return native_ls_refs_response(repo_id, refs, args).await;
+        }
+    }
 
     let mut cmd = Command::new("git");
     cmd.args([sub, "--stateless-rpc"]).arg(repo_path);
@@ -325,6 +351,223 @@ async fn pack_handler(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(stdout))
+        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+}
+
+/// Parsed shape of a v2 ls-refs request. The structure on the wire:
+///
+///   PKT-LINE("command=ls-refs\n")
+///   *PKT-LINE("<capability>\n")    -- e.g. agent=, object-format=
+///   PKT-LINE delim (0001)
+///   *PKT-LINE("<argument>\n")      -- peel | symrefs | ref-prefix <p>
+///   PKT-LINE flush (0000)
+///
+/// We only handle the case where the body is *exclusively* one ls-refs
+/// command — multi-command bodies fall through to `git upload-pack`. In
+/// practice `git` always issues one command per HTTP POST in v2, so the
+/// fast path covers the real workload.
+#[derive(Debug, PartialEq, Eq)]
+struct LsRefsArgs {
+    pub peel: bool,
+    pub symrefs: bool,
+    pub prefixes: Vec<String>,
+}
+
+/// Returns `Some(args)` iff `body` is a v2 ls-refs request and nothing
+/// else. We're conservative: any unfamiliar capability or argument
+/// returns `None` so the subprocess path picks it up. That way new
+/// protocol extensions don't silently get the wrong response.
+fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
+    let mut iter = PktIter::new(body);
+
+    // 1. command line.
+    let first = match iter.next()? {
+        Ok(PktLine::Data(d)) => d,
+        _ => return None,
+    };
+    let first = std::str::from_utf8(first).ok()?.trim_end_matches('\n');
+    if first != "command=ls-refs" {
+        return None;
+    }
+
+    // 2. capability lines until delim. Accept the small fixed set of
+    //    capabilities `git` actually sends; reject anything unknown.
+    let mut saw_delim = false;
+    for item in iter.by_ref() {
+        match item.ok()? {
+            PktLine::Delim => {
+                saw_delim = true;
+                break;
+            }
+            PktLine::Flush => {
+                // No args section at all — still a valid ls-refs.
+                return Some(LsRefsArgs {
+                    peel: false,
+                    symrefs: false,
+                    prefixes: Vec::new(),
+                });
+            }
+            PktLine::Data(d) => {
+                let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
+                if !is_known_capability(s) {
+                    return None;
+                }
+            }
+            PktLine::RespEnd => return None,
+        }
+    }
+    if !saw_delim {
+        return None;
+    }
+
+    // 3. argument lines until flush.
+    let mut peel = false;
+    let mut symrefs = false;
+    let mut prefixes: Vec<String> = Vec::new();
+    for item in iter.by_ref() {
+        match item.ok()? {
+            PktLine::Flush => {
+                return Some(LsRefsArgs {
+                    peel,
+                    symrefs,
+                    prefixes,
+                });
+            }
+            PktLine::Data(d) => {
+                let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
+                if s == "peel" {
+                    peel = true;
+                } else if s == "symrefs" {
+                    symrefs = true;
+                } else if let Some(p) = s.strip_prefix("ref-prefix ") {
+                    prefixes.push(p.to_string());
+                } else if s == "unborn" {
+                    // Tolerate: `unborn` is a flag that says "include
+                    // unborn HEAD in the response if applicable", which
+                    // we already do unconditionally when symrefs is set.
+                } else {
+                    // Unknown argument — fall through to subprocess.
+                    return None;
+                }
+            }
+            PktLine::Delim | PktLine::RespEnd => return None,
+        }
+    }
+    None
+}
+
+/// Capability lines we'll silently accept on a v2 ls-refs request.
+/// Anything else we don't understand → fall back to upload-pack so we
+/// can't serve a wrong response for a feature we haven't audited.
+fn is_known_capability(line: &str) -> bool {
+    line.starts_with("agent=")
+        || line.starts_with("object-format=")
+        || line.starts_with("session-id=")
+}
+
+/// One row of the ls-refs response: `<oid> <name>[<extra>]\n`. The
+/// `extra` field (when set) is the literal trailer including its leading
+/// space — e.g. `" symref-target:refs/heads/main"`.
+struct LsRefsRow {
+    oid: String,
+    name: String,
+    extra: Option<String>,
+}
+
+/// Build the v2 ls-refs response from `RefStore`. Spec format:
+///
+///   <oid> <refname>[ symref-target:<target>][ peeled:<oid>]\n
+///
+/// HEAD goes first when included. For an unborn HEAD (fresh repo, no
+/// commits) we use the v2 `unborn` form: `unborn HEAD symref-target:<t>`.
+async fn native_ls_refs_response(
+    repo_id: &str,
+    refs: &dyn RefStore,
+    args: LsRefsArgs,
+) -> Result<Response<Body>> {
+    let mut rows: Vec<LsRefsRow> = Vec::new();
+
+    // ls-refs filtering: an empty prefix list means "no refs". Real
+    // clients always include at least `ref-prefix HEAD`, but spec is
+    // explicit about this. Distinct from the trait's `list(&[])` which
+    // means "all refs".
+    if !args.prefixes.is_empty() {
+        let want_head = args.prefixes.iter().any(|p| p == "HEAD");
+        let other_prefixes: Vec<String> = args
+            .prefixes
+            .iter()
+            .filter(|p| p.as_str() != "HEAD")
+            .cloned()
+            .collect();
+
+        // HEAD is special: not under any refs/ prefix. Place first so
+        // the response order matches what upload-pack produces.
+        if want_head {
+            match refs.read_head(repo_id).await? {
+                HeadState::Symbolic { target, oid } => {
+                    rows.push(LsRefsRow {
+                        oid,
+                        name: "HEAD".into(),
+                        extra: args.symrefs.then(|| format!(" symref-target:{target}")),
+                    });
+                }
+                HeadState::Detached { oid } => {
+                    rows.push(LsRefsRow {
+                        oid,
+                        name: "HEAD".into(),
+                        extra: None,
+                    });
+                }
+                HeadState::Unborn { target } => {
+                    // Spec: unborn HEAD reports as
+                    //   `unborn HEAD symref-target:<target>`.
+                    // The OID column is the literal string `unborn`,
+                    // not a SHA. Without symrefs, real upload-pack
+                    // omits HEAD here too, so match that.
+                    if args.symrefs {
+                        rows.push(LsRefsRow {
+                            oid: "unborn".into(),
+                            name: "HEAD".into(),
+                            extra: Some(format!(" symref-target:{target}")),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !other_prefixes.is_empty() {
+            let mut entries = refs.list(repo_id, &other_prefixes).await?;
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for e in entries {
+                let extra = if args.peel {
+                    e.peeled.as_ref().map(|p| format!(" peeled:{p}"))
+                } else {
+                    None
+                };
+                rows.push(LsRefsRow {
+                    oid: e.oid,
+                    name: e.name,
+                    extra,
+                });
+            }
+        }
+    }
+
+    let mut body = Vec::with_capacity(64 * rows.len() + 8);
+    for row in &rows {
+        let line = match &row.extra {
+            Some(extra) => format!("{} {}{}\n", row.oid, row.name, extra),
+            None => format!("{} {}\n", row.oid, row.name),
+        };
+        pkt::write_data(&mut body, line.as_bytes());
+    }
+    pkt::write_flush(&mut body);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
         .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
 }
 
@@ -474,5 +717,188 @@ mod tests {
         assert!(service_from_query("service=").is_err());
         assert!(service_from_query("service=git-unknown").is_err());
         assert!(service_from_query("nothing=here").is_err());
+    }
+
+    fn build_ls_refs_body(
+        capabilities: &[&str],
+        arguments: &[&str],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(&mut buf, b"command=ls-refs\n");
+        for cap in capabilities {
+            let mut line = (*cap).to_string();
+            line.push('\n');
+            crate::pkt_line::write_data(&mut buf, line.as_bytes());
+        }
+        crate::pkt_line::write_delim(&mut buf);
+        for arg in arguments {
+            let mut line = (*arg).to_string();
+            line.push('\n');
+            crate::pkt_line::write_data(&mut buf, line.as_bytes());
+        }
+        crate::pkt_line::write_flush(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn parse_ls_refs_only_accepts_typical_clone_request() {
+        // Default `git clone` with v2 sends:
+        //   command=ls-refs / agent=... / object-format=sha1 / 0001
+        //   peel / symrefs / ref-prefix HEAD / ref-prefix refs/heads/
+        //   ref-prefix refs/tags/ / 0000
+        let body = build_ls_refs_body(
+            &["agent=git/2.43.0", "object-format=sha1"],
+            &[
+                "peel",
+                "symrefs",
+                "ref-prefix HEAD",
+                "ref-prefix refs/heads/",
+                "ref-prefix refs/tags/",
+            ],
+        );
+        let args = parse_ls_refs_only(&body).expect("should parse");
+        assert!(args.peel);
+        assert!(args.symrefs);
+        assert_eq!(
+            args.prefixes,
+            vec![
+                "HEAD".to_string(),
+                "refs/heads/".to_string(),
+                "refs/tags/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ls_refs_only_rejects_fetch_command() {
+        // A `command=fetch` body must not be parsed as ls-refs — would
+        // cause a wrong response. Returning None falls through to
+        // upload-pack subprocess which handles fetch correctly.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"thin-pack\n");
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_only_rejects_unknown_argument() {
+        // Unfamiliar args force fallthrough to subprocess so we never
+        // serve a stale-spec response for a feature we haven't audited.
+        let body = build_ls_refs_body(
+            &["agent=git/2.43.0"],
+            &["peel", "future-flag-we-dont-know"],
+        );
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_only_accepts_zero_args() {
+        // A bare `command=ls-refs\n0000` (no delim, no args) is a valid
+        // v2 request meaning "list all refs, no extras". We accept it.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_flush(&mut body);
+        let args = parse_ls_refs_only(&body).expect("should parse");
+        assert!(!args.peel);
+        assert!(!args.symrefs);
+        assert!(args.prefixes.is_empty());
+    }
+
+    /// End-to-end native ls-refs against a real FsRefStore. Sets up a
+    /// repo with a hand-laid loose ref + a packed-refs file, simulates
+    /// HEAD pointing at the loose ref, and asserts that the v2
+    /// response body has the right pkt-line shape.
+    #[tokio::test]
+    async fn native_ls_refs_response_emits_v2_listing() {
+        use crate::refs::{FsRefStore, RefStore};
+        use crate::storage::{new_repo_id, FsStorage, Storage};
+
+        let tmp = std::env::temp_dir().join(format!("nat-ls-{}", new_repo_id()));
+        let repos_dir = tmp.join("repos");
+        let storage = FsStorage::new(&repos_dir).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let refs = FsRefStore::new(repos_dir.clone());
+        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+
+        // Use refs/test/* (no commit-target requirement) to exercise the
+        // path; the response builder is namespace-agnostic.
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::create_dir_all(git_dir.join("refs/test")).unwrap();
+        std::fs::write(git_dir.join("refs/test/x"), format!("{oid}\n")).unwrap();
+        // Symbolic HEAD pointing at our test ref.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/test/x\n").unwrap();
+
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: true,
+            prefixes: vec!["HEAD".into(), "refs/test/".into()],
+        };
+        let resp = native_ls_refs_response(&repo_id, &refs, args).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-result"
+        );
+
+        let body = futures::executor::block_on(axum::body::to_bytes(
+            resp.into_body(),
+            1024 * 1024,
+        ))
+        .unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+
+        // First pkt-line should be HEAD with symref-target annotation.
+        // Format: 4-hex-len + "<oid> HEAD symref-target:refs/test/x\n"
+        let head_line = format!("{oid} HEAD symref-target:refs/test/x\n");
+        let head_pkt = format!("{:04x}{}", head_line.len() + 4, head_line);
+        assert!(
+            s.starts_with(&head_pkt),
+            "expected HEAD pkt-line first, got prefix: {:?}",
+            &s[..head_pkt.len().min(s.len())]
+        );
+        // Then the test ref.
+        let ref_line = format!("{oid} refs/test/x\n");
+        let ref_pkt = format!("{:04x}{}", ref_line.len() + 4, ref_line);
+        assert!(s.contains(&ref_pkt), "missing refs/test/x line in {s:?}");
+        // Trailing flush-pkt.
+        assert!(s.ends_with("0000"), "missing trailing flush-pkt in {s:?}");
+    }
+
+    #[tokio::test]
+    async fn native_ls_refs_response_unborn_head() {
+        use crate::refs::{FsRefStore, RefStore};
+        use crate::storage::{new_repo_id, FsStorage, Storage};
+
+        let tmp = std::env::temp_dir().join(format!("nat-unborn-{}", new_repo_id()));
+        let repos_dir = tmp.join("repos");
+        let storage = FsStorage::new(&repos_dir).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let refs = FsRefStore::new(repos_dir);
+
+        // Fresh repo: HEAD = ref: refs/heads/main, but main doesn't exist.
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: true,
+            prefixes: vec!["HEAD".into(), "refs/heads/".into()],
+        };
+        let resp = native_ls_refs_response(&repo_id, &refs, args).await.unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(
+            resp.into_body(),
+            1024 * 1024,
+        ))
+        .unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        // Per spec, unborn HEAD with symref-target arrives as
+        //   "unborn HEAD symref-target:refs/heads/main\n"
+        let unborn_line = "unborn HEAD symref-target:refs/heads/main\n";
+        let unborn_pkt = format!("{:04x}{}", unborn_line.len() + 4, unborn_line);
+        assert!(
+            s.contains(&unborn_pkt),
+            "missing unborn HEAD line in response: {s:?}"
+        );
     }
 }

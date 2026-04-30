@@ -8,6 +8,7 @@ mod jwt;
 mod merge;
 mod metrics;
 mod ownership;
+mod pkt_line;
 mod rate_limit;
 mod reads;
 mod refs;
@@ -205,12 +206,16 @@ async fn main() -> anyhow::Result<()> {
                 storage,
                 tokens: tokens.clone(),
                 ownership,
-                refs,
+                refs: refs.clone(),
                 rate_limit,
                 events: events::EventBus::new(),
                 alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
             };
-            let git_state = GitState { cfg: cfg.clone(), tokens };
+            let git_state = GitState {
+                cfg: cfg.clone(),
+                tokens,
+                refs,
+            };
 
             let rest_router = Router::new()
                 .route("/v1/health", get(rest::health))
