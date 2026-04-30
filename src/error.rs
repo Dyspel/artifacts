@@ -46,6 +46,16 @@ pub enum Error {
         conflict_paths: Vec<String>,
     },
 
+    #[error("repo {repo_id} has {} dependent fork{}", forks.len(), if forks.len() == 1 { "" } else { "s" })]
+    ForkDependency {
+        /// The repo that was the target of the delete.
+        repo_id: String,
+        /// IDs of repos whose alternates source is `repo_id`. Deleting
+        /// `repo_id` would orphan their object storage, so the delete
+        /// is refused unless the caller passes `?force=true`.
+        forks: Vec<String>,
+    },
+
     #[error("repo quota exceeded for {subject} (limit: {limit})")]
     QuotaExceeded { subject: String, limit: u64 },
 
@@ -129,6 +139,25 @@ impl IntoResponse for Error {
                         "branch": branch,
                         "expected": expected,
                         "current": current,
+                    }
+                }));
+                return (StatusCode::CONFLICT, body).into_response();
+            }
+            Error::ForkDependency { repo_id, forks } => {
+                // 409 with the dependent fork ids so callers can decide
+                // whether to delete those first or re-issue with
+                // ?force=true. Mirrors the shape of MergeConflict /
+                // RefConflict — explicit code + structured payload.
+                let body = Json(json!({
+                    "error": {
+                        "code": "fork_dependency",
+                        "message": format!(
+                            "repo {repo_id} has {} dependent fork{}",
+                            forks.len(),
+                            if forks.len() == 1 { "" } else { "s" },
+                        ),
+                        "repoId": repo_id,
+                        "forks": forks,
                     }
                 }));
                 return (StatusCode::CONFLICT, body).into_response();

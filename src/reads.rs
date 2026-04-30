@@ -823,12 +823,16 @@ async fn count_commits_from_head(git_dir: &Path) -> Result<u64> {
 /// Uses the alternates cache so that repeat calls (e.g. the Detail tab
 /// polled by the GUI) only pay the full resolve cost on files that
 /// actually changed since the last call.
-fn count_forks_of(
+/// IDs of every repo whose alternates source is `repo_id`. Used by
+/// the delete-safety check in rest.rs (refuse to delete a repo that
+/// other forks depend on, unless `?force=true`) and as the count
+/// path's source-of-truth so the two answers can't drift.
+pub(crate) fn list_forks_of(
     repos_dir: &Path,
     repo_id: &str,
     cache: &crate::alternates_cache::AlternatesCache,
-) -> std::io::Result<u64> {
-    let mut n = 0u64;
+) -> std::io::Result<Vec<String>> {
+    let mut out = Vec::new();
     for entry in std::fs::read_dir(repos_dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -845,9 +849,18 @@ fn count_forks_of(
         }
         if let Some(parent) = cache.lookup(repos_dir, sibling_id) {
             if parent == repo_id {
-                n += 1;
+                out.push(sibling_id.to_string());
             }
         }
     }
-    Ok(n)
+    Ok(out)
 }
+
+fn count_forks_of(
+    repos_dir: &Path,
+    repo_id: &str,
+    cache: &crate::alternates_cache::AlternatesCache,
+) -> std::io::Result<u64> {
+    Ok(list_forks_of(repos_dir, repo_id, cache)?.len() as u64)
+}
+

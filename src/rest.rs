@@ -467,10 +467,23 @@ pub async fn rotate_tokens(
     }))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct DeleteRepoQuery {
+    /// Override the alternates-dependency safety check. Without this,
+    /// deleting a repo that other forks depend on returns 409. With
+    /// `force=true` the delete proceeds — forks are left with broken
+    /// alternates pointers, which is sometimes what an admin wants
+    /// (e.g. cleaning up after an experiment) but should never be the
+    /// default. Logged as WARN whenever it fires.
+    pub force: Option<bool>,
+}
+
 /// DELETE /v1/repos/:id
 pub async fn delete_repo(
     State(state): State<RestState>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteRepoQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     let principal = authorize_rest(
@@ -480,6 +493,31 @@ pub async fn delete_repo(
     )?;
     state.rate_limit.check(&principal, Class::Default)?;
     enforce_owner(&*state.ownership, &principal, &id).await?;
+
+    // Refuse to delete a repo other forks depend on via alternates.
+    // The fork count is small (one stat() per repo) so no need to
+    // gate behind a flag — every delete pays the cost.
+    let forks = crate::reads::list_forks_of(
+        &state.cfg.repos_dir(),
+        &id,
+        &state.alternates_cache,
+    )?;
+    if !forks.is_empty() {
+        if q.force.unwrap_or(false) {
+            tracing::warn!(
+                repo = %id,
+                fork_count = forks.len(),
+                forks = ?forks,
+                "delete with force=true; forks will be orphaned",
+            );
+        } else {
+            return Err(Error::ForkDependency {
+                repo_id: id,
+                forks,
+            });
+        }
+    }
+
     state.storage.delete(&id)?;
     state.ownership.delete(&id).await?;
     // Drop the cached source_id entry so the repo_id isn't stuck as
