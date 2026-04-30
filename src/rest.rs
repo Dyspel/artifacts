@@ -476,7 +476,16 @@ pub struct DeleteRepoQuery {
     /// alternates pointers, which is sometimes what an admin wants
     /// (e.g. cleaning up after an experiment) but should never be the
     /// default. Logged as WARN whenever it fires.
+    ///
+    /// Mutually exclusive with `cascade=true`. Force is the
+    /// structured override ("yes I know I'm orphaning forks"); cascade
+    /// is the structured cleanup ("delete me and every dependent").
     pub force: Option<bool>,
+    /// Delete this repo *and* every transitive fork of it. Walks the
+    /// dependent network deepest-first so no repo is briefly orphaned
+    /// mid-cascade. Mutually exclusive with `force=true`. Returns
+    /// the list of all deleted IDs in the response body.
+    pub cascade: Option<bool>,
 }
 
 /// DELETE /v1/repos/:id
@@ -494,6 +503,52 @@ pub async fn delete_repo(
     state.rate_limit.check(&principal, Class::Default)?;
     enforce_owner(&*state.ownership, &principal, &id).await?;
 
+    let force = q.force.unwrap_or(false);
+    let cascade = q.cascade.unwrap_or(false);
+    if force && cascade {
+        return Err(Error::BadRequest(
+            "force and cascade are mutually exclusive — pick one".to_string(),
+        ));
+    }
+
+    if cascade {
+        // BFS the dependent network so we know every repo that has
+        // to go. Then delete deepest-first: child before parent,
+        // so no repo is briefly orphaned with a dangling alternates
+        // pointer mid-cascade.
+        let order = cascade_delete_order(
+            &state.cfg.repos_dir(),
+            &id,
+            &state.alternates_cache,
+        )?;
+        // Re-check ownership for every dependent before we touch
+        // anything. enforce_owner on the root passed; without this
+        // the cascade could let a user delete repos they don't
+        // own just because a fork chain happens to pass through
+        // their repo. Admin bypasses (Principal::Admin's
+        // enforce_owner is a no-op).
+        for dep in &order {
+            if dep != &id {
+                enforce_owner(&*state.ownership, &principal, dep).await?;
+            }
+        }
+        let mut deleted = Vec::with_capacity(order.len());
+        for dep in &order {
+            state.storage.delete(dep)?;
+            state.ownership.delete(dep).await?;
+            state.alternates_cache.invalidate(dep);
+            deleted.push(dep.clone());
+        }
+        tracing::info!(
+            repo = %id, count = deleted.len(),
+            "cascade delete: removed repo + dependent forks",
+        );
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+        })));
+    }
+
     // Refuse to delete a repo other forks depend on via alternates.
     // The fork count is small (one stat() per repo) so no need to
     // gate behind a flag — every delete pays the cost.
@@ -503,7 +558,7 @@ pub async fn delete_repo(
         &state.alternates_cache,
     )?;
     if !forks.is_empty() {
-        if q.force.unwrap_or(false) {
+        if force {
             tracing::warn!(
                 repo = %id,
                 fork_count = forks.len(),
@@ -524,6 +579,44 @@ pub async fn delete_repo(
     // a stale hit if a future repo ever reuses the same id.
     state.alternates_cache.invalidate(&id);
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// BFS the dependent-fork tree rooted at `id` and return the
+/// deletion order: dependents before dependencies. Iterative impl
+/// (no recursion) so a deeply chained fork tree can't blow the
+/// stack. Linear in the size of the dependent set — typically tiny.
+fn cascade_delete_order(
+    repos_dir: &std::path::Path,
+    id: &str,
+    cache: &crate::alternates_cache::AlternatesCache,
+) -> Result<Vec<String>> {
+    use std::collections::HashSet;
+    // Levels: the seed is at depth 0; its forks at depth 1; their
+    // forks at depth 2; etc. We delete from the deepest level back
+    // to depth 0, so a child never sees its parent disappear before
+    // it does.
+    let mut levels: Vec<Vec<String>> = vec![vec![id.to_string()]];
+    let mut seen: HashSet<String> = std::iter::once(id.to_string()).collect();
+    loop {
+        let last = levels.last().cloned().unwrap_or_default();
+        let mut next: Vec<String> = Vec::new();
+        for repo in &last {
+            for child in crate::reads::list_forks_of(repos_dir, repo, cache)? {
+                if seen.insert(child.clone()) {
+                    next.push(child);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        levels.push(next);
+    }
+    let mut out = Vec::with_capacity(seen.len());
+    for level in levels.into_iter().rev() {
+        out.extend(level);
+    }
+    Ok(out)
 }
 
 /// GET /v1/health
