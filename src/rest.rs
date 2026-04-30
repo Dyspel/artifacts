@@ -691,6 +691,34 @@ pub async fn admin_get_repo(
 }
 
 /// Helper: reject non-admin principals with 403.
+/// GET /v1/admin/repos/:id/gc-preview
+///
+/// Read-only reachability accounting for the analyzed repo's loose
+/// objects, alternates-aware. See `crate::gc` for the algorithm.
+/// Admin-only because it walks the alternates network and runs a
+/// `git rev-list` per member — not something a per-user JWT should
+/// be able to trigger on arbitrary other users' repos.
+pub async fn admin_gc_preview(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<crate::gc::GcPreview>> {
+    require_admin(&state, &headers)?;
+    state.rate_limit.check(
+        &crate::auth::Principal::Admin,
+        crate::rate_limit::Class::Default,
+    )?;
+    if !state.storage.exists(&id) {
+        return Err(Error::RepoNotFound(id));
+    }
+    let preview = crate::gc::preview(
+        &state.cfg.repos_dir(),
+        &id,
+        &state.alternates_cache,
+    )?;
+    Ok(Json(preview))
+}
+
 fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
     let principal = authorize_rest(
         headers,
