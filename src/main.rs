@@ -7,6 +7,7 @@ mod events;
 mod jwt;
 mod merge;
 mod metrics;
+mod native_pack;
 mod object_store;
 mod ownership;
 mod pkt_line;

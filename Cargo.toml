@@ -45,6 +45,23 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # evolving sub-crate version matrix; pulling individual gix-* crates
 # directly tends to break on every release.
 gix = "0.83"
+# gix-pack is gix's pack-format crate. Used directly (not via the
+# `gix` umbrella) because the umbrella doesn't re-export it. Pin to
+# the version `gix 0.83` brings in transitively so the types line
+# up with `repo.objects` (a gix_odb::Handle that implements
+# gix_pack::Find).
+gix-pack = "0.70"
+gix-features = "0.48"
+gix-hash = "0.25"
+gix-odb = "0.80"
+gix-object = "0.51"
+# sha1 is needed for the empty-pack trailer in native_pack.rs.
+sha1 = "0.10"
+# prodash::Discard is used as the no-op progress sink for
+# pack-generation routines that take a Count. Pinned to the version
+# gix-features 0.48 brings in transitively so the trait types unify
+# (gix-pack's iter_from_counts requires the same prodash types).
+prodash = { version = "31", default-features = false, features = ["progress-tree"] }
 
 # Webhook delivery over HTTP/HTTPS. ureq is the smallest sync HTTP
 # client we can plausibly take a dep on; we wrap it in spawn_blocking

@@ -660,7 +660,31 @@ async fn native_v2_fetch_response(
     repo_path: &Path,
     req: V2FetchRequest,
 ) -> Result<Response<Body>> {
-    let pack = generate_pack_via_pack_objects(repo_path, &req.wants, &req.haves).await?;
+    // M1b-2c: prefer the native gix-pack path. It uses no
+    // subprocess; just a commit walk + pack entry iteration in
+    // process. Wrap in spawn_blocking because the gix call is sync
+    // and we don't want to block a tokio worker on disk I/O.
+    let pack = {
+        let repo_path_buf = repo_path.to_path_buf();
+        let wants = req.wants.clone();
+        let haves = req.haves.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::native_pack::generate_pack(&repo_path_buf, &wants, &haves)
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("native_pack join: {e}")))?
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // Fall back to the pack-objects subprocess if the
+                // native path errors. This keeps behavior intact while
+                // the gix code matures — we'd rather a working clone
+                // via pack-objects than a 500.
+                tracing::warn!(error = %e, "native_pack failed; falling back to pack-objects");
+                generate_pack_via_pack_objects(repo_path, &req.wants, &req.haves).await?
+            }
+        }
+    };
 
     let mut body = Vec::with_capacity(pack.len() + 256);
     pkt::write_data(&mut body, b"packfile\n");
