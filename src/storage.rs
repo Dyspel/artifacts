@@ -86,24 +86,28 @@ impl Storage for FsStorage {
     }
 
     /// Initialize a new empty bare repo. Fails if the repo already exists.
+    ///
+    /// Writes the minimal bare-repo layout directly — no `git init`
+    /// subprocess. The previous impl shelled `git init --bare --quiet
+    /// --initial-branch=main`; that emitted a `description`,
+    /// `info/exclude`, and a directory of `hooks/*.sample` files we
+    /// don't use. Producing the layout in-process drops those
+    /// (smaller on-disk footprint, simpler to mirror in a non-FS
+    /// `Storage` impl) and removes the `git` binary requirement
+    /// from the create path. Same shape as `fork()` already writes
+    /// by hand for the same reasons.
     fn create(&self, id: &str) -> Result<()> {
         validate_repo_id(id)?;
         let path = self.repo_path(id);
         if path.exists() {
             return Err(Error::RepoExists(id.to_string()));
         }
-        std::fs::create_dir_all(&path)?;
-        let status = Command::new("git")
-            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
-            .arg(&path)
-            .status()?;
-        if !status.success() {
+        write_bare_repo_layout(&path).map_err(|e| {
+            // Best-effort cleanup so a partial init doesn't leave a
+            // stub dir that future creates would treat as RepoExists.
             let _ = std::fs::remove_dir_all(&path);
-            return Err(Error::Other(anyhow::anyhow!("git init failed")));
-        }
-        // Allow smart-HTTP backend to serve this repo without extra config.
-        write_config_flag(&path, "http.receivepack", "true")?;
-        write_config_flag(&path, "http.uploadpack", "true")?;
+            e
+        })?;
         Ok(())
     }
 
@@ -183,6 +187,47 @@ impl Storage for FsStorage {
     }
 }
 
+/// Materialize the minimum-viable bare git repo at `path`. Same
+/// shape `git init --bare --initial-branch=main` produces, minus
+/// the parts we don't use (description, info/exclude, hooks/*.sample).
+///
+/// Files written:
+///   * `HEAD`               — `ref: refs/heads/main`
+///   * `config`             — bare-repo config + smart-HTTP flags
+///   * `refs/heads/`        — empty directory
+///   * `refs/tags/`         — empty directory
+///   * `objects/info/`      — empty directory (alternates may land here)
+///   * `objects/pack/`      — empty directory (incoming packs land here)
+///
+/// Public-in-crate so it's reusable: `fork()` continues to write its
+/// own customized variant (alternates, copied HEAD, packed-refs
+/// snapshot), but a future `MemStorage` or chunked-KV `Storage`
+/// impl can call this same helper conceptually — it documents what
+/// bare-repo state every backend has to satisfy.
+pub(crate) fn write_bare_repo_layout(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path.join("refs/heads"))?;
+    std::fs::create_dir_all(path.join("refs/tags"))?;
+    std::fs::create_dir_all(path.join("objects/info"))?;
+    std::fs::create_dir_all(path.join("objects/pack"))?;
+
+    // HEAD points at refs/heads/main, which doesn't yet exist —
+    // that's the v2 "unborn HEAD" state we already advertise via
+    // ls-refs's `unborn` capability. Same shape `git init
+    // --initial-branch=main` produces.
+    std::fs::write(path.join("HEAD"), "ref: refs/heads/main\n")?;
+
+    // config is the same minimal block fork() writes. Both the
+    // bare-repo flags and the smart-HTTP enablement are required
+    // for our smart-HTTP routes to serve this repo.
+    std::fs::write(
+        path.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\
+         [http]\n\treceivepack = true\n\tuploadpack = true\n",
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)] // retained as a fallback path; no longer called from create()
 fn write_config_flag(repo: &Path, key: &str, value: &str) -> Result<()> {
     let status = Command::new("git")
         .arg("--git-dir")
@@ -252,6 +297,51 @@ fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_writes_minimal_bare_repo_layout_recognised_by_git() {
+        // The new create() path doesn't shell `git init`; it lays
+        // out HEAD + config + refs/* + objects/* directly. This
+        // test confirms `git` itself accepts the result by running
+        // `git rev-parse --is-bare-repository` against it (returns
+        // "true\n" iff the layout is structurally valid).
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = new_repo_id();
+        storage.create(&id).unwrap();
+        let path = storage.repo_path(&id);
+
+        // Sanity: HEAD points at refs/heads/main, config has
+        // bare=true, the four directories exist.
+        let head = std::fs::read_to_string(path.join("HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
+        let config = std::fs::read_to_string(path.join("config")).unwrap();
+        assert!(config.contains("bare = true"), "config: {config:?}");
+        assert!(config.contains("uploadpack = true"));
+        assert!(config.contains("receivepack = true"));
+        assert!(path.join("refs/heads").is_dir());
+        assert!(path.join("refs/tags").is_dir());
+        assert!(path.join("objects/info").is_dir());
+        assert!(path.join("objects/pack").is_dir());
+
+        // The big claim: git accepts our layout as-is.
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&path)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "true",
+            "git didn't recognize our layout as bare"
+        );
+    }
 
     #[test]
     fn validate_repo_id_rules() {
