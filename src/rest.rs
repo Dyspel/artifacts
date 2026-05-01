@@ -119,6 +119,12 @@ pub async fn create_repo(
         .mint(&id, Scope::Write, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
+    tracing::info!(
+        target: "audit",
+        event = "repo.create",
+        actor = principal.audit_label(),
+        repo_id = %id,
+    );
     // Emit a status transition so subscribers pick up brand-new repos
     // without polling. "unknown → idle" matches the repo's initial
     // state in the Fleet UI's RepoStatus enum.
@@ -181,6 +187,14 @@ pub async fn fork_repo(
         .mint(&fork_id, scope, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
+    tracing::info!(
+        target: "audit",
+        event = "repo.fork",
+        actor = principal.audit_label(),
+        source_id = %source_id,
+        repo_id = %fork_id,
+        read_only,
+    );
     state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
@@ -231,6 +245,14 @@ pub async fn mint_token(
             .map(|now| now.as_secs() + d.as_secs())
             .unwrap_or(0)
     });
+    tracing::info!(
+        target: "audit",
+        event = "token.mint",
+        actor = principal.audit_label(),
+        repo_id = %id,
+        scope = ?body.scope,
+        ttl_seconds = ?body.ttl_seconds,
+    );
     Ok(Json(TokenMinted { token, remote, expires_at }))
 }
 
@@ -266,21 +288,38 @@ pub async fn revoke_token(
     )?;
     state.rate_limit.check(&principal, Class::Token)?;
 
+    // Resolve the token's bound repo for the audit log + the
+    // ownership check. Admins skip the ownership check but we
+    // still want the audit field populated; for a stale-or-fake
+    // token there's nothing to bind to so log "unknown".
+    let target_repo: Option<String> = state
+        .tokens
+        .lookup(&body.token)
+        .await
+        .ok()
+        .flatten()
+        .map(|rec| rec.repo_id.clone());
+
     if !matches!(principal, crate::auth::Principal::Admin) {
         // Look up the token's bound repo and require ownership. Any
         // failure to resolve the token (unknown / expired / already
         // revoked) is reported as a 403 rather than a 404, because the
         // alternative leaks "this token doesn't exist" to anyone with
         // a JWT — slight oracle for token-fishing.
-        let rec = state
-            .tokens
-            .lookup(&body.token)
-            .await?
+        let repo_id = target_repo
+            .as_deref()
             .ok_or(Error::Forbidden("not your token"))?;
-        enforce_owner(&*state.ownership, &principal, &rec.repo_id).await?;
+        enforce_owner(&*state.ownership, &principal, repo_id).await?;
     }
 
     let revoked = state.tokens.revoke(&body.token).await?;
+    tracing::info!(
+        target: "audit",
+        event = "token.revoke",
+        actor = principal.audit_label(),
+        repo_id = target_repo.as_deref().unwrap_or("unknown"),
+        revoked,
+    );
     Ok(Json(RevokeResponse { revoked }))
 }
 
@@ -460,6 +499,14 @@ pub async fn rotate_tokens(
         .mint(&id, scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
+    tracing::info!(
+        target: "audit",
+        event = "token.rotate",
+        actor = principal.audit_label(),
+        repo_id = %id,
+        revoked,
+        scope = ?scope,
+    );
     Ok(Json(RotateTokenResponse {
         revoked,
         token,
@@ -540,8 +587,13 @@ pub async fn delete_repo(
             deleted.push(dep.clone());
         }
         tracing::info!(
-            repo = %id, count = deleted.len(),
-            "cascade delete: removed repo + dependent forks",
+            target: "audit",
+            event = "repo.delete",
+            actor = principal.audit_label(),
+            repo_id = %id,
+            mode = "cascade",
+            count = deleted.len(),
+            deleted = ?deleted,
         );
         return Ok(Json(serde_json::json!({
             "ok": true,
@@ -578,6 +630,13 @@ pub async fn delete_repo(
     // Drop the cached source_id entry so the repo_id isn't stuck as
     // a stale hit if a future repo ever reuses the same id.
     state.alternates_cache.invalidate(&id);
+    tracing::info!(
+        target: "audit",
+        event = "repo.delete",
+        actor = principal.audit_label(),
+        repo_id = %id,
+        mode = if force { "force" } else { "default" },
+    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

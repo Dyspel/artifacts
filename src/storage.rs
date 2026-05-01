@@ -75,9 +75,65 @@ impl FsStorage {
     /// need a real directory (the CGI bridge, the commits plumbing) go
     /// through this or via `Config::repos_dir()` which gives the same
     /// answer.
+    ///
+    /// ## Defense in depth
+    ///
+    /// `validate_repo_id` already rejects every shape that could
+    /// produce a path-escape (slashes, dots, control chars), and every
+    /// production caller validates before reaching here. This function
+    /// is the second line of defense: if a future change loosens
+    /// `validate_repo_id` *without* updating us, the asserts here
+    /// catch the regression at the seam where it would actually do
+    /// harm. We `debug_assert` (panic in tests) and `tracing::error
+    /// + return-anyway` in release — better to surface the bug
+    /// loudly than to silently hand back a path that resolves
+    /// somewhere unexpected.
+    ///
+    /// Two checks:
+    ///   1. The joined path strips cleanly off `self.root` — i.e.
+    ///      it's a strict descendant.
+    ///   2. Every component of the relative remainder is a `Normal`
+    ///      path component (rejecting `..`, leading `/`, prefix
+    ///      drives on Windows, etc).
     pub fn repo_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.git"))
+        let path = self.root.join(format!("{id}.git"));
+        if let Err(violation) = path_is_safe_descendant(&self.root, &path) {
+            // Catch in tests/dev. validate_repo_id contract was
+            // violated — fix the validator, not this assert.
+            debug_assert!(
+                false,
+                "FsStorage::repo_path produced unsafe path for id {id:?}: {violation}",
+            );
+            tracing::error!(
+                id = %id, root = %self.root.display(), joined = %path.display(),
+                violation,
+                "FsStorage::repo_path: path escapes root (validate_repo_id contract violated)",
+            );
+        }
+        path
     }
+}
+
+/// Confirm that `joined` is a strict descendant of `root`, with
+/// every relative component being a `Normal` path piece (no `..`,
+/// no absolute-path roots, no prefix drives). Returns `Err(reason)`
+/// describing the violation; reason text is short enough to plumb
+/// into a tracing field.
+fn path_is_safe_descendant(root: &Path, joined: &Path) -> std::result::Result<(), &'static str> {
+    let rel = match joined.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => return Err("strip_prefix(root) failed"),
+    };
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(_) => continue,
+            std::path::Component::ParentDir => return Err("ParentDir component"),
+            std::path::Component::RootDir => return Err("RootDir component"),
+            std::path::Component::Prefix(_) => return Err("Prefix component"),
+            std::path::Component::CurDir => return Err("CurDir component"),
+        }
+    }
+    Ok(())
 }
 
 impl Storage for FsStorage {
@@ -341,6 +397,51 @@ mod tests {
             "true",
             "git didn't recognize our layout as bare"
         );
+    }
+
+    #[test]
+    fn path_is_safe_descendant_accepts_normal_repo_path() {
+        let root = std::path::PathBuf::from("/data/repos");
+        let joined = root.join("abc-123.git");
+        assert!(path_is_safe_descendant(&root, &joined).is_ok());
+    }
+
+    #[test]
+    fn path_is_safe_descendant_rejects_parent_dir_traversal() {
+        // If validate_repo_id ever let `../etc` through, the joined
+        // path would normalise to /etc.git — outside root. We
+        // detect the ParentDir component.
+        let root = std::path::PathBuf::from("/data/repos");
+        let joined = root.join("../etc.git");
+        let err = path_is_safe_descendant(&root, &joined).unwrap_err();
+        assert_eq!(err, "ParentDir component");
+    }
+
+    #[test]
+    fn path_is_safe_descendant_rejects_absolute_id() {
+        // An id like `/etc/passwd` would have joined produce just
+        // `/etc/passwd.git` (Path::join replaces with absolute).
+        // strip_prefix(root) fails — we surface that.
+        let root = std::path::PathBuf::from("/data/repos");
+        let joined = root.join("/etc/passwd.git");
+        let err = path_is_safe_descendant(&root, &joined).unwrap_err();
+        assert_eq!(err, "strip_prefix(root) failed");
+    }
+
+    #[test]
+    #[should_panic(expected = "produced unsafe path")]
+    fn repo_path_panics_in_debug_when_id_breaks_the_contract() {
+        // We never actually reach this from production callers
+        // because validate_repo_id rejects "../foo" upstream. This
+        // test pretends a future change loosened the validator and
+        // shows that repo_path catches the regression instead of
+        // silently emitting a unsafe path. debug_assert means
+        // panic in `cargo test` (this test); release builds log
+        // and return the unsafe path (so legitimate-but-misvalidated
+        // ids don't crash the server, while the bug is loud in the
+        // logs).
+        let storage = FsStorage::new(tempdir().join("repos")).unwrap();
+        let _ = storage.repo_path("../etc");
     }
 
     #[test]

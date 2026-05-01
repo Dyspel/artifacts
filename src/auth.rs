@@ -60,6 +60,19 @@ impl Principal {
             Principal::User { subject } => Some(subject),
         }
     }
+
+    /// Stable label suitable for an audit-log `actor=…` field.
+    /// Always emits something usable: the literal `"admin"` for
+    /// the bootstrap principal, the JWT subject for users. Never
+    /// returns the bytes of an actual token (we never have one
+    /// in hand at this layer — by the time `Principal` exists
+    /// the secret has already been consumed by `authorize_rest`).
+    pub fn audit_label(&self) -> &str {
+        match self {
+            Principal::Admin => "admin",
+            Principal::User { subject } => subject,
+        }
+    }
 }
 
 /// Extract and decode an HTTP Basic token from request headers. Returns the

@@ -620,27 +620,48 @@ semantics here.
 
 ## Security in one paragraph
 
-Authentication is token-based. Per-repo tokens are minted by the admin
-(via `Authorization: Bearer <admin>`), presented by clients as HTTP
-Basic with username `x`, and stored as SHA-256 hashes in SQLite. The
-admin-token compare is constant-time (`subtle::ConstantTimeEq`) to
-prevent byte-at-a-time timing recovery. **That's the entire model.**
-What's *missing*:
+Authentication is token-based. Per-repo tokens are minted by the
+admin (via `Authorization: Bearer <admin>`) or by JWT users
+(`subject` recorded on the token row), presented by clients as HTTP
+Basic with username `x`, and stored as SHA-256 hashes in SQLite.
+Every Bearer compare is constant-time (`subtle::ConstantTimeEq`)
+to prevent byte-at-a-time timing recovery. Path-traversal has two
+lines of defense: `validate_repo_id` rejects slashes and dots at
+ingress, and `FsStorage::repo_path` re-checks every joined path's
+`Path::components()` so a future change to the validator can't
+silently produce a path that escapes the repos root. Every
+mutating endpoint (repo create / fork / delete, token mint /
+revoke / rotate) emits a structured `target: "audit"` tracing
+event with `actor`, `repo_id`, and action-specific fields — pipe
+that target to its own sink for an audit trail. Per-subject
+token-bucket rate limiting + per-user repo-count quotas are
+enforced on every non-admin request; admin bypasses both for
+break-glass purposes.
 
-- **TLS.** The server listens HTTP. Run a TLS terminator in front.
-- **Rate limiting.** None. The admin token can mint/delete unbounded.
-- **Account-level auth.** One shared admin token. No revocation of
-  the admin token except restarting the process with a new value.
-- **Token introspection / audit.** Tokens can be revoked but there's
-  no log of who revoked what when. No `GET /v1/tokens` listing.
-- **Path-traversal hardening.** `repo_id` validation rejects slashes
-  and path-escape characters; if a future change loosens the ruleset
-  without updating `FsStorage::repo_path`, traversal becomes
-  reachable. A `Path::components()` defensive check belongs on the
-  repo_path helper.
+What's *still* missing:
 
-A prototype for agents you trust talking to a backend you trust over
-an internal / TLS-terminated link. Not a public service.
+- **TLS.** The server listens HTTP. Run a TLS terminator in front
+  (nginx, Caddy, an in-cluster mesh sidecar) or `--bind` to a
+  loopback address only. Non-loopback HTTP without
+  `--allow-insecure` is refused at startup.
+- **Admin-token rotation in process.** The admin token is set at
+  startup (env var or auto-generated, printed to stderr) and
+  doesn't rotate without a restart. Per-repo tokens have a
+  `rotate` endpoint (`POST /v1/repos/:id/tokens/rotate`) but the
+  process-wide admin token does not. M4b-key-rotation tracks this.
+- **Webhook secrets at rest.** The HMAC-SHA256 secret for outbound
+  webhook deliveries is stored plaintext in the SQLite registry —
+  it has to be round-trippable so the dispatcher can sign every
+  body, and we don't have a KMS-backed alternative wired in. A
+  KMS swap is M6-deliver-secrets.
+- **Per-token revocation audit.** The audit-event stream records
+  every mint / revoke / rotate; we don't yet persist that event
+  stream in SQLite for after-the-fact admin querying. Pipe the
+  `audit` target to a structured sink (jsonl file, OTel collector)
+  if you need durable history.
+
+A prototype for agents you trust talking to a backend you trust
+over an internal / TLS-terminated link. Not a public service.
 
 ## Development
 
