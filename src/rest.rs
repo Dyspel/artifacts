@@ -52,6 +52,11 @@ pub struct RestState {
     /// Webhook subscriptions registry. In-memory `MemRegistry` today;
     /// SQLite-backed when subscriptions need to survive a restart.
     pub webhooks: Arc<dyn crate::webhooks::WebhookRegistry>,
+    /// Durable audit log. Mirrors the live `tracing!(target: "audit")`
+    /// stream into SQLite so admin tooling can query history after the
+    /// fact. Writes are best-effort — a SQLite hiccup logs a warning
+    /// but never fails the underlying mutation.
+    pub audit: Arc<dyn crate::audit::AuditStore>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -125,6 +130,15 @@ pub async fn create_repo(
         actor = principal.audit_label(),
         repo_id = %id,
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "repo.create",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({}),
+        None,
+    )
+    .await;
     // Emit a status transition so subscribers pick up brand-new repos
     // without polling. "unknown → idle" matches the repo's initial
     // state in the Fleet UI's RepoStatus enum.
@@ -187,6 +201,15 @@ pub async fn fork_repo(
         .mint(&fork_id, scope, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
+    crate::audit::record_silent(
+        &*state.audit,
+        "repo.fork",
+        principal.audit_label(),
+        Some(&fork_id),
+        serde_json::json!({ "source_id": source_id, "read_only": read_only }),
+        None,
+    )
+    .await;
     tracing::info!(
         target: "audit",
         event = "repo.fork",
@@ -253,6 +276,18 @@ pub async fn mint_token(
         scope = ?body.scope,
         ttl_seconds = ?body.ttl_seconds,
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "token.mint",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({
+            "scope": format!("{:?}", body.scope),
+            "ttl_seconds": body.ttl_seconds,
+        }),
+        None,
+    )
+    .await;
     Ok(Json(TokenMinted { token, remote, expires_at }))
 }
 
@@ -320,6 +355,15 @@ pub async fn revoke_token(
         repo_id = target_repo.as_deref().unwrap_or("unknown"),
         revoked,
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "token.revoke",
+        principal.audit_label(),
+        target_repo.as_deref(),
+        serde_json::json!({ "revoked": revoked }),
+        None,
+    )
+    .await;
     Ok(Json(RevokeResponse { revoked }))
 }
 
@@ -507,6 +551,18 @@ pub async fn rotate_tokens(
         revoked,
         scope = ?scope,
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "token.rotate",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({
+            "revoked": revoked,
+            "scope": format!("{:?}", scope),
+        }),
+        None,
+    )
+    .await;
     Ok(Json(RotateTokenResponse {
         revoked,
         token,
@@ -586,6 +642,19 @@ pub async fn delete_repo(
             state.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
         }
+        crate::audit::record_silent(
+            &*state.audit,
+            "repo.delete",
+            principal.audit_label(),
+            Some(&id),
+            serde_json::json!({
+                "mode": "cascade",
+                "count": deleted.len(),
+                "deleted": deleted,
+            }),
+            None,
+        )
+        .await;
         tracing::info!(
             target: "audit",
             event = "repo.delete",
@@ -630,13 +699,23 @@ pub async fn delete_repo(
     // Drop the cached source_id entry so the repo_id isn't stuck as
     // a stale hit if a future repo ever reuses the same id.
     state.alternates_cache.invalidate(&id);
+    let mode = if force { "force" } else { "default" };
     tracing::info!(
         target: "audit",
         event = "repo.delete",
         actor = principal.audit_label(),
         repo_id = %id,
-        mode = if force { "force" } else { "default" },
+        mode,
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "repo.delete",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({ "mode": mode }),
+        None,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -947,7 +1026,64 @@ pub async fn admin_rotate_token(
         event = "admin.token.rotate",
         actor = "admin",
     );
+    crate::audit::record_silent(
+        &*state.audit,
+        "admin.token.rotate",
+        "admin",
+        None,
+        serde_json::json!({}),
+        None,
+    )
+    .await;
     Ok(Json(AdminTokenRotateResponse { token: new }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct AdminAuditQuery {
+    /// Unix epoch seconds. Lower bound (inclusive).
+    pub since: Option<i64>,
+    /// Unix epoch seconds. Upper bound (inclusive).
+    pub until: Option<i64>,
+    /// Filter by event kind, e.g. `repo.create`, `token.mint`.
+    pub event: Option<String>,
+    /// Filter by actor — `admin` or a JWT subject.
+    pub actor: Option<String>,
+    /// Filter by repo id — only events scoped to a single repo
+    /// (admin.token.rotate has no repo and won't match).
+    #[serde(rename = "repoId")]
+    pub repo_id: Option<String>,
+    /// Page size. Server-capped at 1000.
+    pub limit: Option<u32>,
+}
+
+/// `GET /v1/admin/audit`
+///
+/// Returns the persisted audit log, filtered by query params.
+/// Newest-first ordering. Admin-only — JWT principals get 403.
+///
+/// Filters compose with AND. Default page size is 100, hard-capped
+/// at 1000. Events past the cap require pagination via `until` —
+/// take the oldest `ts` from the previous page and pass it as
+/// `until` on the next request.
+pub async fn admin_list_audit(
+    State(state): State<RestState>,
+    axum::extract::Query(q): axum::extract::Query<AdminAuditQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::audit::AuditEvent>>> {
+    require_admin(&state, &headers)?;
+    let rows = state
+        .audit
+        .list(crate::audit::AuditQuery {
+            since_ts: q.since,
+            until_ts: q.until,
+            event: q.event,
+            actor: q.actor,
+            repo_id: q.repo_id,
+            limit: q.limit,
+        })
+        .await?;
+    Ok(Json(rows))
 }
 
 fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {

@@ -194,6 +194,14 @@ async fn main() -> anyhow::Result<()> {
             // contention on the hot path.
             let ownership: Arc<dyn OwnershipStore> =
                 Arc::new(SqliteOwnershipStore::open(&token_db_path)?);
+            // Audit log lives in its own DB so it can be archived /
+            // rotated independently of the token store. Same WAL-mode
+            // SQLite shape; the writer is best-effort (a SQLite
+            // hiccup logs but doesn't fail the underlying mutation).
+            let audit_db_path = data_dir.join("audit.db");
+            tracing::info!(path = %audit_db_path.display(), "opening audit db");
+            let audit: Arc<dyn audit::AuditStore> =
+                Arc::new(audit::SqliteAuditStore::open(&audit_db_path)?);
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
             let rate_limit = Arc::new(RateLimiter::with_defaults());
             // Prune stale per-subject buckets every 5 min; buckets not
@@ -250,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
                 events: event_bus,
                 alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
                 webhooks: webhook_registry,
+                audit,
             };
             // Bench A/B kill-switch. Production never sets this; the
             // bench scripts toggle it to compare native vs subprocess
@@ -300,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/events", get(events::sse_stream))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .route("/v1/admin/token/rotate", post(rest::admin_rotate_token))
+                .route("/v1/admin/audit", get(rest::admin_list_audit))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))
                 .route(

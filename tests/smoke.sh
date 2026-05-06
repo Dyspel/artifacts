@@ -814,6 +814,42 @@ size=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sizeBytes"])' < 
     || { echo "FAIL: detail sizeBytes is $size, expected > 0"; exit 1; }
 echo "    admin → detail → ${ref_count} refs, ${size} bytes on disk"
 
+echo "==> [??] persistent audit log"
+audit_resp="${WORK_DIR}/audit.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?limit=200" -o "$audit_resp"
+audit_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$audit_resp")
+[[ "$audit_count" -ge 5 ]] \
+    || { echo "FAIL: audit list returned $audit_count rows, expected ≥ 5"; cat "$audit_resp"; exit 1; }
+# Earlier steps mint at least one repo.create, repo.fork, token.mint, and
+# token.revoke; verify each kind shows up at least once. (repo.delete is
+# exercised in a follow-up smoke step here so the kind is covered too.)
+for kind in repo.create repo.fork token.mint token.revoke; do
+    seen=$(python3 -c "import json,sys; rows=json.load(sys.stdin); print(sum(1 for r in rows if r['event']=='${kind}'))" < "$audit_resp")
+    [[ "$seen" -ge 1 ]] \
+        || { echo "FAIL: audit log missing event kind '${kind}'"; exit 1; }
+done
+# Trigger a repo.delete to verify that kind also persists, then re-pull
+# the log and check it landed.
+del_repo=$(curl -fsS -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{}' "$BASE_URL/v1/repos" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -fsS -X DELETE "${auth[@]}" "$BASE_URL/v1/repos/${del_repo}" >/dev/null
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?event=repo.delete&limit=10" -o "${WORK_DIR}/audit_del.json"
+del_seen=$(python3 -c "import json,sys; rows=json.load(sys.stdin); print(sum(1 for r in rows if r.get('repoId')=='${del_repo}'))" < "${WORK_DIR}/audit_del.json")
+[[ "$del_seen" -ge 1 ]] \
+    || { echo "FAIL: just-deleted repo missing from audit log"; cat "${WORK_DIR}/audit_del.json"; exit 1; }
+# Filter by event kind round-trips (server-side filtering, not client).
+filtered="${WORK_DIR}/audit_filtered.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?event=repo.create&limit=50" -o "$filtered"
+filtered_ok=$(python3 -c "import json,sys; rows=json.load(sys.stdin); print(all(r['event']=='repo.create' for r in rows) and len(rows)>=1)" < "$filtered")
+[[ "$filtered_ok" == "True" ]] \
+    || { echo "FAIL: ?event=repo.create filter not honored"; cat "$filtered"; exit 1; }
+# JWT user should get 403.
+jwt_audit_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    "${alice_auth[@]}" "$BASE_URL/v1/admin/audit")
+[[ "$jwt_audit_code" == "403" ]] \
+    || { echo "FAIL: JWT user GET /v1/admin/audit expected 403, got $jwt_audit_code"; exit 1; }
+echo "    audit log → $audit_count rows, all 5 expected kinds present, ?event= filter honored, JWT-user→403"
+
 echo "==> [??] admin-token in-process rotation"
 # Admin can rotate; old token stops working immediately; new token works.
 # Then rotate it back (using the new value) so subsequent steps that rely
