@@ -70,6 +70,9 @@ prodash = { version = "31", default-features = false, features = ["progress-tree
 # webhook fan-out so it has to be in the default build.
 ureq = { version = "2", features = ["json", "tls"] }
 hmac = "0.12"
+# AES-256-GCM for encrypting webhook HMAC secrets at rest. Same
+# RustCrypto family as sha2/hmac/subtle; no new transitive baggage.
+aes-gcm = "0.10"
 
 # GUI-only deps; opt-in via `--features gui` so the server binary stays lean.
 eframe = { version = "0.27", optional = true }

@@ -18,6 +18,7 @@ mod reads;
 mod refs;
 mod request_id;
 mod rest;
+mod secrets;
 mod smart_http;
 mod storage;
 mod tokens;
