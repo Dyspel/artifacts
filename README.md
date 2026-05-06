@@ -91,6 +91,7 @@ end-to-end in a day, not a quarter.
 | `X-Request-Id` header roundtrip + structured per-request log     | ✅     |
 | `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
 | `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
+| `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
@@ -100,7 +101,7 @@ end-to-end in a day, not a quarter.
 | Chunked-KV / object-store `Storage` impl — `ObjectStore` trait scaffolded | 🟡 M2b |
 | Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
 | Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
-| Admin-token rotation (in-process) | 🟡 M4b-key-rotation |
+| Admin-token rotation (in-process) | ✅ M4b-key-rotation |
 | Webhooks (HMAC-signed) + Prometheus metrics + retries + SQLite registry | ✅ M6 |
 | KMS-backed webhook secrets | 🟡 M6-deliver-secrets |
 | LFS, replication, PITR | 🟡 M6-other |
@@ -136,15 +137,11 @@ Remaining, in order:
    concurrent-CAS conformance test landed; the consensus log
    (openraft) + per-repo state machine + leader election +
    snapshot install remain.
-3. **M4b-key-rotation — admin-token rotation surface.**
-   Subject column + listing + self-revoke + bulk-rotate
-   shipped; in-process admin-token rotation (vs env-var-on-restart)
-   is the remaining slice.
-4. **M6-deliver-secrets — KMS-backed webhook secrets.**
+3. **M6-deliver-secrets — KMS-backed webhook secrets.**
    SQLite-backed subscriptions + retries + delivery metrics
    shipped; today the per-subscription HMAC secret is stored
    plaintext in SQLite. A KMS swap is the next refinement.
-5. **M6-other — LFS, replication, PITR.** Each is genuinely
+4. **M6-other — LFS, replication, PITR.** Each is genuinely
    multi-week.
 
 ## Numbers we just measured
@@ -371,6 +368,32 @@ tokens out of log archives.
 
 Revocation is idempotent. A second revoke of the same token returns
 `{ "revoked": false }`.
+
+### Rotate the admin token
+
+```
+POST /v1/admin/token/rotate
+Authorization: Bearer <admin>
+```
+
+Response:
+
+```json
+{ "token": "<the new admin token>" }
+```
+
+Generates a fresh process-wide admin token, atomically swaps the
+in-memory cell, and returns it. The previous admin token stops
+working on the next request — there is no grace period, so
+in-flight clients should stash the new token before discarding the
+old one.
+
+Admin-only. JWT principals get 403. Use this after a suspected
+leak or before walking away from a shared session — it's the
+in-process counterpart to restarting the server with a different
+`ARTIFACTS_ADMIN_TOKEN`. The `admin.token.rotate` audit event is
+emitted on success (no token bytes in the event — just the fact of
+rotation).
 
 ### Delete a repo
 
@@ -641,7 +664,11 @@ event with `actor`, `repo_id`, and action-specific fields — pipe
 that target to its own sink for an audit trail. Per-subject
 token-bucket rate limiting + per-user repo-count quotas are
 enforced on every non-admin request; admin bypasses both for
-break-glass purposes.
+break-glass purposes. The process-wide admin token can be
+rotated in-place without a restart via
+`POST /v1/admin/token/rotate` — the previous token stops working
+on the next request. Per-repo tokens have their own
+`POST /v1/repos/:id/tokens/rotate` for the same purpose.
 
 What's *still* missing:
 
@@ -649,11 +676,6 @@ What's *still* missing:
   (nginx, Caddy, an in-cluster mesh sidecar) or `--bind` to a
   loopback address only. Non-loopback HTTP without
   `--allow-insecure` is refused at startup.
-- **Admin-token rotation in process.** The admin token is set at
-  startup (env var or auto-generated, printed to stderr) and
-  doesn't rotate without a restart. Per-repo tokens have a
-  `rotate` endpoint (`POST /v1/repos/:id/tokens/rotate`) but the
-  process-wide admin token does not. M4b-key-rotation tracks this.
 - **Webhook secrets at rest.** The HMAC-SHA256 secret for outbound
   webhook deliveries is stored plaintext in the SQLite registry —
   it has to be round-trippable so the dispatcher can sign every
@@ -679,7 +701,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 164 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks)
+cargo test                  # 168 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
@@ -715,6 +737,7 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait scaffolded; full impl unblocked once M1b-3-gix ships and the unpack-objects subprocess is gone. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
+| **M4b-key-rotation** | ✅ done | In-process admin-token rotation (`POST /v1/admin/token/rotate`). `Config::admin_token` is a runtime `RwLock<String>`; rotation atomically swaps the cell, the previous token stops authorizing on the next request, and the event lands on the `audit` tracing target. | env-var-on-restart only |
 | **M6 — webhooks** | ✅ done | Outbound HTTP webhook delivery with HMAC-SHA256 signing. In-memory `MemRegistry`; SQLite-backed registry + delivery retries are the remaining slice. | — |
 | **M6 — metrics**  | ✅ done | Prometheus `/metrics` with per-route counters + latency histograms + rate-limit / quota counters. | — |
 | **M6 — other**    | 🟡 | LFS, replication, PITR — genuinely multi-week each. | — |
