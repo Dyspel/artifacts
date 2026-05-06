@@ -274,6 +274,10 @@ async fn main() -> anyhow::Result<()> {
                     let p = data_dir.join("webhooks.db");
                     p.exists().then_some(p)
                 });
+            // The on-disk key path is plumbed into RestState so
+            // `admin_rotate_webhook_key` can rewrite it post-rotation.
+            // None for env-var-only / in-memory deployments.
+            let mut webhook_key_path: Option<std::path::PathBuf> = None;
             let webhook_registry: Arc<dyn webhooks::WebhookRegistry> =
                 match webhook_db_path {
                     Some(p) => {
@@ -286,6 +290,13 @@ async fn main() -> anyhow::Result<()> {
                         let master_key = Arc::new(
                             secrets::MasterKey::load_or_generate(&key_path)?,
                         );
+                        // Only plumb the key path through state if the
+                        // env var isn't set — when env is the source of
+                        // truth, rewriting the file would silently
+                        // disagree with the env on next restart.
+                        if std::env::var_os("ARTIFACTS_WEBHOOK_KEY").is_none() {
+                            webhook_key_path = Some(key_path);
+                        }
                         tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry (encrypted secrets)");
                         Arc::new(webhooks::SqliteWebhookRegistry::open(&p, master_key)?)
                     }
@@ -311,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
                 alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
                 webhooks: webhook_registry,
                 audit,
+                webhook_key_path,
             };
             // Bench A/B kill-switch. Production never sets this; the
             // bench scripts toggle it to compare native vs subprocess
@@ -361,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/events", get(events::sse_stream))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
                 .route("/v1/admin/token/rotate", post(rest::admin_rotate_token))
+                .route("/v1/admin/webhook-key/rotate", post(rest::admin_rotate_webhook_key))
                 .route("/v1/admin/audit", get(rest::admin_list_audit))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))

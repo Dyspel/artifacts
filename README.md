@@ -96,6 +96,7 @@ end-to-end in a day, not a quarter.
 | `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
 | `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
 | `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
+| `POST /v1/admin/webhook-key/rotate` — re-encrypt every webhook secret under a fresh master key | ✅     |
 | `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
@@ -373,6 +374,46 @@ tokens out of log archives.
 
 Revocation is idempotent. A second revoke of the same token returns
 `{ "revoked": false }`.
+
+### Rotate the webhook master key
+
+```
+POST /v1/admin/webhook-key/rotate
+Authorization: Bearer <admin>
+```
+
+Response:
+
+```json
+{
+  "rotated": 17,
+  "key": "<base64-encoded 32-byte key>"
+}
+```
+
+Generates a fresh AES-256 master key, re-encrypts every webhook
+secret in the SQLite registry under it (single transaction —
+partial failure rolls back), atomically swaps the in-memory key,
+and returns the new key in the response body.
+
+The `rotated` count is the number of rows re-encrypted. Legacy
+plaintext rows (pre-M6-deliver-secrets, `secret_nonce IS NULL`)
+are intentionally skipped, so the count can be lower than the
+total subscription count.
+
+The on-disk key file (`<data-dir>/webhook-key.bin`) is rewritten
+when one is in use, so a restart picks up the new key. Env-var
+deployments (`ARTIFACTS_WEBHOOK_KEY` set) skip the file rewrite
+— the response body is the only place the new key surfaces, and
+the operator must update the env var out of band before the
+process restarts (otherwise every encrypted row becomes
+unreadable). Audit event `admin.webhook_key.rotate` includes
+the rotated count.
+
+Admin-only. JWT principals get 403. In-memory `MemRegistry`
+deployments accept the call (the trait's default `rotate_master_key`
+is a no-op returning 0); the new key is still generated and
+returned for parity with the SQLite path.
 
 ### Audit log (persistent)
 
@@ -749,11 +790,14 @@ What's *still* missing:
   insert), keyed by an env-pinnable master key
   (`ARTIFACTS_WEBHOOK_KEY`, base64-encoded 32 bytes; auto-generated
   to `<data-dir>/webhook-key.bin` with 0600 perms on first run if
-  unset). This raises the bar from "DB exfil reveals every webhook
-  secret in plaintext" to "DB exfil reveals nothing without the
-  key." A real KMS-backed swap (sealing key referenced by KMS ID,
-  KMS does the unwrap on each delivery) keeps the same trait shape
-  but removes the on-disk-key fallback — that's the still-open
+  unset). The master key can be rotated in-process via
+  `POST /v1/admin/webhook-key/rotate` — the endpoint re-encrypts
+  every existing row under a fresh key in a single transaction.
+  This raises the bar from "DB exfil reveals every webhook secret
+  in plaintext" to "DB exfil reveals nothing without the key." A
+  real KMS-backed swap (sealing key referenced by KMS ID, KMS does
+  the unwrap on each delivery) keeps the same trait shape but
+  removes the on-disk-key fallback — that's the still-open
   refinement, not the at-rest encryption itself.
 
 A prototype for agents you trust talking to a backend you trust
@@ -770,7 +814,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 204 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption, object-store conformance, bind-safety)
+cargo test                  # 207 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption + master-key rotation, object-store conformance, bind-safety)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run

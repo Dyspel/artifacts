@@ -63,6 +63,22 @@ pub trait WebhookRegistry: Send + Sync {
     fn list(&self, repo_id: &str) -> Vec<Subscription>;
     fn remove(&self, repo_id: &str, hook_id: &str) -> bool;
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription>;
+
+    /// Replace the in-process master key, re-encrypting every existing
+    /// secret under it. Returns the count of rows re-encrypted (0
+    /// for backends that don't store encrypted secrets — `MemRegistry`,
+    /// or rows that were stored as legacy plaintext).
+    ///
+    /// Default impl is `Ok(0)` — backends without encrypted-at-rest
+    /// secrets have nothing to do, but the rotation endpoint still
+    /// generates and installs a fresh key for the next `add()`. The
+    /// SQLite impl overrides; Mem inherits the default.
+    fn rotate_master_key(
+        &self,
+        _new: Arc<crate::secrets::MasterKey>,
+    ) -> crate::error::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// SQLite-backed `WebhookRegistry`. Subscriptions persist across
@@ -91,10 +107,12 @@ pub trait WebhookRegistry: Send + Sync {
 /// whether `ARTIFACTS_WEBHOOK_DB` is set (defaults to in-memory).
 pub struct SqliteWebhookRegistry {
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    /// Symmetric key used to seal/unseal `secret`. Held for the
-    /// process lifetime; rotation is out of scope for this slice
-    /// (would require re-encrypting every row).
-    master_key: Arc<crate::secrets::MasterKey>,
+    /// Symmetric key used to seal/unseal `secret`. Wrapped in
+    /// `RwLock<Arc<…>>` so `rotate_master_key` can swap it
+    /// in-process. Reads (every `add` / `list`) clone the `Arc`
+    /// under the read lock and drop the lock immediately, so a
+    /// rotation only blocks readers for the brief swap window.
+    master_key: std::sync::RwLock<Arc<crate::secrets::MasterKey>>,
 }
 
 impl SqliteWebhookRegistry {
@@ -132,12 +150,27 @@ impl SqliteWebhookRegistry {
         }
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
-            master_key,
+            master_key: std::sync::RwLock::new(master_key),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Snapshot the current master key. Cheap (Arc clone). Callers
+    /// hold the snapshot for the duration of one operation; the
+    /// rotation path swaps under a write lock, so a snapshot taken
+    /// just before a rotation may be the old key — that's fine for
+    /// readers (rows on disk match whichever key they were sealed
+    /// under) but matters for writers, which is why `add` and
+    /// `rotate_master_key` both take the conn-mutex first to
+    /// serialize.
+    fn current_key(&self) -> Arc<crate::secrets::MasterKey> {
+        self.master_key
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -158,8 +191,9 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         // Failure here is genuinely impossible with a valid 32-byte
         // key, but we don't unwrap because that would crash the
         // process on a misconfig that's recoverable.
+        let key = self.current_key();
         let (secret_b64, nonce_blob): (Option<String>, Option<Vec<u8>>) = match &sub.secret {
-            Some(plaintext) => match crate::secrets::seal(&self.master_key, plaintext.as_bytes()) {
+            Some(plaintext) => match crate::secrets::seal(&key, plaintext.as_bytes()) {
                 Ok((ct, nonce)) => (
                     Some(BASE64_STD.encode(ct)),
                     Some(nonce.to_vec()),
@@ -190,7 +224,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let key = self.master_key.clone();
+        let key = self.current_key();
         let rows = stmt.query_map(rusqlite::params![repo_id], move |row| {
             row_to_sub(row, &key)
         });
@@ -226,6 +260,76 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             .into_iter()
             .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
             .collect()
+    }
+
+    /// Re-encrypt every secret-bearing row under `new`, then atomically
+    /// install `new` as the current master key. Holds the connection
+    /// mutex for the full operation, so concurrent `add` and `list`
+    /// block until it completes — they then see the new key. The
+    /// transaction means a partial failure mid-rotation rolls back to
+    /// the old ciphertext under the old key, never a half-rotated DB.
+    ///
+    /// Legacy plaintext rows (secret_nonce IS NULL) are left untouched
+    /// so the migration story stays consistent — a row stored before
+    /// the M6-deliver-secrets encryption shipped doesn't suddenly get
+    /// encrypted under a key that may later be rotated again.
+    ///
+    /// Returns the count of rows actually re-encrypted (0 if no
+    /// encrypted rows exist; the swap still happens).
+    fn rotate_master_key(
+        &self,
+        new: Arc<crate::secrets::MasterKey>,
+    ) -> crate::error::Result<u64> {
+        use rusqlite::params;
+        let mut conn = self.lock();
+        let old = self.current_key();
+        let tx = conn.transaction()?;
+        let mut count: u64 = 0;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, secret, secret_nonce FROM webhooks
+                 WHERE secret IS NOT NULL AND secret_nonce IS NOT NULL",
+            )?;
+            // Collect first so the statement borrow drops before the
+            // per-row UPDATE acquires the connection again via tx.
+            let rows: Vec<(String, String, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (id, ct_b64, nonce_blob) in rows {
+                let nonce: [u8; 12] = nonce_blob.as_slice().try_into().map_err(|_| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: nonce wrong length ({} bytes)",
+                        nonce_blob.len()
+                    ))
+                })?;
+                let ct = BASE64_STD.decode(ct_b64.as_bytes()).map_err(|e| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: ciphertext base64 decode: {e}"
+                    ))
+                })?;
+                let pt = crate::secrets::unseal(&old, &ct, &nonce).map_err(|e| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: unseal under old key: {e}"
+                    ))
+                })?;
+                let (new_ct, new_nonce) = crate::secrets::seal(&new, &pt)?;
+                tx.execute(
+                    "UPDATE webhooks SET secret = ?1, secret_nonce = ?2 WHERE id = ?3",
+                    params![BASE64_STD.encode(&new_ct), new_nonce.to_vec(), id],
+                )?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        // Swap the in-memory key while we still hold the conn mutex so
+        // concurrent `add` calls — which take the same mutex — wake up
+        // using the new key in lockstep with the on-disk re-encryption.
+        *self
+            .master_key
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = new;
+        Ok(count)
     }
 }
 
@@ -817,5 +921,137 @@ mod tests {
         let listed = r.list("r1");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].secret.as_deref(), Some("legacy-plaintext-secret"));
+    }
+
+    #[test]
+    fn sqlite_rotate_master_key_re_encrypts_existing_rows() {
+        // The contract: after rotate(), every encrypted row decrypts
+        // under the new key. Set up two rows under k1, rotate to k2,
+        // verify list() returns the same plaintexts. Then peek at the
+        // raw secret column — it must have changed (different
+        // ciphertext under the new key).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let k1 = test_master_key();
+        let r = SqliteWebhookRegistry::open(&path, k1).unwrap();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: Some("alpha".into()),
+            events: vec![],
+        });
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: Some("beta".into()),
+            events: vec![],
+        });
+
+        // Snapshot the raw secret column before rotation.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let before: Vec<String> = conn
+            .prepare("SELECT secret FROM webhooks ORDER BY created_at, id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        drop(conn);
+
+        let k2 = test_master_key();
+        let rotated = r.rotate_master_key(k2).unwrap();
+        assert_eq!(rotated, 2, "expected to re-encrypt 2 rows, got {rotated}");
+
+        // After rotation, list() returns plaintexts decrypted under the
+        // newly-installed key — same plaintexts, since we re-encrypted
+        // the same secrets under the new key.
+        let listed = r.list("r1");
+        let mut plaintexts: Vec<&str> =
+            listed.iter().filter_map(|s| s.secret.as_deref()).collect();
+        plaintexts.sort();
+        assert_eq!(plaintexts, vec!["alpha", "beta"]);
+
+        // Raw secret column changed.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let after: Vec<String> = conn
+            .prepare("SELECT secret FROM webhooks ORDER BY created_at, id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_ne!(before, after, "ciphertext should change on rotation");
+    }
+
+    #[test]
+    fn sqlite_rotate_with_no_rows_is_noop_but_swaps_key() {
+        // No encrypted rows yet. Rotate succeeds with count=0; a row
+        // added after rotation seals under the NEW key (verified by
+        // observing that opening the DB with the OLD key drops the
+        // secret to None on read).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let k1 = test_master_key();
+        let r = SqliteWebhookRegistry::open(&path, k1.clone()).unwrap();
+        let n = r.rotate_master_key(test_master_key()).unwrap();
+        assert_eq!(n, 0);
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: Some("post-rotate".into()),
+            events: vec![],
+        });
+        // Rebuild a registry against the OLD key — the row added after
+        // rotation must come back unsigned (key mismatch handled the
+        // same way as in `sqlite_wrong_key_yields_unsigned_subscription`).
+        drop(r);
+        let r_old = SqliteWebhookRegistry::open(&path, k1).unwrap();
+        let listed = r_old.list("r1");
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].secret.is_none(),
+            "row encrypted under post-rotation key must not decrypt under pre-rotation key"
+        );
+    }
+
+    #[test]
+    fn sqlite_rotate_skips_legacy_plaintext_rows() {
+        // Legacy rows (secret_nonce IS NULL) are migration cruft —
+        // they should pass through rotation untouched, not get
+        // newly-encrypted under the rotated key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        // Bootstrap the schema by opening once.
+        {
+            let _ = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        }
+        // Insert a legacy-shape row directly.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO webhooks (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+             VALUES ('legacy-1', 'r1', 'u', 'legacy-plaintext', NULL, '[]', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        // Add an encrypted row alongside.
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: Some("encrypted-row".into()),
+            events: vec![],
+        });
+        let rotated = r.rotate_master_key(test_master_key()).unwrap();
+        assert_eq!(rotated, 1, "legacy row should be skipped, only the encrypted row touched");
+        // Legacy row still readable as plaintext.
+        let listed = r.list("r1");
+        let plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
+        assert!(plaintexts.contains(&"legacy-plaintext"));
+        assert!(plaintexts.contains(&"encrypted-row"));
     }
 }

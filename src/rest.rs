@@ -57,6 +57,11 @@ pub struct RestState {
     /// fact. Writes are best-effort — a SQLite hiccup logs a warning
     /// but never fails the underlying mutation.
     pub audit: Arc<dyn crate::audit::AuditStore>,
+    /// Path to the on-disk webhook master key file, when one is in
+    /// use. `None` for env-var-only deployments. The
+    /// `admin_rotate_webhook_key` handler updates this file (if set)
+    /// after a successful rotation so a restart picks up the new key.
+    pub webhook_key_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1036,6 +1041,87 @@ pub async fn admin_rotate_token(
     )
     .await;
     Ok(Json(AdminTokenRotateResponse { token: new }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminWebhookKeyRotateResponse {
+    /// Number of rows re-encrypted under the new key. Legacy
+    /// plaintext rows (secret_nonce IS NULL) are skipped, so this
+    /// can be lower than the total subscription count.
+    pub rotated: u64,
+    /// The freshly-generated 32-byte AES-256 key, base64-encoded.
+    /// Caller must persist this — if the server restarts before the
+    /// new key is in `ARTIFACTS_WEBHOOK_KEY` env or the on-disk key
+    /// file, every encrypted webhook row becomes unreadable.
+    pub key: String,
+}
+
+/// `POST /v1/admin/webhook-key/rotate`
+///
+/// Generates a fresh AES-256 master key, re-encrypts every webhook
+/// secret in the SQLite registry under it (in a single transaction
+/// — partial failure rolls back), atomically swaps the in-memory
+/// key, and returns the new key in the response body.
+///
+/// If the deployment uses the on-disk key file
+/// (`<data-dir>/webhook-key.bin`) the file is rewritten with the new
+/// key (0600 perms preserved) so a restart picks up the new value.
+/// Env-var deployments must update `ARTIFACTS_WEBHOOK_KEY` out of
+/// band — the response body is the only place the new key surfaces.
+///
+/// Admin-only. JWT principals get 403. Emits an
+/// `admin.webhook_key.rotate` audit event with the rotated row
+/// count (no key bytes in the event).
+///
+/// In-memory `MemRegistry` deployments accept the call but the
+/// trait's default `rotate_master_key` is a no-op (returns 0); the
+/// new key is still generated and returned for parity with the
+/// SQLite path.
+pub async fn admin_rotate_webhook_key(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminWebhookKeyRotateResponse>> {
+    require_admin(&state, &headers)?;
+    let new_key = Arc::new(crate::secrets::MasterKey::random());
+    let new_key_b64 = new_key.to_base64();
+
+    let rotated = state.webhooks.rotate_master_key(new_key.clone())?;
+
+    // Update the on-disk key file (if one is in use) so a restart
+    // loads the new key. Failure here is best-effort logged — the
+    // in-memory swap already succeeded, and the response body
+    // surfaces the key so the operator can persist it manually if
+    // we couldn't.
+    if let Some(path) = state.webhook_key_path.as_deref() {
+        if let Err(e) = std::fs::write(path, &new_key_b64) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "webhook key file rewrite failed; persist `key` from response manually",
+            );
+        }
+    }
+
+    tracing::info!(
+        target: "audit",
+        event = "admin.webhook_key.rotate",
+        actor = "admin",
+        rotated,
+    );
+    crate::audit::record_silent(
+        &*state.audit,
+        "admin.webhook_key.rotate",
+        "admin",
+        None,
+        serde_json::json!({ "rotated": rotated }),
+        None,
+    )
+    .await;
+
+    Ok(Json(AdminWebhookKeyRotateResponse {
+        rotated,
+        key: new_key_b64,
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
