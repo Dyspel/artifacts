@@ -100,6 +100,19 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_MAX_COMMIT_BLOB_BYTES", default_value_t = 8 * 1024 * 1024)]
         max_commit_blob_bytes: usize,
 
+        /// PEM-encoded TLS certificate. Pair with `--tls-key`. When
+        /// both are set the server listens HTTPS via rustls and the
+        /// bind-safety check no longer requires loopback. When either
+        /// is missing the server falls back to plaintext HTTP (for
+        /// dev — production should put a terminator in front, or set
+        /// these flags).
+        #[arg(long, env = "ARTIFACTS_TLS_CERT")]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM-encoded TLS private key. Paired with `--tls-cert`.
+        #[arg(long, env = "ARTIFACTS_TLS_KEY")]
+        tls_key: Option<PathBuf>,
+
         /// Audit log retention, in days. Rows older than this are
         /// pruned hourly. `0` disables pruning (audit log grows
         /// indefinitely — useful for compliance scenarios where an
@@ -142,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
             token_db,
             max_repos_per_user,
             max_commit_blob_bytes,
+            tls_cert,
+            tls_key,
             audit_retention_days,
             allow_insecure,
         } => {
@@ -150,7 +165,17 @@ async fn main() -> anyhow::Result<()> {
             // plaintext unless TLS is terminating somewhere. The #1
             // reason prototypes leak credentials in real deploys is
             // forgetting to put a terminator in front.
-            check_bind_safety(&bind, &public_base_url, allow_insecure)?;
+            // TLS is enabled iff both cert + key are set. Mismatched
+            // (only one set) is a misconfig — fail fast rather than
+            // silently downgrade to plaintext.
+            let tls_enabled = match (tls_cert.as_ref(), tls_key.as_ref()) {
+                (Some(_), Some(_)) => true,
+                (None, None) => false,
+                _ => anyhow::bail!(
+                    "--tls-cert and --tls-key must be set together (one without the other is a config error)"
+                ),
+            };
+            check_bind_safety(&bind, &public_base_url, allow_insecure, tls_enabled)?;
             let admin_token = admin_token.unwrap_or_else(|| {
                 let t = random_admin_token();
                 eprintln!("[artifacts] generated admin token: {t}");
@@ -378,9 +403,37 @@ async fn main() -> anyhow::Result<()> {
                 // the span covers the full request lifecycle.
                 .layer(axum_middleware::from_fn(request_id::instrument));
 
-            let listener = tokio::net::TcpListener::bind(&bind).await?;
-            tracing::info!(%bind, data_dir = %data_dir.display(), "artifacts listening");
-            axum::serve(listener, app).await?;
+            if tls_enabled {
+                // rustls 0.23 dropped the implicit default crypto
+                // provider — install ring once before any RustlsConfig
+                // touches the global default. Idempotent (harmless to
+                // call once; second call returns Err which we swallow).
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                // Both flags are Some by the tls_enabled gate above.
+                let cert = tls_cert.expect("tls_cert checked above");
+                let key = tls_key.expect("tls_key checked above");
+                let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(
+                        "loading TLS material from {cert:?} + {key:?}: {e}"
+                    ))?;
+                let addr: std::net::SocketAddr = bind
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("parsing --bind={bind}: {e}"))?;
+                tracing::info!(
+                    %bind,
+                    data_dir = %data_dir.display(),
+                    cert = %cert.display(),
+                    "artifacts listening (TLS)"
+                );
+                axum_server::bind_rustls(addr, config)
+                    .serve(app.into_make_service())
+                    .await?;
+            } else {
+                let listener = tokio::net::TcpListener::bind(&bind).await?;
+                tracing::info!(%bind, data_dir = %data_dir.display(), "artifacts listening");
+                axum::serve(listener, app).await?;
+            }
         }
     }
     Ok(())
@@ -400,9 +453,21 @@ async fn main() -> anyhow::Result<()> {
 /// `allow_insecure` is the explicit opt-out. `--bind 127.0.0.1:...` and
 /// loopback IPv6 (`::1`) are permitted unconditionally (nothing but the
 /// local host reaches them).
-fn check_bind_safety(bind: &str, public_base_url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+fn check_bind_safety(
+    bind: &str,
+    public_base_url: &str,
+    allow_insecure: bool,
+    tls_enabled: bool,
+) -> anyhow::Result<()> {
     if allow_insecure {
         tracing::warn!("--allow-insecure is set; bind-safety check skipped");
+        return Ok(());
+    }
+    if tls_enabled {
+        // TLS terminates in-process — bytes on the wire are encrypted.
+        // The terminator-in-front shape (loopback bind + https public
+        // URL) was the previous "safe non-loopback" route; this is
+        // the second one.
         return Ok(());
     }
     let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
@@ -413,15 +478,17 @@ fn check_bind_safety(bind: &str, public_base_url: &str, allow_insecure: bool) ->
         return Ok(());
     }
     if public_base_url.starts_with("https://") {
-        // Non-loopback + HTTPS is the intended shape — a terminator is
-        // presumably rewriting https:// → http:// on the loopback leg.
+        // Non-loopback + HTTPS public URL is the terminator-in-front
+        // shape — a separate process is rewriting https:// → http://
+        // on the loopback leg.
         return Ok(());
     }
     anyhow::bail!(
-        "refusing to start: bind={bind} is not loopback and public-base-url={public_base_url} is not https://.\n\
+        "refusing to start: bind={bind} is not loopback, --tls-cert/--tls-key are not set, and public-base-url={public_base_url} is not https://.\n\
          Tokens travel in plaintext — this is almost always a deployment mistake.\n\
          Fix one of:\n\
-           - bind 127.0.0.1:... and put a TLS terminator in front (recommended)\n\
+           - pass --tls-cert / --tls-key to terminate TLS in-process\n\
+           - bind 127.0.0.1:... and put a TLS terminator in front\n\
            - set --public-base-url to an https:// URL (terminator handles TLS for you)\n\
            - pass --allow-insecure if you really mean it (an ephemeral test rig, say)"
     );
@@ -433,4 +500,61 @@ pub(crate) fn random_admin_token() -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod bind_safety_tests {
+    use super::*;
+
+    #[test]
+    fn allow_insecure_skips_all_checks() {
+        // Even the worst-case combo (non-loopback + plaintext + no TLS)
+        // is permitted with --allow-insecure. The flag is the explicit
+        // "I know what I'm doing" override.
+        assert!(check_bind_safety("0.0.0.0:8787", "http://0.0.0.0:8787", true, false).is_ok());
+    }
+
+    #[test]
+    fn tls_enabled_permits_non_loopback() {
+        // Bytes on the wire are encrypted — non-loopback is fine.
+        assert!(check_bind_safety("0.0.0.0:8787", "http://example.com", false, true).is_ok());
+    }
+
+    #[test]
+    fn loopback_passes_without_tls() {
+        for host in ["127.0.0.1:8787", "[::1]:8787", "localhost:8787"] {
+            assert!(
+                check_bind_safety(host, "http://localhost:8787", false, false).is_ok(),
+                "expected loopback bind {host} to pass"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_with_https_public_url_passes() {
+        // Terminator-in-front shape — separate process is rewriting
+        // https:// → http:// on the loopback leg (not exercised here,
+        // but the safety check trusts the operator's https:// assertion).
+        assert!(
+            check_bind_safety("0.0.0.0:8787", "https://artifacts.example.com", false, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_loopback_plaintext_no_tls_is_rejected() {
+        let r = check_bind_safety("0.0.0.0:8787", "http://0.0.0.0:8787", false, false);
+        assert!(r.is_err(), "expected refusal, got {r:?}");
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("--tls-cert"), "error should mention TLS path: {msg}");
+    }
+
+    #[test]
+    fn ipv6_loopback_brackets_stripped() {
+        // [::1] in bind syntax must be recognized as loopback once
+        // the brackets are trimmed. Regression: an earlier version
+        // matched on the bracketed string and treated [::1] as
+        // non-loopback.
+        assert!(check_bind_safety("[::1]:8787", "http://[::1]:8787", false, false).is_ok());
+    }
 }

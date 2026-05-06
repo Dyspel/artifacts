@@ -18,11 +18,15 @@ end-to-end in a day, not a quarter.
 
 ## What this is *not*, plainly
 
-- **Not secure out of the box.** HTTP only, no TLS. Tokens travel in the
-  URL (as git clients do) — if you run this over the public internet
-  without TLS in front, you're broadcasting credentials. Put nginx /
-  caddy / cloudflare-tunnel / any TLS terminator in front of the
-  listener before exposing it. See [Security](#security-in-one-paragraph).
+- **Plaintext by default; TLS opt-in.** The server speaks HTTP unless
+  you pass `--tls-cert` and `--tls-key` (terminates TLS in-process via
+  rustls). Tokens travel in the URL (as git clients do); without TLS
+  on the wire — either in-process or via an external terminator
+  (nginx / caddy / cloudflare-tunnel) — you're broadcasting
+  credentials. The bind-safety check refuses to start in the
+  worst-case combination (non-loopback bind + no TLS + no
+  https:// public URL) unless `--allow-insecure` is set. See
+  [Security](#security-in-one-paragraph).
 - **Admin bypasses rate limiting and quotas.** Per-subject token-bucket
   rate limiting and per-user repo-count quotas are enforced for JWT
   users; the admin Bearer is the break-glass principal and bypasses
@@ -729,12 +733,17 @@ rotated in-place without a restart via
 on the next request. Per-repo tokens have their own
 `POST /v1/repos/:id/tokens/rotate` for the same purpose.
 
+TLS terminates in-process when both `--tls-cert <path>` and
+`--tls-key <path>` are set (PEM files, also via env
+`ARTIFACTS_TLS_CERT` / `ARTIFACTS_TLS_KEY`). Implementation is
+rustls 0.23 + `axum-server`'s `bind_rustls` path, with the `ring`
+crypto provider installed at startup. Non-loopback HTTP without
+TLS, an `https://` public URL (terminator-in-front), or
+`--allow-insecure` is refused at startup — the bind-safety check
+short-circuits the most common credential-leak misconfig.
+
 What's *still* missing:
 
-- **TLS.** The server listens HTTP. Run a TLS terminator in front
-  (nginx, Caddy, an in-cluster mesh sidecar) or `--bind` to a
-  loopback address only. Non-loopback HTTP without
-  `--allow-insecure` is refused at startup.
 - **KMS-backed webhook secrets.** Webhook HMAC keys are encrypted
   at rest with AES-256-GCM (per-row 96-bit nonce, fresh-random per
   insert), keyed by an env-pinnable master key
@@ -761,7 +770,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 198 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption, object-store conformance)
+cargo test                  # 204 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption, object-store conformance, bind-safety)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
