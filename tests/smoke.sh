@@ -472,6 +472,17 @@ grep -q '^artifacts_quota_exceeded_total' "$metrics_body" \
     || { echo "FAIL: /metrics missing quota_exceeded counter"; exit 1; }
 echo "    quota_exceeded counter observed in /metrics"
 
+# Audit-event counter should be incremented per event kind. Counters
+# reset at the step-10 restart, so we can only assert on kinds that
+# fire AFTER the restart — repo.create and token.mint both fire
+# during step 11's JWT/ownership exercise. (repo.fork and
+# token.revoke fire pre-restart only in this smoke run.)
+for kind in repo.create token.mint; do
+    grep -q "^artifacts_audit_events_total{event=\"${kind}\"}" "$metrics_body" \
+        || { echo "FAIL: /metrics missing artifacts_audit_events_total{event=\"${kind}\"}"; exit 1; }
+done
+echo "    audit-event counter has labeled series for repo.create + token.mint"
+
 # X-Request-Id roundtrip: client-supplied id must be echoed.
 echo_code=$(curl -sS -D "${WORK_DIR}/rid_headers.txt" -o /dev/null -w '%{http_code}' \
     -H 'X-Request-Id: smoke-trace-xyz' "$BASE_URL/v1/health")

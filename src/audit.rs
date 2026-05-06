@@ -301,6 +301,13 @@ pub async fn record_silent(
     fields: serde_json::Value,
     request_id: Option<String>,
 ) {
+    // Prometheus counter — labeled by event kind so dashboards can
+    // chart `repo.create` rate vs `token.revoke` rate independently.
+    // Always-on (cardinality is bounded by the audit-event vocabulary,
+    // currently 7 kinds), and incremented up front so a SQLite hiccup
+    // doesn't drop the count.
+    metrics::counter!("artifacts_audit_events_total", "event" => event.to_string())
+        .increment(1);
     let evt = AuditEvent {
         id: 0,
         ts: now_unix_secs(),

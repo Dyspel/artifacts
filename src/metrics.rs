@@ -18,6 +18,12 @@
 //! - `artifacts_rate_limited_total{class}` — counter (incremented by
 //!   `Error::RateLimited` mapping)
 //! - `artifacts_quota_exceeded_total` — counter
+//! - `artifacts_audit_events_total{event}` — counter (one increment per
+//!   audit-event record, labeled by event kind so dashboards can chart
+//!   `repo.create` rate vs `token.revoke` rate independently)
+//! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
+//!   (already-shipped; incremented by the webhook dispatcher with
+//!   outcome ∈ {ok, http_error, transport_error})
 //! - `artifacts_build_info{version}` — gauge=1, static for version info
 //!
 //! The `path` label is the *matched route template* (`/v1/repos/:id`),

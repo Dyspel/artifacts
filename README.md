@@ -575,6 +575,8 @@ Exposed metrics:
 | `artifacts_request_duration_seconds`           | histogram | `method`, `path`         |
 | `artifacts_rate_limited_total`                 | counter   | —                        |
 | `artifacts_quota_exceeded_total`               | counter   | —                        |
+| `artifacts_audit_events_total`                 | counter   | `event`                  |
+| `artifacts_webhook_deliveries_total`           | counter   | `kind`, `outcome`        |
 | `artifacts_build_info`                         | gauge     | `version`                |
 
 The `path` label is the **route template** (`/v1/repos/:id/tokens`),
