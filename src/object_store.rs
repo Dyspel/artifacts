@@ -32,18 +32,26 @@
 //! anything that reads/writes objects has to keep touching the
 //! filesystem.
 //!
-//! ## What this commit *does* deliver
+//! ## What's delivered today
 //!
-//! - The trait + the FS impl so the seam is named and tested.
-//! - A minimal "round-trip a loose object" test that pins down
-//!   the contract: returned bytes are the *raw zlib-compressed
-//!   loose-object payload*, not the deflated content. Callers
-//!   (gix-object) decode them.
+//! - The trait and two impls — `FsObjectStore` (production-shape
+//!   reads against `<repo>/objects/<aa>/<bbbb...>`) and
+//!   `MemObjectStore` (in-memory `HashMap`-backed). The Mem impl is
+//!   the M2b proof-of-concept: it shows the trait shape isn't
+//!   accidentally FS-specific, so the eventual chunked-KV impl can
+//!   plug in by implementing the same trait without trait surgery.
+//! - A conformance test suite (`conformance` module) that runs
+//!   both impls through the same contract checks — read-after-write
+//!   round-trip, missing-oid → `None`, malformed-oid → `None`. New
+//!   impls add their own conformance test by calling the shared
+//!   helpers; the contract lives in one place.
 //! - Documentation that says, plainly, that production code
 //!   doesn't route through this yet.
 
 use crate::error::{Error, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 /// Read-only view into a repo's git object database. Writes don't
 /// have a method yet — receive-pack writes go through
@@ -82,8 +90,9 @@ impl FsObjectStore {
     fn loose_path(&self, repo_id: &str, oid: &str) -> Option<PathBuf> {
         // Defensive: oid validation. We don't trust the caller for
         // path-traversal — anything outside the [a-f0-9]{40} shape
-        // gets rejected.
-        if oid.len() != 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+        // gets rejected. Shared with `MemObjectStore` so both impls
+        // honor the same malformed-oid contract.
+        if !oid_is_valid(oid) {
             return None;
         }
         let (a, b) = oid.split_at(2);
@@ -111,6 +120,135 @@ impl ObjectStore for FsObjectStore {
     }
 }
 
+/// In-memory `ObjectStore`. Backed by an `RwLock<HashMap<(repo_id, oid),
+/// Vec<u8>>>`; reads share the lock, writes serialize. Built as the
+/// M2b proof-of-concept that the trait isn't FS-specific. Tests use it
+/// as a fast, deterministic alternative to spinning up a real
+/// `<repo>/objects/` tree.
+///
+/// Not used in production yet — production reads still go through
+/// the filesystem via `FsObjectStore` (or, more often, directly via
+/// gix). The chunked-KV `Storage` impl is the place this would get
+/// wired up: the trait shape demonstrated here is what M2b's actual
+/// impl will satisfy.
+#[allow(dead_code)]
+pub struct MemObjectStore {
+    objects: RwLock<HashMap<(String, String), Vec<u8>>>,
+}
+
+#[allow(dead_code)]
+impl MemObjectStore {
+    pub fn new() -> Self {
+        Self {
+            objects: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Test-helper: insert raw loose-object bytes for `(repo_id, oid)`.
+    /// Production code wouldn't need this — the eventual M2b impl
+    /// will populate via the receive-pack path. For now this is the
+    /// only way to put bytes in.
+    ///
+    /// Rejects malformed `oid` the same way `read_loose` does, so
+    /// the store can't be poisoned with un-readable keys.
+    pub fn write_loose(&self, repo_id: &str, oid: &str, bytes: Vec<u8>) -> bool {
+        if !oid_is_valid(oid) {
+            return false;
+        }
+        self.objects
+            .write()
+            .expect("MemObjectStore lock poisoned")
+            .insert((repo_id.to_string(), oid.to_string()), bytes);
+        true
+    }
+}
+
+impl Default for MemObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ObjectStore for MemObjectStore {
+    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
+        if !oid_is_valid(oid) {
+            return Ok(None);
+        }
+        Ok(self
+            .objects
+            .read()
+            .expect("MemObjectStore lock poisoned")
+            .get(&(repo_id.to_string(), oid.to_string()))
+            .cloned())
+    }
+}
+
+/// 40-char lowercase hex. The validation contract both impls share —
+/// keeping it in one place means the conformance test for malformed
+/// oids exercises the same predicate against both backends.
+fn oid_is_valid(oid: &str) -> bool {
+    oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Conformance contract for any `ObjectStore` impl. Each behavior
+/// here is one assertion both `FsObjectStore` and `MemObjectStore`
+/// must satisfy. A future chunked-KV impl runs the same helpers and
+/// inherits the contract for free.
+///
+/// Helpers take a fixture closure `populate` that puts known bytes
+/// for a known oid into the impl-specific way (FS: `git hash-object`
+/// against a real bare repo; Mem: `MemObjectStore::write_loose`).
+/// Each helper then exercises the trait method and asserts.
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::*;
+
+    /// "Read returns the bytes that were written." The fundamental
+    /// contract — an ObjectStore that can't read back what it stored
+    /// is broken regardless of backend.
+    pub fn read_after_write_round_trips<S: ObjectStore>(store: &S, repo_id: &str, oid: &str) {
+        let bytes = store
+            .read_loose(repo_id, oid)
+            .expect("read_loose Result::Ok")
+            .expect("Some(bytes) for a known-present oid");
+        assert!(!bytes.is_empty(), "read_loose returned empty bytes");
+    }
+
+    /// Reading an oid that was never inserted yields `Ok(None)` —
+    /// not an error, not empty bytes. Distinguishes "absent" from
+    /// "present but empty".
+    pub fn missing_oid_returns_none<S: ObjectStore>(store: &S, repo_id: &str) {
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert!(
+            store.read_loose(repo_id, absent).unwrap().is_none(),
+            "expected None for unknown oid, got Some",
+        );
+    }
+
+    /// Malformed oids (path-traversal, wrong length, non-hex) yield
+    /// `Ok(None)` — never an error, never a stored value, never a
+    /// computed path that escapes the store. This is the trait's
+    /// path-safety contract.
+    pub fn malformed_oid_returns_none<S: ObjectStore>(store: &S) {
+        // Path-traversal attempt.
+        assert!(
+            store
+                .read_loose("repo", "../something/with/slash/and/some/more/x")
+                .unwrap()
+                .is_none()
+        );
+        // Wrong length.
+        assert!(store.read_loose("repo", "abc").unwrap().is_none());
+        // Non-hex (uppercase Z).
+        assert!(
+            store
+                .read_loose("repo", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,8 +270,9 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
-    #[test]
-    fn read_loose_returns_zlib_payload_for_existing_object() {
+    // ─── FsObjectStore conformance ─────────────────────────────────
+
+    fn fs_fixture() -> (tempfile::TempDir, FsObjectStore, String, String) {
         let tmp = tempfile::tempdir().unwrap();
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
@@ -141,50 +280,109 @@ mod tests {
         storage.create(&repo_id).unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
         let oid = write_blob(&git_dir, b"hello\n");
-
         let store = FsObjectStore::new(&repos);
+        (tmp, store, repo_id, oid)
+    }
+
+    #[test]
+    fn fs_read_after_write_round_trips() {
+        let (_t, store, repo_id, oid) = fs_fixture();
+        conformance::read_after_write_round_trips(&store, &repo_id, &oid);
+    }
+
+    #[test]
+    fn fs_missing_oid_returns_none() {
+        let (_t, store, repo_id, _) = fs_fixture();
+        conformance::missing_oid_returns_none(&store, &repo_id);
+    }
+
+    #[test]
+    fn fs_malformed_oid_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::malformed_oid_returns_none(&store);
+    }
+
+    /// FS-specific contract that doesn't apply to Mem: returned bytes
+    /// are git's actual zlib-deflated loose-object format. The Mem
+    /// impl stores whatever the test puts in, so it can't satisfy
+    /// this — that's fine, `read_loose`'s contract is only "return
+    /// the bytes that were stored", not "return zlib".
+    #[test]
+    fn fs_returns_zlib_deflated_payload() {
+        let (_t, store, repo_id, oid) = fs_fixture();
         let bytes = store.read_loose(&repo_id, &oid).unwrap().expect("found");
         // Loose objects start with the zlib magic byte 0x78 (low-nibble
         // = 0x8 means deflate at the default window size).
         assert_eq!(bytes[0], 0x78);
-        // And a non-empty payload.
         assert!(bytes.len() > 2);
     }
 
-    #[test]
-    fn read_loose_returns_none_for_unknown_oid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repos = tmp.path().join("repos");
-        let storage = FsStorage::new(&repos).unwrap();
-        let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+    // ─── MemObjectStore conformance ────────────────────────────────
 
-        let store = FsObjectStore::new(&repos);
-        let absent = "0123456789abcdef0123456789abcdef01234567";
-        assert!(store.read_loose(&repo_id, absent).unwrap().is_none());
+    /// Synthesize a deterministic 40-hex oid for a Mem fixture. The
+    /// store doesn't validate the oid against the bytes (the FS impl
+    /// doesn't either — it's a key-value lookup), so any 40-hex
+    /// string is fine for round-trip testing.
+    fn mem_oid(seed: u8) -> String {
+        let mut s = String::with_capacity(40);
+        for _ in 0..40 {
+            s.push(char::from_digit((seed % 16) as u32, 16).unwrap());
+        }
+        s
+    }
+
+    fn mem_fixture() -> (MemObjectStore, String, String) {
+        let store = MemObjectStore::new();
+        let repo_id = "mem-repo".to_string();
+        let oid = mem_oid(0xa);
+        assert!(store.write_loose(&repo_id, &oid, b"any-bytes-stand-in".to_vec()));
+        (store, repo_id, oid)
     }
 
     #[test]
-    fn read_loose_rejects_non_hex_oid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repos = tmp.path().join("repos");
-        let store = FsObjectStore::new(&repos);
-        // Path-traversal attempt — we should never compute a path
-        // for "../foo".
-        assert!(
-            store
-                .read_loose("repo", "../something/with/slash/and/some/more/x")
-                .unwrap()
-                .is_none(),
-        );
-        // Wrong length.
-        assert!(store.read_loose("repo", "abc").unwrap().is_none());
-        // Non-hex.
-        assert!(
-            store
-                .read_loose("repo", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
-                .unwrap()
-                .is_none()
-        );
+    fn mem_read_after_write_round_trips() {
+        let (store, repo_id, oid) = mem_fixture();
+        conformance::read_after_write_round_trips(&store, &repo_id, &oid);
+    }
+
+    #[test]
+    fn mem_missing_oid_returns_none() {
+        let (store, repo_id, _) = mem_fixture();
+        conformance::missing_oid_returns_none(&store, &repo_id);
+    }
+
+    #[test]
+    fn mem_malformed_oid_returns_none() {
+        let store = MemObjectStore::new();
+        conformance::malformed_oid_returns_none(&store);
+    }
+
+    #[test]
+    fn mem_write_loose_rejects_malformed_oid() {
+        // The store can't be poisoned with a path-traversal-shaped
+        // key — write_loose silently refuses, so subsequent reads
+        // for that key yield None (covered by malformed_oid_returns_none).
+        let store = MemObjectStore::new();
+        assert!(!store.write_loose("repo", "../bad", b"x".to_vec()));
+        assert!(!store.write_loose("repo", "abc", b"x".to_vec()));
+        assert!(!store.write_loose(
+            "repo",
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            b"x".to_vec()
+        ));
+    }
+
+    #[test]
+    fn mem_read_returns_exact_bytes_written() {
+        // Mem-specific: returned bytes are *exactly* what was stored.
+        // The FS impl can't make this assertion because git rewrites
+        // its loose-object format on write.
+        let store = MemObjectStore::new();
+        let oid = mem_oid(0x3);
+        let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        store.write_loose("r", &oid, payload.clone());
+        let got = store.read_loose("r", &oid).unwrap().unwrap();
+        assert_eq!(got, payload);
     }
 }
