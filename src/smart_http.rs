@@ -1323,6 +1323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "exceeds max")]
     fn pkt_line_panics_on_oversized_payload_in_debug() {
         let too_big = "a".repeat(PKT_LINE_MAX_PAYLOAD + 1);

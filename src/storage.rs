@@ -429,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "produced unsafe path")]
     fn repo_path_panics_in_debug_when_id_breaks_the_contract() {
         // We never actually reach this from production callers
