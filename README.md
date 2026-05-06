@@ -92,6 +92,7 @@ end-to-end in a day, not a quarter.
 | `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
 | `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
 | `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
+| `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
@@ -369,6 +370,52 @@ tokens out of log archives.
 Revocation is idempotent. A second revoke of the same token returns
 `{ "revoked": false }`.
 
+### Audit log (persistent)
+
+```
+GET /v1/admin/audit
+  ?since=<unix-ts>
+  &until=<unix-ts>
+  &event=<kind>
+  &actor=<admin|jwt-subject>
+  &repoId=<id>
+  &limit=<n>            # default 100, capped 1000
+Authorization: Bearer <admin>
+```
+
+Returns newest-first list of `AuditEvent` rows persisted by the
+server. Every mutating endpoint (repo create / fork / delete,
+token mint / revoke / rotate, admin-token rotate) writes a row
+here in addition to the live `tracing!(target: "audit")` event.
+
+Each row:
+
+```json
+{
+  "id": 42,
+  "ts": 1734567890,
+  "event": "repo.create",
+  "actor": "u-alice",
+  "repoId": "n11g4bw6...",
+  "fields": "{\"scope\":\"Write\",\"ttl_seconds\":null}",
+  "requestId": "abc..."
+}
+```
+
+`fields` is a JSON-string blob — kept as a string so adding a new
+event kind with new fields doesn't require a schema migration.
+Server-side filters compose with AND. To page past the 1000 cap,
+take the oldest `ts` in a page and pass it as `until` on the
+next request.
+
+Stored in `<data-dir>/audit.db` (separate from `tokens.db` so the
+audit log can be archived / rotated independently). Writes are
+best-effort — a SQLite hiccup logs a warning but doesn't fail the
+underlying mutation; the live `tracing!` call is the durable copy
+of last resort.
+
+Admin-only. JWT principals get 403.
+
 ### Rotate the admin token
 
 ```
@@ -604,7 +651,8 @@ Under `$DATA_DIR` at runtime:
 
 ```
 data/
-├── tokens.db                  SQLite — minted tokens (hashed), expiry, revocation
+├── tokens.db                  SQLite — minted tokens (hashed), expiry, revocation, ownership, webhooks
+├── audit.db                   SQLite — persisted audit events (queryable via GET /v1/admin/audit)
 └── repos/
     ├── abc12...xy.git/        bare git repo (source)
     │   ├── HEAD
@@ -661,7 +709,9 @@ silently produce a path that escapes the repos root. Every
 mutating endpoint (repo create / fork / delete, token mint /
 revoke / rotate) emits a structured `target: "audit"` tracing
 event with `actor`, `repo_id`, and action-specific fields — pipe
-that target to its own sink for an audit trail. Per-subject
+that target to its own sink for live monitoring, and query
+`GET /v1/admin/audit` for a SQLite-backed history (the same
+events are persisted there). Per-subject
 token-bucket rate limiting + per-user repo-count quotas are
 enforced on every non-admin request; admin bypasses both for
 break-glass purposes. The process-wide admin token can be
@@ -681,11 +731,6 @@ What's *still* missing:
   it has to be round-trippable so the dispatcher can sign every
   body, and we don't have a KMS-backed alternative wired in. A
   KMS swap is M6-deliver-secrets.
-- **Per-token revocation audit.** The audit-event stream records
-  every mint / revoke / rotate; we don't yet persist that event
-  stream in SQLite for after-the-fact admin querying. Pipe the
-  `audit` target to a structured sink (jsonl file, OTel collector)
-  if you need durable history.
 
 A prototype for agents you trust talking to a backend you trust
 over an internal / TLS-terminated link. Not a public service.
@@ -701,7 +746,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 168 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation)
+cargo test                  # 177 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
