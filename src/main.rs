@@ -1,4 +1,5 @@
 mod alternates_cache;
+mod audit;
 mod auth;
 mod commits;
 mod config;
