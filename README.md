@@ -104,7 +104,7 @@ end-to-end in a day, not a quarter.
 | Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
 | Admin-token rotation (in-process) | ✅ M4b-key-rotation |
 | Webhooks (HMAC-signed) + Prometheus metrics + retries + SQLite registry | ✅ M6 |
-| KMS-backed webhook secrets | 🟡 M6-deliver-secrets |
+| Webhook secrets encrypted at rest (AES-256-GCM, env-pinnable master key) | ✅ M6-deliver-secrets |
 | LFS, replication, PITR | 🟡 M6-other |
 
 ## What's next
@@ -138,11 +138,7 @@ Remaining, in order:
    concurrent-CAS conformance test landed; the consensus log
    (openraft) + per-repo state machine + leader election +
    snapshot install remain.
-3. **M6-deliver-secrets — KMS-backed webhook secrets.**
-   SQLite-backed subscriptions + retries + delivery metrics
-   shipped; today the per-subscription HMAC secret is stored
-   plaintext in SQLite. A KMS swap is the next refinement.
-4. **M6-other — LFS, replication, PITR.** Each is genuinely
+3. **M6-other — LFS, replication, PITR.** Each is genuinely
    multi-week.
 
 ## Numbers we just measured
@@ -653,6 +649,7 @@ Under `$DATA_DIR` at runtime:
 data/
 ├── tokens.db                  SQLite — minted tokens (hashed), expiry, revocation, ownership, webhooks
 ├── audit.db                   SQLite — persisted audit events (queryable via GET /v1/admin/audit)
+├── webhook-key.bin            32-byte AES-256 master key (auto-generated, 0600). Pin via ARTIFACTS_WEBHOOK_KEY env in prod.
 └── repos/
     ├── abc12...xy.git/        bare git repo (source)
     │   ├── HEAD
@@ -726,11 +723,17 @@ What's *still* missing:
   (nginx, Caddy, an in-cluster mesh sidecar) or `--bind` to a
   loopback address only. Non-loopback HTTP without
   `--allow-insecure` is refused at startup.
-- **Webhook secrets at rest.** The HMAC-SHA256 secret for outbound
-  webhook deliveries is stored plaintext in the SQLite registry —
-  it has to be round-trippable so the dispatcher can sign every
-  body, and we don't have a KMS-backed alternative wired in. A
-  KMS swap is M6-deliver-secrets.
+- **KMS-backed webhook secrets.** Webhook HMAC keys are encrypted
+  at rest with AES-256-GCM (per-row 96-bit nonce, fresh-random per
+  insert), keyed by an env-pinnable master key
+  (`ARTIFACTS_WEBHOOK_KEY`, base64-encoded 32 bytes; auto-generated
+  to `<data-dir>/webhook-key.bin` with 0600 perms on first run if
+  unset). This raises the bar from "DB exfil reveals every webhook
+  secret in plaintext" to "DB exfil reveals nothing without the
+  key." A real KMS-backed swap (sealing key referenced by KMS ID,
+  KMS does the unwrap on each delivery) keeps the same trait shape
+  but removes the on-disk-key fallback — that's the still-open
+  refinement, not the at-rest encryption itself.
 
 A prototype for agents you trust talking to a backend you trust
 over an internal / TLS-terminated link. Not a public service.
@@ -746,7 +749,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 177 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log)
+cargo test                  # 191 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log, webhook-secret encryption)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
