@@ -227,20 +227,18 @@ pub fn generate_pack(
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>),
     });
     // FromEntriesIter requires E: std::error::Error + 'static
-    let entries_mapped = entries_mapped.map(|r| {
-        r.map_err(|e| BoxStdErr(e))
-    });
+    let entries_mapped = entries_mapped.map(|r| r.map_err(BoxStdErr));
 
     // Bytes phase: write entries into our buffer.
     let mut out_buf = Vec::with_capacity(64 * 1024);
-    let mut from_entries = output::bytes::FromEntriesIter::new(
+    let from_entries = output::bytes::FromEntriesIter::new(
         entries_mapped,
         &mut out_buf,
         num_entries,
         gix_pack::data::Version::V2,
         gix_hash::Kind::Sha1,
     );
-    while let Some(chunk_result) = from_entries.next() {
+    for chunk_result in from_entries {
         chunk_result.map_err(|e| Error::Other(anyhow::anyhow!("pack write: {e}")))?;
     }
     Ok(out_buf)

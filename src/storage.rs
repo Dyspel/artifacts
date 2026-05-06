@@ -84,10 +84,10 @@ impl FsStorage {
     /// is the second line of defense: if a future change loosens
     /// `validate_repo_id` *without* updating us, the asserts here
     /// catch the regression at the seam where it would actually do
-    /// harm. We `debug_assert` (panic in tests) and `tracing::error
-    /// + return-anyway` in release — better to surface the bug
-    /// loudly than to silently hand back a path that resolves
-    /// somewhere unexpected.
+    /// harm. We `debug_assert` (panic in tests) and use
+    /// `tracing::error` plus return-anyway in release — better to
+    /// surface the bug loudly than to silently hand back a path
+    /// that resolves somewhere unexpected.
     ///
     /// Two checks:
     ///   1. The joined path strips cleanly off `self.root` — i.e.
@@ -230,9 +230,9 @@ impl Storage for FsStorage {
         Ok(())
     }
 
-    /// Delete a repo. For M0 this is a rm -rf; production needs soft-delete
-    /// + GC ordering (can't delete a repo that's the alternates source for
-    /// another live repo).
+    /// Delete a repo. For M0 this is a rm -rf; production needs
+    /// soft-delete and GC ordering (can't delete a repo that's the
+    /// alternates source for another live repo).
     fn delete(&self, id: &str) -> Result<()> {
         let path = self.repo_path(id);
         if !path.is_dir() {

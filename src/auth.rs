@@ -42,15 +42,6 @@ pub enum Principal {
 }
 
 impl Principal {
-    /// True if this principal is authorized to act on a repo owned by
-    /// `owner`. `Admin` is always authorized; `User` must match exactly.
-    pub fn is_owner_of(&self, owner: &str) -> bool {
-        match self {
-            Principal::Admin => true,
-            Principal::User { subject } => subject == owner,
-        }
-    }
-
     /// The subject string to record as the owner when a user creates a
     /// new repo. `Admin` has no meaningful subject — callers that want
     /// an owner field must use a JWT path. Returns `None` for admin.
@@ -287,15 +278,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn principal_admin_is_owner_of_anyone() {
-        assert!(Principal::Admin.is_owner_of("anyone"));
-    }
-
-    #[test]
-    fn principal_user_owns_only_self() {
-        let p = Principal::User { subject: "u-1".into() };
-        assert!(p.is_owner_of("u-1"));
-        assert!(!p.is_owner_of("u-2"));
-    }
 }

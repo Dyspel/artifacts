@@ -7,8 +7,8 @@
 //!   - `0000` — flush-pkt (end of a stream of pkt-lines)
 //!   - `0001` — delim-pkt (separator between sections within a v2 command)
 //!   - `0002` — response-end-pkt (used by stateful protocols; v2 doesn't
-//!              actually send these on the wire, but we accept them in
-//!              parsing for forward-compat)
+//!     actually send these on the wire, but we accept them in
+//!     parsing for forward-compat)
 //!
 //! Anything else with length < 4 is malformed.
 //!

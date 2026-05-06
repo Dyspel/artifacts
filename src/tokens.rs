@@ -66,11 +66,16 @@ pub struct TokenRecord {
     pub repo_id: String,
     pub scope: Scope,
     /// Unix epoch seconds. `None` means the token never expires.
+    /// Read-side machinery uses this through derived Debug rather
+    /// than direct field access; `#[allow(dead_code)]` reflects
+    /// that — clippy's reachability check doesn't see Debug uses.
+    #[allow(dead_code)]
     pub expires_at: Option<u64>,
     /// JWT subject the token was minted for. `None` for tokens
     /// minted by the admin path (no per-user binding) and for
-    /// rows that predate the M4b subject column. Audit / listing
-    /// surfaces this so users can see "who minted what".
+    /// rows that predate the M4b subject column. Same Debug-only
+    /// access pattern as `expires_at`.
+    #[allow(dead_code)]
     pub subject: Option<String>,
 }
 

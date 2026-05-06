@@ -95,6 +95,11 @@ pub struct AuditQuery {
 pub trait AuditStore: Send + Sync {
     async fn record(&self, evt: AuditEvent) -> Result<()>;
     async fn list(&self, query: AuditQuery) -> Result<Vec<AuditEvent>>;
+    /// Tests use this; production paths haven't needed it yet (admins
+    /// can SELECT COUNT(*) directly, and the list endpoint returns
+    /// up to 1000 rows). Kept on the trait so a future
+    /// `/v1/admin/audit/stats` endpoint has the cheap-counting hook.
+    #[allow(dead_code)]
     async fn count(&self) -> Result<u64>;
 }
 
@@ -102,6 +107,7 @@ pub trait AuditStore: Send + Sync {
 /// persistence isn't being exercised, and as the obvious "audit
 /// disabled" knob if a deployment ever wants to skip the SQLite write
 /// (live tracing alone may be enough for some operators).
+#[allow(dead_code)] // available as a deployment knob; tests exercise it
 pub struct NoopAuditStore;
 
 #[async_trait]
