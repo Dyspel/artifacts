@@ -100,6 +100,14 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_MAX_COMMIT_BLOB_BYTES", default_value_t = 8 * 1024 * 1024)]
         max_commit_blob_bytes: usize,
 
+        /// Audit log retention, in days. Rows older than this are
+        /// pruned hourly. `0` disables pruning (audit log grows
+        /// indefinitely — useful for compliance scenarios where an
+        /// external archiver moves rows out before they age out).
+        /// Default 90 days.
+        #[arg(long, env = "ARTIFACTS_AUDIT_RETENTION_DAYS", default_value_t = 90)]
+        audit_retention_days: u64,
+
         /// Opt-in to binding a non-loopback address with `http://`.
         /// Without this flag we refuse to start in that combination,
         /// because it broadcasts tokens in the clear to anyone who can
@@ -134,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             token_db,
             max_repos_per_user,
             max_commit_blob_bytes,
+            audit_retention_days,
             allow_insecure,
         } => {
             // Refuse to start in the "non-loopback bind + plaintext HTTP"
@@ -203,6 +212,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(path = %audit_db_path.display(), "opening audit db");
             let audit: Arc<dyn audit::AuditStore> =
                 Arc::new(audit::SqliteAuditStore::open(&audit_db_path)?);
+            // Hourly retention sweep — same cadence as the token-prune
+            // task. `0` days from the CLI flag disables pruning, which
+            // `spawn_prune_task` honors by not spawning at all.
+            audit::spawn_prune_task(
+                audit.clone(),
+                Duration::from_secs(3600),
+                Duration::from_secs(audit_retention_days * 86400),
+            );
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
             let rate_limit = Arc::new(RateLimiter::with_defaults());
             // Prune stale per-subject buckets every 5 min; buckets not

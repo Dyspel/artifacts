@@ -410,6 +410,12 @@ best-effort — a SQLite hiccup logs a warning but doesn't fail the
 underlying mutation; the live `tracing!` call is the durable copy
 of last resort.
 
+**Retention.** Rows older than `--audit-retention-days`
+(default 90, env `ARTIFACTS_AUDIT_RETENTION_DAYS`) are pruned
+hourly. Set to `0` to disable pruning entirely — useful for
+compliance scenarios where an external archiver moves rows out
+before they age out.
+
 Admin-only. JWT principals get 403.
 
 ### Rotate the admin token
@@ -749,7 +755,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 191 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log, webhook-secret encryption)
+cargo test                  # 192 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run

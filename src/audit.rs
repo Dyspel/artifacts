@@ -101,6 +101,12 @@ pub trait AuditStore: Send + Sync {
     /// `/v1/admin/audit/stats` endpoint has the cheap-counting hook.
     #[allow(dead_code)]
     async fn count(&self) -> Result<u64>;
+    /// Delete rows with `ts < cutoff_ts`. Returns the row count
+    /// removed. The retention task in `spawn_prune_task` calls this
+    /// on a timer; admins can also invoke directly for one-shot
+    /// cleanups. A `cutoff_ts == 0` is a no-op (the table can't
+    /// have negative-timestamp rows).
+    async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64>;
 }
 
 /// Drops every write on the floor. Useful in unit tests where audit
@@ -119,6 +125,9 @@ impl AuditStore for NoopAuditStore {
         Ok(Vec::new())
     }
     async fn count(&self) -> Result<u64> {
+        Ok(0)
+    }
+    async fn prune_older_than(&self, _: i64) -> Result<u64> {
         Ok(0)
     }
 }
@@ -232,6 +241,52 @@ impl AuditStore for SqliteAuditStore {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
         Ok(n.max(0) as u64)
     }
+
+    async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let affected = conn.execute(
+            "DELETE FROM audit_events WHERE ts < ?1",
+            params![cutoff_ts],
+        )?;
+        Ok(affected as u64)
+    }
+}
+
+/// Spawn a background task that calls `prune_older_than` on a timer.
+/// Mirror of `tokens::spawn_prune_task` for the audit store.
+///
+/// `retention` is how long an event must survive before becoming
+/// eligible for pruning; `tick` is how often the task wakes up. A
+/// `retention == Duration::ZERO` (or `0` days from the CLI flag)
+/// disables pruning entirely — useful for compliance scenarios that
+/// require indefinite retention until an external archiver moves
+/// rows out.
+///
+/// First prune fires after the first `tick` (not at startup) so it
+/// doesn't contend with boot-time work.
+pub fn spawn_prune_task(
+    store: Arc<dyn AuditStore>,
+    tick: std::time::Duration,
+    retention: std::time::Duration,
+) {
+    if retention.is_zero() {
+        tracing::info!("audit retention disabled — prune task not spawned");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Skip the immediate fire so prune doesn't run during boot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let cutoff = now_unix_secs().saturating_sub(retention.as_secs() as i64);
+            match store.prune_older_than(cutoff).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "audit prune"),
+                Err(e) => tracing::error!(error = %e, "audit prune failed"),
+            }
+        }
+    });
 }
 
 /// Convenience: write to the store, log + swallow on failure. Audit
@@ -429,6 +484,43 @@ mod tests {
         let rows = s.list(AuditQuery::default()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, "repo.create");
+    }
+
+    #[tokio::test]
+    async fn prune_older_than_removes_only_old_rows() {
+        let (_d, s) = store();
+        let mut e_old = evt("a", "admin", None);
+        e_old.ts = 100;
+        let mut e_mid = evt("b", "admin", None);
+        e_mid.ts = 200;
+        let mut e_new = evt("c", "admin", None);
+        e_new.ts = 300;
+        s.record(e_old).await.unwrap();
+        s.record(e_mid).await.unwrap();
+        s.record(e_new).await.unwrap();
+
+        // Cutoff = 200: rows with ts < 200 are removed (the `a` row).
+        let removed = s.prune_older_than(200).await.unwrap();
+        assert_eq!(removed, 1);
+        let rows = s.list(AuditQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.ts >= 200));
+    }
+
+    #[tokio::test]
+    async fn prune_with_zero_cutoff_is_noop() {
+        let (_d, s) = store();
+        s.record(evt("a", "admin", None)).await.unwrap();
+        let removed = s.prune_older_than(0).await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(s.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_idempotent_on_empty_store() {
+        let (_d, s) = store();
+        let removed = s.prune_older_than(now_unix_secs()).await.unwrap();
+        assert_eq!(removed, 0);
     }
 
     #[tokio::test]
