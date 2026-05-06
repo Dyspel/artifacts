@@ -1,10 +1,16 @@
 use std::path::PathBuf;
+use std::sync::RwLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub public_base_url: String,
-    pub admin_token: String,
+    /// Process-wide admin token. Wrapped in `RwLock` so an admin
+    /// rotation endpoint can swap it without restarting the server.
+    /// Reads happen on every REST call but finish in microseconds (the
+    /// lock is uncontended in practice; rotation is rare). Read via
+    /// `Config::admin_token()`, replace via `Config::rotate_admin_token()`.
+    admin_token: RwLock<String>,
     /// Shared secret for verifying JWTs on REST endpoints. `None`
     /// disables the JWT auth path entirely — only the admin token is
     /// accepted. Set via `--jwt-secret` / `ARTIFACTS_JWT_SECRET`.
@@ -25,7 +31,105 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn new(
+        data_dir: PathBuf,
+        public_base_url: String,
+        admin_token: String,
+        jwt_secret: Option<String>,
+        max_repos_per_user: u64,
+        max_commit_blob_bytes: usize,
+    ) -> Self {
+        Self {
+            data_dir,
+            public_base_url,
+            admin_token: RwLock::new(admin_token),
+            jwt_secret,
+            max_repos_per_user,
+            max_commit_blob_bytes,
+        }
+    }
+
     pub fn repos_dir(&self) -> PathBuf {
         self.data_dir.join("repos")
+    }
+
+    /// Snapshot the current admin token. Allocates — call once per
+    /// REST request at the auth boundary, not in inner loops.
+    pub fn admin_token(&self) -> String {
+        self.admin_token
+            .read()
+            .expect("admin_token lock poisoned")
+            .clone()
+    }
+
+    /// Replace the in-process admin token. Subsequent REST requests
+    /// authorize against the new value; the old one stops working
+    /// immediately. Idempotent — rotating to the same value is a no-op
+    /// from the caller's perspective.
+    pub fn rotate_admin_token(&self, new: String) {
+        *self.admin_token.write().expect("admin_token lock poisoned") = new;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(token: &str) -> Config {
+        Config::new(
+            PathBuf::from("/tmp/x"),
+            "http://x".to_string(),
+            token.to_string(),
+            None,
+            16,
+            1024,
+        )
+    }
+
+    #[test]
+    fn admin_token_returns_initial_value() {
+        let c = cfg("alpha");
+        assert_eq!(c.admin_token(), "alpha");
+    }
+
+    #[test]
+    fn rotate_replaces_admin_token_atomically() {
+        let c = cfg("alpha");
+        c.rotate_admin_token("beta".to_string());
+        assert_eq!(c.admin_token(), "beta");
+        c.rotate_admin_token("gamma".to_string());
+        assert_eq!(c.admin_token(), "gamma");
+    }
+
+    #[test]
+    fn rotate_to_same_value_is_observable_no_op() {
+        let c = cfg("alpha");
+        c.rotate_admin_token("alpha".to_string());
+        assert_eq!(c.admin_token(), "alpha");
+    }
+
+    #[test]
+    fn concurrent_reads_dont_block_each_other() {
+        // Sanity-check that the chosen lock type doesn't surprise us
+        // under concurrent reads. Spawn N readers that each snapshot
+        // the token a few times — they should all see the same value
+        // and all finish quickly.
+        use std::sync::Arc;
+        use std::thread;
+
+        let c = Arc::new(cfg("shared"));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let c = c.clone();
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(c.admin_token(), "shared");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

@@ -151,14 +151,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 tracing::info!("jwt auth disabled — only admin token accepted");
             }
-            let cfg = Arc::new(Config {
-                data_dir: data_dir.clone(),
+            let cfg = Arc::new(Config::new(
+                data_dir.clone(),
                 public_base_url,
                 admin_token,
                 jwt_secret,
                 max_repos_per_user,
                 max_commit_blob_bytes,
-            });
+            ));
             tracing::info!(
                 max_repos_per_user,
                 max_commit_blob_bytes,

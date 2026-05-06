@@ -159,7 +159,7 @@ pub async fn sse_stream(
 ) -> Result<Sse<impl Stream<Item = std::result::Result<SseEvent, Infallible>>>> {
     let _principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     let rx = state.events.subscribe();

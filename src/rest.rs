@@ -94,7 +94,7 @@ pub async fn create_repo(
 ) -> Result<Json<RepoHandle>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Create)?;
@@ -155,7 +155,7 @@ pub async fn fork_repo(
 ) -> Result<Json<RepoHandle>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Create)?;
@@ -225,7 +225,7 @@ pub async fn mint_token(
 ) -> Result<Json<TokenMinted>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Token)?;
@@ -283,7 +283,7 @@ pub async fn revoke_token(
 ) -> Result<Json<RevokeResponse>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Token)?;
@@ -373,7 +373,7 @@ pub async fn create_webhook(
 ) -> Result<Json<WebhookCreated>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Token)?;
@@ -399,7 +399,7 @@ pub async fn list_webhooks(
 ) -> Result<Json<Vec<crate::webhooks::Subscription>>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     if !state.storage.exists(&id) {
@@ -417,7 +417,7 @@ pub async fn delete_webhook(
 ) -> Result<Json<serde_json::Value>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     if !state.storage.exists(&id) {
@@ -443,7 +443,7 @@ pub async fn list_tokens(
 ) -> Result<Json<Vec<crate::tokens::TokenSummary>>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     if !state.storage.exists(&id) {
@@ -482,7 +482,7 @@ pub async fn rotate_tokens(
 ) -> Result<Json<RotateTokenResponse>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Token)?;
@@ -544,7 +544,7 @@ pub async fn delete_repo(
 ) -> Result<Json<serde_json::Value>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Default)?;
@@ -703,7 +703,7 @@ pub async fn list_repos(
 ) -> Result<Json<Vec<AdminRepoSummary>>> {
     let principal = authorize_rest(
         &headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
@@ -914,7 +914,7 @@ pub async fn admin_gc_run(
 fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
     let principal = authorize_rest(
         headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     if !matches!(principal, crate::auth::Principal::Admin) {

@@ -54,7 +54,7 @@ async fn authorize_read(
 ) -> Result<std::path::PathBuf> {
     let principal = authorize_rest(
         headers,
-        &state.cfg.admin_token,
+        &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
     state.rate_limit.check(&principal, Class::Default)?;
