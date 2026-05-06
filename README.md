@@ -23,9 +23,14 @@ end-to-end in a day, not a quarter.
   without TLS in front, you're broadcasting credentials. Put nginx /
   caddy / cloudflare-tunnel / any TLS terminator in front of the
   listener before exposing it. See [Security](#security-in-one-paragraph).
-- **Not rate-limited.** The admin token has unlimited create / fork /
-  delete. An insider with it can fill the disk and burn inodes. No
-  quotas, no per-token caps, no audit log.
+- **Admin bypasses rate limiting and quotas.** Per-subject token-bucket
+  rate limiting and per-user repo-count quotas are enforced for JWT
+  users; the admin Bearer is the break-glass principal and bypasses
+  both. An insider with the admin token can fill the disk and burn
+  inodes. The audit-event stream (`target: "audit"` tracing events on
+  every mutating call) records actor + repo_id + action — pipe it to a
+  durable sink and you have an after-the-fact paper trail; we don't
+  yet persist it ourselves.
 - **Not a drop-in for a multi-backend storage story.** `Storage` and
   `RefStore` are traits with one filesystem impl each. They're trait
   boundaries, not Spring-style pluggable backends — any real second impl
@@ -674,7 +679,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 64 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id)
+cargo test                  # 164 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
