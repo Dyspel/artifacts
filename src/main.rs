@@ -298,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/repos/:id/notes", get(reads::get_note))
                 .route("/v1/events", get(events::sse_stream))
                 .route("/v1/tokens/revoke", post(rest::revoke_token))
+                .route("/v1/admin/token/rotate", post(rest::admin_rotate_token))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))
                 .route(
@@ -388,7 +389,7 @@ fn check_bind_safety(bind: &str, public_base_url: &str, allow_insecure: bool) ->
     );
 }
 
-fn random_admin_token() -> String {
+pub(crate) fn random_admin_token() -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use rand::Rng;
     let mut bytes = [0u8; 24];

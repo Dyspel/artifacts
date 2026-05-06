@@ -911,6 +911,45 @@ pub async fn admin_gc_run(
     Ok(Json(result))
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminTokenRotateResponse {
+    /// The fresh admin token. Caller stores it; we don't keep a
+    /// plaintext copy server-side beyond the in-memory `Config`
+    /// cell that future requests authorize against.
+    pub token: String,
+}
+
+/// `POST /v1/admin/token/rotate`
+///
+/// Generates a new process-wide admin token, atomically swaps the
+/// in-memory cell, and returns the new token. The previous admin
+/// token stops working on subsequent requests. Admin-only — JWT
+/// principals get 403 from `require_admin`.
+///
+/// The audit event records that rotation happened but never the
+/// token bytes (the old one is being invalidated and the new one
+/// returns in the response body — no audit field needs them).
+///
+/// This is the in-process counterpart to restarting the server
+/// with a different `ARTIFACTS_ADMIN_TOKEN`. Use it after a
+/// suspected leak, before walking away from a shared session, or
+/// any time the previous holder shouldn't keep speaking for
+/// every user.
+pub async fn admin_rotate_token(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminTokenRotateResponse>> {
+    require_admin(&state, &headers)?;
+    let new = crate::random_admin_token();
+    state.cfg.rotate_admin_token(new.clone());
+    tracing::info!(
+        target: "audit",
+        event = "admin.token.rotate",
+        actor = "admin",
+    );
+    Ok(Json(AdminTokenRotateResponse { token: new }))
+}
+
 fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()> {
     let principal = authorize_rest(
         headers,

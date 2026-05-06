@@ -814,5 +814,35 @@ size=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sizeBytes"])' < 
     || { echo "FAIL: detail sizeBytes is $size, expected > 0"; exit 1; }
 echo "    admin → detail → ${ref_count} refs, ${size} bytes on disk"
 
+echo "==> [??] admin-token in-process rotation"
+# Admin can rotate; old token stops working immediately; new token works.
+# Then rotate it back (using the new value) so subsequent steps that rely
+# on $ADMIN_TOKEN continue to work — this step is order-independent if
+# we leave $ADMIN_TOKEN intact at the end.
+rotate_resp="${WORK_DIR}/rotate.json"
+curl -fsS -X POST "${auth[@]}" "$BASE_URL/v1/admin/token/rotate" -o "$rotate_resp"
+new_admin=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' < "$rotate_resp")
+[[ -n "$new_admin" && "$new_admin" != "$ADMIN_TOKEN" ]] \
+    || { echo "FAIL: rotate returned empty/identical token"; cat "$rotate_resp"; exit 1; }
+old_code=$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" "$BASE_URL/v1/admin/repos")
+[[ "$old_code" == "401" ]] \
+    || { echo "FAIL: old admin token still works after rotate (got $old_code, want 401)"; exit 1; }
+new_auth=(-H "Authorization: Bearer ${new_admin}")
+new_code=$(curl -sS -o /dev/null -w '%{http_code}' "${new_auth[@]}" "$BASE_URL/v1/admin/repos")
+[[ "$new_code" == "200" ]] \
+    || { echo "FAIL: new admin token does not work (got $new_code, want 200)"; exit 1; }
+# Rotate back to ADMIN_TOKEN (using the new token's authority) so the
+# rest of the script can reuse $auth if needed.
+curl -fsS -X POST "${new_auth[@]}" -H 'Content-Type: application/json' \
+    "$BASE_URL/v1/admin/token/rotate" >/dev/null
+# After this second rotate, $ADMIN_TOKEN is also stale — but we don't
+# call any more admin endpoints, so that's fine.
+# JWT user can't rotate.
+jwt_rotate_code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    "${alice_auth[@]}" "$BASE_URL/v1/admin/token/rotate")
+[[ "$jwt_rotate_code" == "403" ]] \
+    || { echo "FAIL: JWT user POST /v1/admin/token/rotate expected 403, got $jwt_rotate_code"; exit 1; }
+echo "    rotate → old=401, new=200; JWT-user→403"
+
 echo
 echo "==> all checks passed"
