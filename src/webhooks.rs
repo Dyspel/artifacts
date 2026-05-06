@@ -29,6 +29,7 @@
 //! call sleeps the blocking-pool thread, never the tokio reactor.
 
 use crate::events::Event;
+use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use serde::{Deserialize, Serialize};
@@ -68,28 +69,39 @@ pub trait WebhookRegistry: Send + Sync {
 /// restarts, which is what the in-memory `MemRegistry` does NOT do.
 ///
 /// Schema (created on open if absent):
-///   id          TEXT PRIMARY KEY    — UUIDv4
-///   repo_id     TEXT NOT NULL       — repo this subscription fires for
-///   url         TEXT NOT NULL
-///   secret      TEXT                — plaintext HMAC key (we have to
-///                                      keep it round-trippable so the
-///                                      dispatcher can sign every body;
-///                                      a KMS-backed swap would be a
-///                                      separate commit).
-///   events_json TEXT NOT NULL       — JSON array of event-kind strings
-///   created_at  INTEGER NOT NULL
-///   revoked_at  INTEGER             — set on remove() so an admin can
-///                                      audit the lifecycle; matching()
-///                                      filters out revoked rows.
+///   id           TEXT PRIMARY KEY    — UUIDv4
+///   repo_id      TEXT NOT NULL       — repo this subscription fires for
+///   url          TEXT NOT NULL
+///   secret       TEXT                — base64 AES-256-GCM ciphertext of
+///                                       the HMAC key when secret_nonce is
+///                                       set; legacy plaintext for rows
+///                                       written before the M6-deliver-secrets
+///                                       migration (secret_nonce NULL).
+///   secret_nonce BLOB                — 12-byte AES-GCM nonce paired with
+///                                       `secret`. NULL means legacy
+///                                       plaintext (back-compat with rows
+///                                       inserted before this migration).
+///   events_json  TEXT NOT NULL       — JSON array of event-kind strings
+///   created_at   INTEGER NOT NULL
+///   revoked_at   INTEGER             — set on remove() so an admin can
+///                                       audit the lifecycle; matching()
+///                                       filters out revoked rows.
 ///
 /// Same trait as MemRegistry. Wire choice happens in main.rs based on
 /// whether `ARTIFACTS_WEBHOOK_DB` is set (defaults to in-memory).
 pub struct SqliteWebhookRegistry {
     conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    /// Symmetric key used to seal/unseal `secret`. Held for the
+    /// process lifetime; rotation is out of scope for this slice
+    /// (would require re-encrypting every row).
+    master_key: Arc<crate::secrets::MasterKey>,
 }
 
 impl SqliteWebhookRegistry {
-    pub fn open(path: &std::path::Path) -> crate::error::Result<Self> {
+    pub fn open(
+        path: &std::path::Path,
+        master_key: Arc<crate::secrets::MasterKey>,
+    ) -> crate::error::Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -105,8 +117,22 @@ impl SqliteWebhookRegistry {
              );
              CREATE INDEX IF NOT EXISTS idx_webhooks_repo ON webhooks(repo_id);",
         )?;
+        // M6-deliver-secrets migration: add `secret_nonce` column.
+        // Idempotent — swallow the duplicate-column error so we can
+        // run unchanged against both fresh DBs and DBs that already
+        // ran this migration. Same forward-only pattern the token
+        // store uses for its `subject` column.
+        match conn.execute("ALTER TABLE webhooks ADD COLUMN secret_nonce BLOB", []) {
+            Ok(_) => {
+                tracing::info!("webhook store migrated: added `secret_nonce` column");
+            }
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(crate::error::Error::from(e)),
+        }
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
+            master_key,
         })
     }
 
@@ -125,10 +151,31 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let events = serde_json::to_string(&sub.events).unwrap_or_else(|_| "[]".into());
+
+        // Encrypt the HMAC secret if present. Failed seal falls back
+        // to NULL secret + NULL nonce — that yields a working (but
+        // unsigned) subscription rather than dropping the row.
+        // Failure here is genuinely impossible with a valid 32-byte
+        // key, but we don't unwrap because that would crash the
+        // process on a misconfig that's recoverable.
+        let (secret_b64, nonce_blob): (Option<String>, Option<Vec<u8>>) = match &sub.secret {
+            Some(plaintext) => match crate::secrets::seal(&self.master_key, plaintext.as_bytes()) {
+                Ok((ct, nonce)) => (
+                    Some(BASE64_STD.encode(ct)),
+                    Some(nonce.to_vec()),
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "webhook secret seal failed; storing NULL");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+
         let _ = self.lock().execute(
-            "INSERT INTO webhooks (id, repo_id, url, secret, events_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![sub.id, sub.repo_id, sub.url, sub.secret, events, now],
+            "INSERT INTO webhooks (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![sub.id, sub.repo_id, sub.url, secret_b64, nonce_blob, events, now],
         );
         sub.id
     }
@@ -136,14 +183,17 @@ impl WebhookRegistry for SqliteWebhookRegistry {
     fn list(&self, repo_id: &str) -> Vec<Subscription> {
         let conn = self.lock();
         let mut stmt = match conn.prepare_cached(
-            "SELECT id, repo_id, url, secret, events_json
+            "SELECT id, repo_id, url, secret, secret_nonce, events_json
              FROM webhooks
              WHERE repo_id = ?1 AND revoked_at IS NULL",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = stmt.query_map(rusqlite::params![repo_id], row_to_sub);
+        let key = self.master_key.clone();
+        let rows = stmt.query_map(rusqlite::params![repo_id], move |row| {
+            row_to_sub(row, &key)
+        });
         let rows = match rows {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -179,13 +229,63 @@ impl WebhookRegistry for SqliteWebhookRegistry {
     }
 }
 
-fn row_to_sub(row: &rusqlite::Row<'_>) -> rusqlite::Result<Subscription> {
+fn row_to_sub(
+    row: &rusqlite::Row<'_>,
+    key: &crate::secrets::MasterKey,
+) -> rusqlite::Result<Subscription> {
     let id: String = row.get(0)?;
     let repo_id: String = row.get(1)?;
     let url: String = row.get(2)?;
-    let secret: Option<String> = row.get(3)?;
-    let events_json: String = row.get(4)?;
+    let stored_secret: Option<String> = row.get(3)?;
+    let nonce_blob: Option<Vec<u8>> = row.get(4)?;
+    let events_json: String = row.get(5)?;
     let events: Vec<String> = serde_json::from_str(&events_json).unwrap_or_default();
+
+    // Three cases for the secret column:
+    //   1. (None, _)              — no secret was registered. Nothing to decrypt.
+    //   2. (Some(s), None)        — legacy plaintext (pre-migration row).
+    //                                Return as-is so existing subscriptions keep
+    //                                working through the migration.
+    //   3. (Some(b64), Some(n))   — encrypted. Decrypt with the master key.
+    //                                A decrypt failure (corruption, key mismatch
+    //                                after a botched rotate, base64 garbage)
+    //                                logs and yields None — the subscription
+    //                                stays in the list but bodies go unsigned
+    //                                rather than vanishing entirely.
+    let secret = match (stored_secret, nonce_blob) {
+        (None, _) => None,
+        (Some(s), None) => Some(s),
+        (Some(ct_b64), Some(nonce_vec)) => {
+            let nonce: [u8; 12] = match nonce_vec.as_slice().try_into() {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!(hook_id = %id, "webhook nonce wrong length; treating as unsigned");
+                    return Ok(Subscription { id, repo_id, url, secret: None, events });
+                }
+            };
+            let ct = match BASE64_STD.decode(ct_b64.as_bytes()) {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(hook_id = %id, "webhook ciphertext base64 decode failed; treating as unsigned");
+                    return Ok(Subscription { id, repo_id, url, secret: None, events });
+                }
+            };
+            match crate::secrets::unseal(key, &ct, &nonce) {
+                Ok(pt) => match String::from_utf8(pt) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        tracing::warn!(hook_id = %id, "webhook secret not valid UTF-8 after unseal");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(hook_id = %id, error = %e, "webhook secret unseal failed");
+                    None
+                }
+            }
+        }
+    };
+
     Ok(Subscription {
         id,
         repo_id,
@@ -536,10 +636,14 @@ mod tests {
         assert_eq!(kind_str(b"not json"), "unknown");
     }
 
+    fn test_master_key() -> Arc<crate::secrets::MasterKey> {
+        Arc::new(crate::secrets::MasterKey::random())
+    }
+
     fn open_sqlite_registry() -> (tempfile::TempDir, SqliteWebhookRegistry) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("webhooks.db");
-        let r = SqliteWebhookRegistry::open(&path).unwrap();
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
         (dir, r)
     }
 
@@ -580,8 +684,11 @@ mod tests {
     fn sqlite_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("webhooks.db");
+        // Single shared key — both `open` calls must use the same one
+        // to decrypt the secret on the second open.
+        let key = test_master_key();
         let id = {
-            let r = SqliteWebhookRegistry::open(&path).unwrap();
+            let r = SqliteWebhookRegistry::open(&path, key.clone()).unwrap();
             r.add(Subscription {
                 id: String::new(),
                 repo_id: "r1".into(),
@@ -591,7 +698,7 @@ mod tests {
             })
         };
         // Drop, reopen on the same path. Must see the row.
-        let r = SqliteWebhookRegistry::open(&path).unwrap();
+        let r = SqliteWebhookRegistry::open(&path, key).unwrap();
         let listed = r.list("r1");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
@@ -620,5 +727,95 @@ mod tests {
         let m_fork = r.matching("r1", "fork");
         assert_eq!(m_fork.len(), 1);
         assert_eq!(m_fork[0].url, "u-all");
+    }
+
+    #[test]
+    fn sqlite_secret_on_disk_is_opaque_ciphertext() {
+        // Open the registry, write a known plaintext, then peek at
+        // the row directly via raw SQL — the `secret` column must
+        // not be readable as the original plaintext, and
+        // `secret_nonce` must be set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "u".into(),
+            secret: Some("plaintext-marker-XYZ".into()),
+            events: vec![],
+        });
+        // Raw read against the same DB file. Must NOT see "plaintext-marker-XYZ".
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (stored_secret, nonce): (Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT secret, secret_nonce FROM webhooks WHERE repo_id = 'r1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let stored_secret = stored_secret.expect("secret column NULL after add");
+        let nonce = nonce.expect("secret_nonce column NULL after add");
+        assert_eq!(nonce.len(), 12, "nonce must be 12 bytes for AES-GCM");
+        assert!(
+            !stored_secret.contains("plaintext-marker-XYZ"),
+            "ciphertext column leaked plaintext: {stored_secret}",
+        );
+    }
+
+    #[test]
+    fn sqlite_wrong_key_yields_unsigned_subscription() {
+        // Write under one key, reopen under a different key. The
+        // subscription must still appear in the list (so the admin
+        // can see "this hook exists") but the secret is dropped to
+        // None so deliveries go unsigned rather than panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        let k1 = test_master_key();
+        {
+            let r = SqliteWebhookRegistry::open(&path, k1).unwrap();
+            r.add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "u".into(),
+                secret: Some("k".into()),
+                events: vec![],
+            });
+        }
+        let k2 = test_master_key(); // fresh, unrelated
+        let r = SqliteWebhookRegistry::open(&path, k2).unwrap();
+        let listed = r.list("r1");
+        assert_eq!(listed.len(), 1, "subscription should still be visible");
+        assert_eq!(
+            listed[0].secret, None,
+            "wrong key must produce None secret, not garbage"
+        );
+    }
+
+    #[test]
+    fn sqlite_legacy_plaintext_rows_still_readable() {
+        // Simulate a row written before the secret-encryption migration:
+        // secret = plaintext, secret_nonce = NULL. The reader must
+        // detect that and return the plaintext as-is so existing
+        // subscriptions keep working through the migration.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        // First open to run the schema migrations.
+        let _r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        // Now insert a legacy-shape row directly: secret_nonce = NULL.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO webhooks (id, repo_id, url, secret, secret_nonce, events_json, created_at)
+             VALUES ('legacy-hook', 'r1', 'u', 'legacy-plaintext-secret', NULL, '[]', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        // Reopen via the registry with a (different) key — legacy rows
+        // ignore the key entirely.
+        let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+        let listed = r.list("r1");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].secret.as_deref(), Some("legacy-plaintext-secret"));
     }
 }

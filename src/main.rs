@@ -235,8 +235,17 @@ async fn main() -> anyhow::Result<()> {
             let webhook_registry: Arc<dyn webhooks::WebhookRegistry> =
                 match webhook_db_path {
                     Some(p) => {
-                        tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry");
-                        Arc::new(webhooks::SqliteWebhookRegistry::open(&p)?)
+                        // Load the AES-256 master key that seals webhook
+                        // HMAC secrets at rest. Resolution order is
+                        // env-first, then `<data-dir>/webhook-key.bin`,
+                        // then auto-generate (with a warning) so a
+                        // first-run dev server doesn't fail to start.
+                        let key_path = data_dir.join("webhook-key.bin");
+                        let master_key = Arc::new(
+                            secrets::MasterKey::load_or_generate(&key_path)?,
+                        );
+                        tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry (encrypted secrets)");
+                        Arc::new(webhooks::SqliteWebhookRegistry::open(&p, master_key)?)
                     }
                     None => {
                         tracing::info!("webhooks: in-memory registry (subscriptions lost on restart)");
