@@ -99,7 +99,7 @@ end-to-end in a day, not a quarter.
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait scaffolded | 🟡 M2b |
+| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait + `MemObjectStore` + conformance suite landed; production read routing + chunked-KV impl remain | 🟡 M2b |
 | Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
 | Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
 | Admin-token rotation (in-process) | ✅ M4b-key-rotation |
@@ -129,11 +129,15 @@ when subprocess isn't an option.
 
 Remaining, in order:
 
-1. **M2b — chunked-KV `Storage` impl.** The `ObjectStore` trait
-   is scaffolded; the protocol layer no longer assumes a
-   `<repo>/objects/` directory on disk for hot-path reads. The
-   chunked-KV impl + lifecycle ops (which still call `git init
-   --bare`) is the remaining work.
+1. **M2b — chunked-KV `Storage` impl.** `ObjectStore` trait +
+   two impls (`FsObjectStore`, `MemObjectStore`) + a shared
+   conformance suite landed — the trait shape is no longer
+   FS-specific, and a chunked-KV impl plugs in by satisfying
+   the same conformance helpers. Production code doesn't route
+   through the trait yet (reads still touch the filesystem
+   directly or via gix); routing the receive-pack and
+   commits-plumbing paths through `ObjectStore` is the next
+   slice, then the chunked-KV impl itself.
 2. **M3b — distributed `RefStore` impl.** `MemRefStore` + a
    concurrent-CAS conformance test landed; the consensus log
    (openraft) + per-repo state machine + leader election +
@@ -755,7 +759,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 192 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption)
+cargo test                  # 198 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc, webhooks, config rotation, audit log + retention, webhook-secret encryption, object-store conformance)
 ./tests/smoke.sh            # 14-step end-to-end integration test
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
@@ -788,7 +792,7 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
 | **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
 | **M1b-3-gix** | 🟡 opt-in | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Available behind `ARTIFACTS_NATIVE_INDEX_PACK=1`; the bench (see Push latency above) showed `gix-pack` is ~4× slower than `git unpack-objects` on typical small pushes, so the default is the subprocess until the crossover improves upstream. The dispatch + helper are wired so a future chunked-KV `Storage` impl (which can't shell out) gets a working native path on day one. | n/a (default subprocess) |
-| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait scaffolded; full impl unblocked once M1b-3-gix ships and the unpack-objects subprocess is gone. | bare repos on disk |
+| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait + `FsObjectStore` + `MemObjectStore` + a shared conformance suite landed (proof the trait isn't FS-specific). Production read routing + the chunked-KV impl itself + lifecycle ops remain. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
 | **M4b-key-rotation** | ✅ done | In-process admin-token rotation (`POST /v1/admin/token/rotate`). `Config::admin_token` is a runtime `RwLock<String>`; rotation atomically swaps the cell, the previous token stops authorizing on the next request, and the event lands on the `audit` tracing target. | env-var-on-restart only |
