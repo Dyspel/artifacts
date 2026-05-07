@@ -16,6 +16,7 @@ use crate::{
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -913,25 +914,69 @@ pub struct RefEntry {
     pub sha: String,
 }
 
+/// Pagination query for `GET /v1/admin/repos`. Both fields are optional;
+/// missing fields fall back to `DEFAULT_LIMIT` / `0`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct AdminListReposQuery {
+    /// Page size. Server-capped at `MAX_LIMIT` (5000); default 1000.
+    /// 1000 is high enough that no realistic prototype-stage caller
+    /// (the GUI poller, the smoke harness) hits it implicitly — the
+    /// cap is a safety bound on a previously-unbounded endpoint, not
+    /// a behaviour change for current users.
+    pub limit: Option<u32>,
+    /// Number of rows to skip (in `created_at DESC` order). Use the
+    /// `X-Total-Count` response header to know when to stop paging.
+    pub offset: Option<u32>,
+}
+
+const ADMIN_LIST_REPOS_DEFAULT_LIMIT: u32 = 1000;
+const ADMIN_LIST_REPOS_MAX_LIMIT: u32 = 5000;
+
 /// `GET /v1/admin/repos`
 ///
-/// Returns every repo the server knows about. Expensive bits (disk size,
+/// Returns the repos the server knows about. Expensive bits (disk size,
 /// ref list) are deliberately left off this list endpoint so it stays
 /// cheap even with thousands of repos — those live on the single-repo
 /// detail endpoint.
+///
+/// Pagination: `?limit=N&offset=M`. Default limit is
+/// [`ADMIN_LIST_REPOS_DEFAULT_LIMIT`], hard-capped at
+/// [`ADMIN_LIST_REPOS_MAX_LIMIT`]. The total row count is returned in
+/// the `X-Total-Count` response header so callers can tell whether
+/// they need to fetch more pages.
 pub async fn admin_list_repos(
     State(state): State<RestState>,
+    axum::extract::Query(q): axum::extract::Query<AdminListReposQuery>,
     headers: HeaderMap,
-) -> Result<Json<Vec<AdminRepoSummary>>> {
+) -> Result<Response> {
     require_admin(&state, &headers)?;
     state.rate_limit.check(
         &crate::auth::Principal::Admin, // rate-limit is a no-op for admin; kept for symmetry
         crate::rate_limit::Class::Default,
     )?;
 
-    let rows = state.ownership.list_all().await?;
+    let limit = q
+        .limit
+        .unwrap_or(ADMIN_LIST_REPOS_DEFAULT_LIMIT)
+        .min(ADMIN_LIST_REPOS_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+
+    let total = state.ownership.count_all().await?;
+    let rows = state.ownership.list_paginated(limit, offset).await?;
+
+    // Operational signal: if a caller hit the cap without paging,
+    // they're probably truncating silently — log it once per request.
+    if offset == 0 && total > limit as u64 {
+        tracing::warn!(
+            total,
+            limit,
+            "/v1/admin/repos returned a truncated page; caller should paginate via ?offset=",
+        );
+    }
+
     let repos_dir = state.cfg.repos_dir();
-    let summaries = rows
+    let summaries: Vec<AdminRepoSummary> = rows
         .into_iter()
         .map(|r| AdminRepoSummary {
             source_id: state.alternates_cache.lookup(&repos_dir, &r.id),
@@ -940,7 +985,15 @@ pub async fn admin_list_repos(
             created_at: r.created_at,
         })
         .collect();
-    Ok(Json(summaries))
+
+    let body = Json(summaries).into_response();
+    let (mut parts, body) = body.into_parts();
+    parts.headers.insert(
+        axum::http::HeaderName::from_static("x-total-count"),
+        axum::http::HeaderValue::from_str(&total.to_string())
+            .expect("u64 decimal fits in a header value"),
+    );
+    Ok(Response::from_parts(parts, body))
 }
 
 /// `GET /v1/admin/repos/:id`

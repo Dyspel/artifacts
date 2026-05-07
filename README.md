@@ -678,8 +678,9 @@ structured field — grep-friendly for incident debugging.
 ### Admin inspection (read-only)
 
 ```
-GET /v1/admin/repos         →  [{ id, owner, createdAt, sourceId? }, ...]
-GET /v1/admin/repos/:id     →  { …summary, sizeBytes, refs: [{ name, sha }] }
+GET /v1/admin/repos                          →  [{ id, owner, createdAt, sourceId? }, ...]
+GET /v1/admin/repos?limit=N&offset=M         →  same, paginated
+GET /v1/admin/repos/:id                      →  { …summary, sizeBytes, refs: [{ name, sha }] }
 ```
 
 Both admin-only. `sourceId` is derived by reading the repo's
@@ -687,6 +688,14 @@ Both admin-only. `sourceId` is derived by reading the repo's
 admin list without a separate column. The list endpoint intentionally
 omits size and ref walks (O(n_repos) each); those live on the detail
 endpoint, which walks only the requested repo.
+
+The list endpoint accepts optional `limit` (default 1000, capped at
+5000) and `offset` (default 0) query params, and always returns the
+full row count in the `X-Total-Count` response header so callers can
+detect when they need another page. The default of 1000 is high
+enough that realistic prototype-stage callers (the GUI poller, the
+smoke harness) hit it implicitly; the cap is a safety bound on a
+previously-unbounded endpoint, not a behaviour change.
 
 Powers [`artifacts-gui`](./GUI.md) — the Wayland/X11 live viewer — and
 any other tooling that needs to browse server state out-of-band.

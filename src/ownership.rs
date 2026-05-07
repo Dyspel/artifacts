@@ -71,6 +71,32 @@ pub trait OwnershipStore: Send + Sync {
     /// Order is `created_at DESC` so the newest repos show first.
     async fn list_all(&self) -> Result<Vec<RepoRow>>;
 
+    /// Page-shaped variant of `list_all` for the admin REST surface.
+    /// Same ordering (`created_at DESC`); the implementation pushes
+    /// `LIMIT`/`OFFSET` into SQL so a paginated request doesn't load
+    /// the entire table into Rust memory just to slice it.
+    ///
+    /// Default impl falls back to `list_all` + slice so non-SQL
+    /// stores (the in-memory test store) don't need to special-case
+    /// this. Production stores override.
+    async fn list_paginated(&self, limit: u32, offset: u32) -> Result<Vec<RepoRow>> {
+        let all = self.list_all().await?;
+        let off = offset as usize;
+        if off >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = (off + limit as usize).min(all.len());
+        Ok(all[off..end].to_vec())
+    }
+
+    /// Total row count for the admin list. Used to populate the
+    /// `X-Total-Count` header alongside a paginated response so callers
+    /// can tell whether they need another page. Constant-time on SQLite
+    /// (`SELECT COUNT(*)`); default falls back to `list_all().len()`.
+    async fn count_all(&self) -> Result<u64> {
+        Ok(self.list_all().await?.len() as u64)
+    }
+
     /// List repos owned by a specific user subject. Admin-owned repos
     /// (owner_subject = NULL) are excluded; they belong to no user's
     /// fleet. Order is `created_at DESC`. Uses the `idx_repos_owner`
@@ -185,6 +211,37 @@ impl OwnershipStore for SqliteOwnershipStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    async fn list_paginated(&self, limit: u32, offset: u32) -> Result<Vec<RepoRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_subject, created_at
+             FROM repos
+             ORDER BY created_at DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+            Ok(RepoRow {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    async fn count_all(&self) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM repos")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.expect("COUNT(*) always returns one row");
+        let n: i64 = row.get(0)?;
+        Ok(n as u64)
     }
 
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {
@@ -492,6 +549,52 @@ mod tests {
     async fn list_all_empty_when_no_rows() {
         let (_d, store) = fresh_store();
         assert!(store.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_paginated_slices_under_full_list_order() {
+        // Insert four rows with distinct creation timestamps so the
+        // newest-first ordering is unambiguous, then verify that
+        // `list_paginated(2, 1)` is exactly the second-and-third-newest
+        // — the same slice the caller would compute by hand from
+        // `list_all()`.
+        let (_d, store) = fresh_store();
+        store.record_owner("oldest", Some("u")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.record_owner("older", Some("u")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.record_owner("newer", Some("u")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        store.record_owner("newest", Some("u")).await.unwrap();
+
+        let page = store.list_paginated(2, 1).await.unwrap();
+        let ids: Vec<&str> = page.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["newer", "older"]);
+    }
+
+    #[tokio::test]
+    async fn list_paginated_offset_past_end_returns_empty() {
+        let (_d, store) = fresh_store();
+        store.record_owner("only", Some("u")).await.unwrap();
+        let page = store.list_paginated(10, 5).await.unwrap();
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_all_matches_list_all_len() {
+        // The whole point of `count_all` is to be cheaper than
+        // `list_all().len()` while returning the same number — so this
+        // test pins the equivalence rather than the implementation.
+        let (_d, store) = fresh_store();
+        assert_eq!(store.count_all().await.unwrap(), 0);
+        store.record_owner("a", Some("u")).await.unwrap();
+        store.record_owner("b", None).await.unwrap();
+        store.record_owner("c", Some("v")).await.unwrap();
+        assert_eq!(store.count_all().await.unwrap(), 3);
+        assert_eq!(
+            store.count_all().await.unwrap() as usize,
+            store.list_all().await.unwrap().len()
+        );
     }
 
     #[tokio::test]

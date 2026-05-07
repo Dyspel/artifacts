@@ -822,6 +822,23 @@ jwt_code=$(curl -sS -o /dev/null -w '%{http_code}' \
     || { echo "FAIL: JWT user hitting /v1/admin/repos expected 403, got $jwt_code"; exit 1; }
 echo "    JWT user → /v1/admin/repos → 403 (admin-only)"
 
+# Pagination: ?limit=1 returns one row, X-Total-Count header carries
+# the unpaginated total. Default behavior (no query) was just exercised
+# above and must keep returning the full list, so this only pokes the
+# explicit-pagination path.
+paginated_headers="${WORK_DIR}/admin_list_paginated.headers"
+paginated_body="${WORK_DIR}/admin_list_paginated.json"
+curl -fsS "${auth[@]}" -D "$paginated_headers" -o "$paginated_body" \
+    "$BASE_URL/v1/admin/repos?limit=1"
+paginated_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$paginated_body")
+[[ "$paginated_count" == "1" ]] \
+    || { echo "FAIL: ?limit=1 returned $paginated_count rows, expected exactly 1"; exit 1; }
+total_header=$(grep -i '^x-total-count:' "$paginated_headers" \
+    | tr -d '\r' | awk '{print $2}')
+[[ "$total_header" == "$count" ]] \
+    || { echo "FAIL: X-Total-Count='$total_header' should match unpaginated count='$count'"; exit 1; }
+echo "    admin → ?limit=1 → 1 row, X-Total-Count=$total_header"
+
 # Detail endpoint returns refs + size-on-disk.
 detail="${WORK_DIR}/admin_detail.json"
 curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/repos/${repo_id}" -o "$detail"
