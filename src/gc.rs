@@ -49,6 +49,7 @@
 
 use crate::alternates_cache::AlternatesCache;
 use crate::error::{Error, Result};
+use crate::object_store::ObjectStore;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -115,10 +116,17 @@ pub struct GcResult {
 /// Compute the GC preview. Subprocess cost: one `git rev-list` per
 /// repo in the network. For a typical repo with no forks, that's
 /// one subprocess. For a repo with N forks, it's N+1.
+///
+/// Loose-object enumeration goes through the `ObjectStore` trait —
+/// the FS impl reads the on-disk shard tree, a future chunked-KV
+/// impl reads its own table. Reachability still spawns
+/// `git rev-list` per network member; that path requires real on-disk
+/// state today and isn't part of the trait yet.
 pub fn preview(
     repos_dir: &Path,
     repo_id: &str,
     cache: &AlternatesCache,
+    objects: &dyn ObjectStore,
 ) -> Result<GcPreview> {
     let mut network = network_around(repos_dir, repo_id, cache)?;
     network.sort();
@@ -132,18 +140,17 @@ pub fn preview(
         }
     }
 
-    let target_repo = repos_dir.join(format!("{repo_id}.git"));
-    let loose = loose_objects(&target_repo)?;
+    let loose = objects.list_loose(repo_id)?;
 
     let mut unreachable_bytes: u64 = 0;
     let mut sample: Vec<String> = Vec::new();
     let mut unreachable_count: u64 = 0;
-    for (oid, size) in &loose {
-        if !reachable.contains(oid) {
+    for info in &loose {
+        if !reachable.contains(&info.oid) {
             unreachable_count += 1;
-            unreachable_bytes += size;
+            unreachable_bytes += info.size;
             if sample.len() < SAMPLE_CAP {
-                sample.push(oid.clone());
+                sample.push(info.oid.clone());
             }
         }
     }
@@ -184,19 +191,20 @@ pub fn run(
     repo_id: &str,
     cache: &AlternatesCache,
     min_age_secs: u64,
+    objects: &dyn ObjectStore,
 ) -> Result<GcResult> {
-    let preview = preview(repos_dir, repo_id, cache)?;
-    let target_repo = repos_dir.join(format!("{repo_id}.git"));
-    let now = std::time::SystemTime::now();
-    let cutoff = now
-        .checked_sub(std::time::Duration::from_secs(min_age_secs))
-        .unwrap_or(std::time::UNIX_EPOCH);
+    let preview = preview(repos_dir, repo_id, cache, objects)?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff_secs = now_secs.saturating_sub(min_age_secs as i64);
 
-    // Re-walk loose objects: cheaper than threading the full list
-    // through the preview return (which only carries a sample).
-    // The preview-then-walk pair is each O(N); doing the walk
-    // twice is fine at our repo size.
-    let loose = loose_objects(&target_repo)?;
+    // Re-list loose objects through the trait. Cheaper than threading
+    // the full list through preview's return (which only carries a
+    // bounded sample). The preview-then-list pair is each O(N); doing
+    // the enumerate twice is fine at our repo size.
+    let loose = objects.list_loose(repo_id)?;
 
     // Recompute reachable here so we don't have to plumb it through
     // GcPreview's public shape (which is intentionally bounded).
@@ -210,36 +218,37 @@ pub fn run(
     let mut deleted = 0u64;
     let mut deleted_bytes = 0u64;
     let mut skipped_too_young = 0u64;
-    for (oid, _size) in &loose {
-        if reachable.contains(oid) {
+    for info in &loose {
+        if reachable.contains(&info.oid) {
             continue;
         }
-        let path = loose_path(&target_repo, oid);
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            // Already gone — possibly a concurrent gc or a race.
-            // Either way, nothing to do.
-            Err(_) => continue,
-        };
-        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        if mtime > cutoff {
+        // Anti-race guard: a push that landed objects seconds ago
+        // might be mid-stream — its ref hasn't yet pointed at these
+        // objects. The `created_secs` field comes from the trait
+        // (FS = mtime; chunked-KV = the row's own created_at), so
+        // this guard works for any backend.
+        if info.created_secs > cutoff_secs {
             skipped_too_young += 1;
             tracing::debug!(
-                oid = %oid, age_secs = ?now.duration_since(mtime).map(|d| d.as_secs()),
+                oid = %info.oid,
+                age_secs = now_secs.saturating_sub(info.created_secs),
                 "gc: skipping young loose object"
             );
             continue;
         }
-        match std::fs::remove_file(&path) {
-            Ok(_) => {
+        match objects.delete_loose(repo_id, &info.oid) {
+            Ok(true) => {
                 deleted += 1;
-                deleted_bytes += meta.len();
-                tracing::debug!(oid = %oid, bytes = meta.len(), "gc: removed");
+                deleted_bytes += info.size;
+                tracing::debug!(oid = %info.oid, bytes = info.size, "gc: removed");
             }
+            // Already gone — concurrent gc, or a race. Treat as a
+            // no-op rather than counting toward `deleted`.
+            Ok(false) => {}
             Err(e) => {
                 // Soft-fail per object — a permission error or
                 // racy unlink shouldn't abort the whole pass.
-                tracing::warn!(oid = %oid, error = %e, "gc: remove failed");
+                tracing::warn!(oid = %info.oid, error = %e, "gc: remove failed");
             }
         }
     }
@@ -254,14 +263,6 @@ pub fn run(
         deleted_bytes,
         skipped_too_young,
     })
-}
-
-/// `<git_dir>/objects/<aa>/<bbbb…>` — the canonical loose-object
-/// path, sharded by the first two hex chars. Caller must have
-/// already validated `oid` as 40-char hex.
-fn loose_path(git_dir: &Path, oid: &str) -> std::path::PathBuf {
-    let (a, b) = oid.split_at(2);
-    git_dir.join("objects").join(a).join(b)
 }
 
 /// BFS over the alternates relation to find every repo connected
@@ -329,45 +330,10 @@ fn rev_list_objects(repos_dir: &Path, repo_id: &str) -> Result<Vec<String>> {
     Ok(oids)
 }
 
-/// Walk `<git_dir>/objects/<aa>/<bbbb…>` and return (oid, size) for
-/// every loose object on disk. Skips `objects/info` and
-/// `objects/pack` since those aren't loose objects.
-fn loose_objects(git_dir: &Path) -> Result<Vec<(String, u64)>> {
-    let objects = git_dir.join("objects");
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&objects) {
-        Ok(e) => e,
-        Err(_) => return Ok(out),
-    };
-    for ent in entries.flatten() {
-        let name = match ent.file_name().to_str().map(|s| s.to_string()) {
-            Some(s) => s,
-            None => continue,
-        };
-        // Loose object subdirs are exactly 2 hex chars.
-        if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let subdir = ent.path();
-        let inner = match std::fs::read_dir(&subdir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for f in inner.flatten() {
-            let fname = match f.file_name().to_str().map(|s| s.to_string()) {
-                Some(s) => s,
-                None => continue,
-            };
-            if fname.len() != 38 || !fname.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let oid = format!("{name}{fname}");
-            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push((oid, size));
-        }
-    }
-    Ok(out)
-}
+// `loose_objects` and `loose_path` were filesystem-direct helpers
+// before M2b production routing landed. They've been replaced by
+// `ObjectStore::list_loose` and `ObjectStore::delete_loose`
+// respectively — gc is now backend-neutral.
 
 #[cfg(test)]
 mod tests {
@@ -448,12 +414,9 @@ mod tests {
     fn preview_on_clean_repo_reports_zero_unreachable() {
         let (tmp, storage, repo_id) = seed_repo();
         let cache = AlternatesCache::new();
-        let p = preview(
-            &storage_repos_dir(&tmp, &storage),
-            &repo_id,
-            &cache,
-        )
-        .unwrap();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let objects = fs_objects(&repos_dir);
+        let p = preview(&repos_dir, &repo_id, &cache, &objects).unwrap();
 
         assert_eq!(p.network, vec![repo_id.clone()]);
         assert!(p.reachable_oids >= 3, "commit + tree + blob = 3+");
@@ -487,12 +450,9 @@ mod tests {
             .to_string();
 
         let cache = AlternatesCache::new();
-        let preview = preview(
-            &storage_repos_dir(&tmp, &storage),
-            &repo_id,
-            &cache,
-        )
-        .unwrap();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let objects = fs_objects(&repos_dir);
+        let preview = preview(&repos_dir, &repo_id, &cache, &objects).unwrap();
         assert_eq!(preview.unreachable_loose, 1);
         assert!(preview.unreachable_bytes > 0);
         assert!(
@@ -516,7 +476,8 @@ mod tests {
         storage.fork(&source_id, &fork_id).unwrap();
 
         let cache = AlternatesCache::new();
-        let p_source = preview(&repos_dir, &source_id, &cache).unwrap();
+        let objects = fs_objects(&repos_dir);
+        let p_source = preview(&repos_dir, &source_id, &cache, &objects).unwrap();
         // Network must contain both repos (sorted).
         assert_eq!(p_source.network.len(), 2);
         assert!(p_source.network.contains(&source_id));
@@ -529,6 +490,18 @@ mod tests {
 
     fn storage_repos_dir(tmp: &tempfile::TempDir, _storage: &FsStorage) -> std::path::PathBuf {
         tmp.path().join("repos")
+    }
+
+    /// Build an `FsObjectStore` rooted at the same `<tmp>/repos` the
+    /// test fixtures use, plus a path-builder for the canonical
+    /// loose-object on-disk location (used by the existence-on-disk
+    /// asserts that the trait doesn't directly expose).
+    fn fs_objects(repos_dir: &std::path::Path) -> crate::object_store::FsObjectStore {
+        crate::object_store::FsObjectStore::new(repos_dir.to_path_buf())
+    }
+    fn loose_path(git_dir: &std::path::Path, oid: &str) -> std::path::PathBuf {
+        let (a, b) = oid.split_at(2);
+        git_dir.join("objects").join(a).join(b)
     }
 
     #[test]
@@ -560,14 +533,15 @@ mod tests {
         assert!(dpath.exists(), "dangler should be on disk before gc");
 
         let cache = AlternatesCache::new();
-        let result = run(&repos_dir, &repo_id, &cache, 0).unwrap();
+        let objects = fs_objects(&repos_dir);
+        let result = run(&repos_dir, &repo_id, &cache, 0, &objects).unwrap();
         assert_eq!(result.deleted, 1, "exactly the dangler");
         assert!(result.deleted_bytes > 0);
         assert_eq!(result.skipped_too_young, 0);
         assert!(!dpath.exists(), "dangler should be gone after gc");
 
         // A second run is a no-op — already cleaned.
-        let result2 = run(&repos_dir, &repo_id, &cache, 0).unwrap();
+        let result2 = run(&repos_dir, &repo_id, &cache, 0, &objects).unwrap();
         assert_eq!(result2.deleted, 0);
         assert_eq!(result2.skipped_too_young, 0);
     }
@@ -598,7 +572,8 @@ mod tests {
             .to_string();
 
         let cache = AlternatesCache::new();
-        let result = run(&repos_dir, &repo_id, &cache, 3600).unwrap();
+        let objects = fs_objects(&repos_dir);
+        let result = run(&repos_dir, &repo_id, &cache, 3600, &objects).unwrap();
         assert_eq!(result.deleted, 0, "young object should not be deleted");
         assert_eq!(result.skipped_too_young, 1);
         // File still on disk.

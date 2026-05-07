@@ -209,6 +209,12 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("metrics init failed: {e:#}"))?;
             std::fs::create_dir_all(&data_dir)?;
             let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
+            // Object-store seam: gc reads/writes/lists/deletes loose
+            // objects through this. The FS impl wraps the same
+            // `<repos_dir>` the storage layer uses; a future chunked-KV
+            // impl swaps in here without changing handler code.
+            let objects: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::FsObjectStore::new(cfg.repos_dir()));
             let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
             tracing::info!(path = %token_db_path.display(), "opening metadata db");
             let sqlite_tokens = Arc::new(SqliteTokenStore::open(&token_db_path)?);
@@ -323,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
                 webhooks: webhook_registry,
                 audit,
                 webhook_key_path,
+                objects,
             };
             // Bench A/B kill-switch. Production never sets this; the
             // bench scripts toggle it to compare native vs subprocess

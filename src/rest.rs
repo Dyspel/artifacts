@@ -62,6 +62,11 @@ pub struct RestState {
     /// `admin_rotate_webhook_key` handler updates this file (if set)
     /// after a successful rotation so a restart picks up the new key.
     pub webhook_key_path: Option<std::path::PathBuf>,
+    /// Object-store backend for loose-object reads / writes / list /
+    /// delete. M2b's first production-routing landing — `gc` goes
+    /// through this trait now. A future chunked-KV backend swaps
+    /// in by satisfying the same trait.
+    pub objects: Arc<dyn crate::object_store::ObjectStore>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -951,6 +956,7 @@ pub async fn admin_gc_preview(
         &state.cfg.repos_dir(),
         &id,
         &state.alternates_cache,
+        &*state.objects,
     )?;
     Ok(Json(preview))
 }
@@ -991,6 +997,7 @@ pub async fn admin_gc_run(
         &id,
         &state.alternates_cache,
         q.min_age_secs.unwrap_or(7200),
+        &*state.objects,
     )?;
     Ok(Json(result))
 }
