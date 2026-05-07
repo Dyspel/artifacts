@@ -322,6 +322,13 @@ async fn main() -> anyhow::Result<()> {
             // events start flying. Otherwise the first commit/fork on
             // boot wouldn't reach any subscribers.
             webhooks::spawn_dispatcher(webhook_registry.clone(), event_bus.clone());
+            // Active-subscription gauge: synchronous startup populate +
+            // 60s refresher. Mirrors the active-token gauge shape.
+            webhooks::refresh_active_webhook_gauge(&*webhook_registry);
+            webhooks::spawn_active_gauge_refresher(
+                webhook_registry.clone(),
+                Duration::from_secs(60),
+            );
 
             let rest_state = RestState {
                 cfg: cfg.clone(),

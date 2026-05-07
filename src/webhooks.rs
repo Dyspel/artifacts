@@ -79,6 +79,14 @@ pub trait WebhookRegistry: Send + Sync {
     ) -> crate::error::Result<u64> {
         Ok(0)
     }
+
+    /// Total non-revoked subscription count across all repos. Powers
+    /// the `artifacts_webhooks_active_total` gauge. Default impl
+    /// returns 0 — `MemRegistry` doesn't expose a cheap aggregate.
+    /// SQLite overrides.
+    fn count_active(&self) -> crate::error::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// SQLite-backed `WebhookRegistry`. Subscriptions persist across
@@ -260,6 +268,16 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             .into_iter()
             .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
             .collect()
+    }
+
+    fn count_active(&self) -> crate::error::Result<u64> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webhooks WHERE revoked_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
     }
 
     /// Re-encrypt every secret-bearing row under `new`, then atomically
@@ -450,6 +468,34 @@ impl WebhookRegistry for MemRegistry {
             .cloned()
             .collect()
     }
+}
+
+/// One-shot — read the active subscription count and publish to the
+/// `artifacts_webhooks_active_total` gauge. Failure is best-effort
+/// logged; the gauge keeps its previous value.
+pub fn refresh_active_webhook_gauge(registry: &dyn WebhookRegistry) {
+    match registry.count_active() {
+        Ok(n) => metrics::gauge!("artifacts_webhooks_active_total").set(n as f64),
+        Err(e) => tracing::warn!(error = %e, "active-webhook gauge refresh failed"),
+    }
+}
+
+/// Spawn a 60-second refresher for the active-webhook gauge. Same
+/// shape as `tokens::spawn_active_gauge_refresher`; both run in
+/// parallel so the metrics surface tracks real activity within a
+/// minute.
+pub fn spawn_active_gauge_refresher(
+    registry: Arc<dyn WebhookRegistry>,
+    tick: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            refresh_active_webhook_gauge(&*registry);
+        }
+    });
 }
 
 /// Long-lived task that subscribes to the event bus and dispatches

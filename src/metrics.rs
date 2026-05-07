@@ -27,6 +27,10 @@
 //!   tokio task, and at the tail of each hourly token-prune sweep.
 //!   Useful for capacity planning + spotting anomalous-mass token
 //!   issuance within a minute of it happening.
+//! - `artifacts_webhooks_active_total` — gauge (non-revoked webhook
+//!   subscription count, across all repos). Same 60-second refresh
+//!   cadence as the token gauge. Useful for catching subscription
+//!   leaks (handlers adding faster than they remove).
 //! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
 //!   (already-shipped; incremented by the webhook dispatcher with
 //!   outcome ∈ {ok, http_error, transport_error})
