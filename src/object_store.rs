@@ -53,12 +53,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-/// Read-only view into a repo's git object database. Writes don't
-/// have a method yet — receive-pack writes go through
-/// `git unpack-objects` (M1b-3 leaf). When that subprocess is
-/// replaced with native code, we'll add `write_loose` here.
+/// Read + write view into a repo's git object database.
 ///
-/// Production paths don't route through this yet — the trait + impl
+/// Production paths don't route through this yet — the trait + impls
 /// exist as M2b foundation per the README. Annotated `#[allow(dead_code)]`
 /// so the unused warning doesn't drift into a real signal once
 /// real callers land.
@@ -71,6 +68,18 @@ pub trait ObjectStore: Send + Sync {
     /// need that distinction should consult a higher-level `find`
     /// API on top of this trait.
     fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Store loose-object bytes for `(repo_id, oid)`. Idempotent:
+    /// a second write of the same `oid` is a no-op (loose objects
+    /// are content-addressed — the same oid implies the same
+    /// bytes). Malformed `oid` is rejected with an error rather
+    /// than silently dropped, since this is a write path and the
+    /// caller wants to know.
+    ///
+    /// FS impl writes atomically via tmp-then-rename so a torn
+    /// write never leaves a partial file at the canonical path.
+    /// Mem impl just inserts into the map.
+    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()>;
 }
 
 /// Filesystem-backed `ObjectStore`. Reads from
@@ -118,6 +127,41 @@ impl ObjectStore for FsObjectStore {
             Err(e) => Err(Error::from(e)),
         }
     }
+
+    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.loose_path(repo_id, oid).ok_or_else(|| {
+            Error::Other(anyhow::anyhow!("write_loose: invalid oid {oid:?}"))
+        })?;
+        // Idempotent — content-addressed storage means the same oid
+        // implies the same bytes. Skip the rewrite to save the syscall
+        // and avoid the rename race that brief existence would imply.
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Atomic write: stage into a tmp file in the same parent
+        // directory (so rename is filesystem-local), then rename
+        // into place. A torn write to the tmp file leaves the
+        // canonical path untouched. Tmp name uses pid+rand+oid
+        // suffix so concurrent writers of the same object don't
+        // collide on the tmp path.
+        let parent = path.parent().expect("loose_path has 2-component prefix");
+        let tmp_name = format!(".tmp-{}-{}-{}", std::process::id(), rand::random::<u32>(), oid);
+        let tmp = parent.join(tmp_name);
+        std::fs::write(&tmp, bytes)?;
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Clean up the tmp on failure so we don't leave
+                // garbage. Best-effort; if cleanup fails too, the
+                // original error is the one that matters.
+                let _ = std::fs::remove_file(&tmp);
+                Err(Error::from(e))
+            }
+        }
+    }
 }
 
 /// In-memory `ObjectStore`. Backed by an `RwLock<HashMap<(repo_id, oid),
@@ -144,23 +188,6 @@ impl MemObjectStore {
         }
     }
 
-    /// Test-helper: insert raw loose-object bytes for `(repo_id, oid)`.
-    /// Production code wouldn't need this — the eventual M2b impl
-    /// will populate via the receive-pack path. For now this is the
-    /// only way to put bytes in.
-    ///
-    /// Rejects malformed `oid` the same way `read_loose` does, so
-    /// the store can't be poisoned with un-readable keys.
-    pub fn write_loose(&self, repo_id: &str, oid: &str, bytes: Vec<u8>) -> bool {
-        if !oid_is_valid(oid) {
-            return false;
-        }
-        self.objects
-            .write()
-            .expect("MemObjectStore lock poisoned")
-            .insert((repo_id.to_string(), oid.to_string()), bytes);
-        true
-    }
 }
 
 impl Default for MemObjectStore {
@@ -180,6 +207,19 @@ impl ObjectStore for MemObjectStore {
             .expect("MemObjectStore lock poisoned")
             .get(&(repo_id.to_string(), oid.to_string()))
             .cloned())
+    }
+
+    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
+        if !oid_is_valid(oid) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "write_loose: invalid oid {oid:?}"
+            )));
+        }
+        self.objects
+            .write()
+            .expect("MemObjectStore lock poisoned")
+            .insert((repo_id.to_string(), oid.to_string()), bytes.to_vec());
+        Ok(())
     }
 }
 
@@ -246,6 +286,53 @@ pub(crate) mod conformance {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// `write_loose` round-trips through `read_loose` with byte-exact
+    /// fidelity. Both impls have to satisfy this — anything a chunked-KV
+    /// or future backend can't preserve verbatim is broken.
+    pub fn write_then_read_round_trips<S: ObjectStore>(store: &S) {
+        // Use a synthetic 40-hex oid; both impls treat it as opaque
+        // key-value lookup, so the FS impl's loose-format expectation
+        // doesn't apply to the trait contract test.
+        let oid = "1111111111111111111111111111111111111111";
+        let payload = b"contract-bytes-stand-in";
+        store.write_loose("conf-repo", oid, payload).unwrap();
+        let got = store
+            .read_loose("conf-repo", oid)
+            .unwrap()
+            .expect("Some after write");
+        assert_eq!(got.as_slice(), payload);
+    }
+
+    /// `write_loose` is idempotent — a second write of the same oid is
+    /// a no-op. Loose objects are content-addressed, so the same oid
+    /// implies the same bytes; both impls must honor this without
+    /// erroring out.
+    pub fn write_loose_idempotent_on_repeat<S: ObjectStore>(store: &S) {
+        let oid = "2222222222222222222222222222222222222222";
+        let payload = b"first-write";
+        store.write_loose("conf-repo", oid, payload).unwrap();
+        // Second write of the same oid + bytes — must not error.
+        store.write_loose("conf-repo", oid, payload).unwrap();
+        let got = store.read_loose("conf-repo", oid).unwrap().unwrap();
+        assert_eq!(got.as_slice(), payload);
+    }
+
+    /// `write_loose` with a malformed oid is a hard error, not a
+    /// silent drop. Reads of malformed oids return `Ok(None)` (the
+    /// path-safety contract), but writes need to surface the bug —
+    /// callers want to know rather than silently lose data.
+    pub fn write_loose_rejects_malformed_oid<S: ObjectStore>(store: &S) {
+        let cases = [
+            "../something",
+            "abc",
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        ];
+        for bad in cases {
+            let r = store.write_loose("repo", bad, b"x");
+            assert!(r.is_err(), "expected write_loose({bad:?}) to error, got {r:?}");
+        }
     }
 }
 
@@ -336,7 +423,9 @@ mod tests {
         let store = MemObjectStore::new();
         let repo_id = "mem-repo".to_string();
         let oid = mem_oid(0xa);
-        assert!(store.write_loose(&repo_id, &oid, b"any-bytes-stand-in".to_vec()));
+        store
+            .write_loose(&repo_id, &oid, b"any-bytes-stand-in")
+            .unwrap();
         (store, repo_id, oid)
     }
 
@@ -359,18 +448,21 @@ mod tests {
     }
 
     #[test]
-    fn mem_write_loose_rejects_malformed_oid() {
-        // The store can't be poisoned with a path-traversal-shaped
-        // key — write_loose silently refuses, so subsequent reads
-        // for that key yield None (covered by malformed_oid_returns_none).
+    fn mem_write_then_read_round_trips() {
         let store = MemObjectStore::new();
-        assert!(!store.write_loose("repo", "../bad", b"x".to_vec()));
-        assert!(!store.write_loose("repo", "abc", b"x".to_vec()));
-        assert!(!store.write_loose(
-            "repo",
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-            b"x".to_vec()
-        ));
+        conformance::write_then_read_round_trips(&store);
+    }
+
+    #[test]
+    fn mem_write_loose_idempotent_on_repeat() {
+        let store = MemObjectStore::new();
+        conformance::write_loose_idempotent_on_repeat(&store);
+    }
+
+    #[test]
+    fn mem_write_loose_rejects_malformed_oid() {
+        let store = MemObjectStore::new();
+        conformance::write_loose_rejects_malformed_oid(&store);
     }
 
     #[test]
@@ -381,8 +473,55 @@ mod tests {
         let store = MemObjectStore::new();
         let oid = mem_oid(0x3);
         let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
-        store.write_loose("r", &oid, payload.clone());
+        store.write_loose("r", &oid, &payload).unwrap();
         let got = store.read_loose("r", &oid).unwrap().unwrap();
         assert_eq!(got, payload);
+    }
+
+    // ─── FsObjectStore — write conformance ─────────────────────────
+
+    #[test]
+    fn fs_write_then_read_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::write_then_read_round_trips(&store);
+    }
+
+    #[test]
+    fn fs_write_loose_idempotent_on_repeat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::write_loose_idempotent_on_repeat(&store);
+    }
+
+    #[test]
+    fn fs_write_loose_rejects_malformed_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::write_loose_rejects_malformed_oid(&store);
+    }
+
+    /// FS-specific: `write_loose` is atomic via tmp+rename. After a
+    /// successful write the canonical path exists; no `.tmp-*` files
+    /// remain in the parent dir.
+    #[test]
+    fn fs_write_loose_leaves_no_tmp_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        let oid = "9999999999999999999999999999999999999999";
+        store.write_loose("r", oid, b"payload").unwrap();
+        // Walk the parent dir; only the canonical 38-hex name should
+        // remain. Any `.tmp-*` entry means the cleanup is broken.
+        let parent = tmp.path().join("repos/r.git/objects/99");
+        let entries: Vec<String> = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["9".repeat(38)],
+            "expected only the canonical loose-object file, got {entries:?}"
+        );
     }
 }
