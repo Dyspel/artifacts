@@ -252,6 +252,16 @@ async fn main() -> anyhow::Result<()> {
             // contention on the hot path.
             let ownership: Arc<dyn OwnershipStore> =
                 Arc::new(SqliteOwnershipStore::open(&token_db_path)?);
+            // Populate the repos-total gauge before the listener
+            // starts (so the first scrape isn't 0), then spawn a 60s
+            // refresher to track create/delete activity. Same cadence
+            // and rationale as the active-token / active-webhook
+            // gauges spawned above.
+            ownership::refresh_repos_gauge(&*ownership).await;
+            ownership::spawn_repos_gauge_refresher(
+                ownership.clone(),
+                Duration::from_secs(60),
+            );
             // Audit log lives in its own DB so it can be archived /
             // rotated independently of the token store. Same WAL-mode
             // SQLite shape; the writer is best-effort (a SQLite

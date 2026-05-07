@@ -31,6 +31,11 @@
 //!   subscription count, across all repos). Same 60-second refresh
 //!   cadence as the token gauge. Useful for catching subscription
 //!   leaks (handlers adding faster than they remove).
+//! - `artifacts_repos_total` — gauge (rows in the `repos` table:
+//!   every repo the server knows about, both user- and admin-owned).
+//!   Refreshed at startup and every 60 seconds via a dedicated tokio
+//!   task. Tracks create/delete activity within a minute — useful for
+//!   capacity planning and detecting runaway creation loops.
 //! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
 //!   (already-shipped; incremented by the webhook dispatcher with
 //!   outcome ∈ {ok, http_error, transport_error})

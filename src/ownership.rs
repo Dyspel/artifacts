@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Records which user "owns" each repo.
@@ -311,6 +311,37 @@ pub async fn check_repo_quota(
         });
     }
     Ok(())
+}
+
+/// One-shot — read the total repo count and publish to the
+/// `artifacts_repos_total` gauge. Called at startup and on a 60s
+/// ticker so capacity-planning + anomaly-detection dashboards see
+/// repo growth within a minute. Failure is best-effort logged; the
+/// gauge keeps its previous value rather than going to zero on a
+/// transient SQLite error.
+pub async fn refresh_repos_gauge(store: &dyn OwnershipStore) {
+    match store.count_all().await {
+        Ok(n) => metrics::gauge!("artifacts_repos_total").set(n as f64),
+        Err(e) => tracing::warn!(error = %e, "repos-total gauge refresh failed"),
+    }
+}
+
+/// Spawn a dedicated refresher for the repos-total gauge. Runs at
+/// `tick` cadence — same shape as `tokens::spawn_active_gauge_refresher`
+/// and `webhooks::spawn_active_gauge_refresher`, all three running in
+/// parallel so each metric stays fresh independently.
+pub fn spawn_repos_gauge_refresher(store: Arc<dyn OwnershipStore>, tick: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Skip the immediate-fire tick — the caller already populates
+        // the gauge synchronously at startup; this loop owns refreshes
+        // only.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            refresh_repos_gauge(&*store).await;
+        }
+    });
 }
 
 /// Enforcement helper: caller's `principal` must be permitted to act on

@@ -472,6 +472,20 @@ grep -q '^artifacts_quota_exceeded_total' "$metrics_body" \
     || { echo "FAIL: /metrics missing quota_exceeded counter"; exit 1; }
 echo "    quota_exceeded counter observed in /metrics"
 
+# repos-total gauge: at this point the smoke has created several repos
+# (root + forks + per-user repos) so the gauge must be non-zero. The
+# gauge is populated synchronously at startup and refreshed every 60s,
+# so it tracks creates within a minute — this scrape is well within
+# that window.
+repos_gauge=$(grep '^artifacts_repos_total ' "$metrics_body" \
+    | awk '{print $2}' || true)
+[[ -n "$repos_gauge" ]] \
+    || { echo "FAIL: /metrics missing artifacts_repos_total gauge"; exit 1; }
+# Compare as integers — Prometheus emits "5" for an integer-valued gauge.
+[[ "${repos_gauge%.*}" -ge 1 ]] \
+    || { echo "FAIL: artifacts_repos_total=$repos_gauge, expected ≥ 1 (smoke creates repos)"; exit 1; }
+echo "    artifacts_repos_total gauge → $repos_gauge"
+
 # Audit-event counter should be incremented per event kind. Counters
 # reset at the step-10 restart, so we can only assert on kinds that
 # fire AFTER the restart — repo.create and token.mint both fire
