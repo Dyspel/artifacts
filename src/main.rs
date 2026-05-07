@@ -268,6 +268,44 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(3600),
                 Duration::from_secs(audit_retention_days * 86400),
             );
+            // Emit a startup audit event so a compliance reviewer can
+            // see "when did this server boot, with what
+            // security-relevant configuration." Captures the flags
+            // that affect the threat model (TLS, allow_insecure) plus
+            // the retention/quota knobs that bound auditability and
+            // capacity. Live `tracing::info!` mirrors the same fields
+            // for live log subscribers — same shape as the rest of
+            // the audit-event call sites.
+            tracing::info!(
+                target: "audit",
+                event = "server.start",
+                actor = "admin",
+                bind = %bind,
+                public_base_url = %cfg.public_base_url,
+                tls_enabled,
+                allow_insecure,
+                max_repos_per_user,
+                audit_retention_days,
+                shutdown_timeout_secs,
+            );
+            crate::audit::record_silent(
+                &*audit,
+                "server.start",
+                "admin",
+                None,
+                serde_json::json!({
+                    "bind": bind,
+                    "public_base_url": cfg.public_base_url,
+                    "tls_enabled": tls_enabled,
+                    "allow_insecure": allow_insecure,
+                    "max_repos_per_user": max_repos_per_user,
+                    "audit_retention_days": audit_retention_days,
+                    "shutdown_timeout_secs": shutdown_timeout_secs,
+                    "version": env!("CARGO_PKG_VERSION"),
+                }),
+                None,
+            )
+            .await;
             let refs: Arc<dyn RefStore> = Arc::new(FsRefStore::new(cfg.repos_dir()));
             let rate_limit = Arc::new(RateLimiter::with_defaults());
             // Prune stale per-subject buckets every 5 min; buckets not

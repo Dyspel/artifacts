@@ -479,6 +479,13 @@ best-effort — a SQLite hiccup logs a warning but doesn't fail the
 underlying mutation; the live `tracing!` call is the durable copy
 of last resort.
 
+**Boot audit.** Every server start emits a `server.start` event
+with `bind`, `public_base_url`, `tls_enabled`, `allow_insecure`,
+quota / retention / shutdown knobs, and the build version. A
+compliance reviewer querying
+`GET /v1/admin/audit?event=server.start` gets a full process-boot
+history without needing access to the operational logs.
+
 **Cheap totals.** `GET /v1/admin/audit/stats` returns
 `{ count: <total rows> }` — backed by `SELECT COUNT(*)` against
 the indexed `audit_events` table, so admin tooling can surface
