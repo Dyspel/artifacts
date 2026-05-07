@@ -378,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
 
             let rest_router = Router::new()
                 .route("/v1/health", get(rest::health))
+                .route("/v1/health/ready", get(rest::health_ready))
                 .route("/v1/repos", post(rest::create_repo).get(rest::list_repos))
                 .route("/v1/repos/:id", delete(rest::delete_repo).get(reads::get_repo))
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))

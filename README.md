@@ -286,7 +286,24 @@ challenge dance.
 
 ### Health
 
-`GET /v1/health` → `{"ok":true}` — no auth.
+`GET /v1/health` → `{"ok":true}` — cheap liveness probe, no auth.
+
+`GET /v1/health/ready` — readiness probe, no auth. Exercises the
+tokens and audit SQLite stores via cheap queries (1-second
+deadline each):
+
+```json
+// healthy
+{ "ok": true,  "components": {"tokens": "ok", "audit": "ok"} }
+// unhealthy — returns HTTP 503 so k8s/systemd refuses traffic
+{ "ok": false, "components": {"tokens": "ok", "audit": "fail"} }
+```
+
+Distinct from `/v1/health` so a stuck SQLite read doesn't fail the
+liveness probe (which would trigger a restart loop) — readiness
+fails first, the orchestrator drains traffic, and only then does
+the liveness probe drive a restart if the underlying issue
+persists.
 
 ### Create repo
 

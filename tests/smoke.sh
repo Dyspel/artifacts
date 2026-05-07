@@ -483,6 +483,14 @@ for kind in repo.create token.mint; do
 done
 echo "    audit-event counter has labeled series for repo.create + token.mint"
 
+# Readiness probe — exercises both SQLite stores; must report all
+# components ok on a healthy server.
+ready_body=$(curl -fsS "$BASE_URL/v1/health/ready")
+ready_ok=$(echo "$ready_body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])')
+[[ "$ready_ok" == "True" ]] || { echo "FAIL: /v1/health/ready not ok: $ready_body"; exit 1; }
+ready_components=$(echo "$ready_body" | python3 -c 'import json,sys; c=json.load(sys.stdin)["components"]; print(",".join(f"{k}={v}" for k,v in sorted(c.items())))')
+echo "    /v1/health/ready → ok=true, components: $ready_components"
+
 # X-Request-Id roundtrip: client-supplied id must be echoed.
 echo_code=$(curl -sS -D "${WORK_DIR}/rid_headers.txt" -o /dev/null -w '%{http_code}' \
     -H 'X-Request-Id: smoke-trace-xyz' "$BASE_URL/v1/health")

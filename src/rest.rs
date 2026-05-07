@@ -772,6 +772,63 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+/// `GET /v1/health/ready`
+///
+/// Readiness probe — distinct from `/v1/health` (the cheap liveness
+/// probe). Exercises the SQLite stores so k8s / systemd / load
+/// balancers catch a server that's running but can't actually serve
+/// traffic (DB file unreadable, schema drift, disk full, …).
+///
+/// Returns 200 with `{ok:true, components:{tokens:"ok", audit:"ok"}}`
+/// when both stores respond. Returns 503 with `ok:false` and the
+/// failing component(s) flagged when any store errors out — k8s
+/// then refuses to route traffic to the pod.
+///
+/// Each component check has a 1-second deadline. Slow-but-not-broken
+/// stores fail closed rather than blocking the probe; an indefinitely
+/// hung probe is worse than one that flags a problem and lets the
+/// orchestrator decide.
+///
+/// No auth — same as `/v1/health`. Probe traffic shouldn't need
+/// credentials.
+pub async fn health_ready(
+    State(state): State<RestState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use std::time::Duration;
+
+    let deadline = Duration::from_secs(1);
+    // Cheap query that hits the tokens table — `lookup` of a known-
+    // missing token returns Ok(None) and proves the store can read.
+    let tokens_ok = matches!(
+        tokio::time::timeout(deadline, state.tokens.lookup("__health_ready_probe__")).await,
+        Ok(Ok(_))
+    );
+    let audit_ok = matches!(
+        tokio::time::timeout(deadline, state.audit.count()).await,
+        Ok(Ok(_))
+    );
+
+    let all_ok = tokens_ok && audit_ok;
+    let body = serde_json::json!({
+        "ok": all_ok,
+        "components": {
+            "tokens": if tokens_ok { "ok" } else { "fail" },
+            "audit":  if audit_ok  { "ok" } else { "fail" },
+        }
+    });
+    let status = if all_ok {
+        StatusCode::OK
+    } else {
+        tracing::warn!(
+            tokens_ok, audit_ok,
+            "/v1/health/ready failing — orchestrator should refuse traffic"
+        );
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
+}
+
 /// `GET /v1/repos`
 ///
 /// User-facing repo listing. Scoped by who's asking:
