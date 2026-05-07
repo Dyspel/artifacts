@@ -784,6 +784,14 @@ rotated in-place without a restart via
 on the next request. Per-repo tokens have their own
 `POST /v1/repos/:id/tokens/rotate` for the same purpose.
 
+**Graceful shutdown.** SIGTERM (k8s/systemd) and SIGINT (Ctrl-C)
+both trigger a graceful drain — the server stops accepting new
+connections and waits up to `--shutdown-timeout-secs` (default 30,
+env `ARTIFACTS_SHUTDOWN_TIMEOUT_SECS`) for in-flight requests to
+finish before exiting. Useful so a rolling deploy doesn't drop a
+git push mid-stream. Set the timeout to 0 for an immediate
+hard-exit (dev only).
+
 TLS terminates in-process when both `--tls-cert <path>` and
 `--tls-key <path>` are set (PEM files, also via env
 `ARTIFACTS_TLS_CERT` / `ARTIFACTS_TLS_KEY`). Implementation is

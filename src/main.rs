@@ -113,6 +113,16 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_TLS_KEY")]
         tls_key: Option<PathBuf>,
 
+        /// Graceful-shutdown drain timeout, in seconds. On SIGTERM /
+        /// SIGINT (Ctrl-C), the server stops accepting new connections
+        /// and waits up to this long for in-flight requests to
+        /// complete before exiting. Default 30s — covers a slow git
+        /// push (which buffers on the server side) without blocking a
+        /// deployment for a stuck client. Set to 0 to skip the drain
+        /// (immediate shutdown — dev only).
+        #[arg(long, env = "ARTIFACTS_SHUTDOWN_TIMEOUT_SECS", default_value_t = 30)]
+        shutdown_timeout_secs: u64,
+
         /// Audit log retention, in days. Rows older than this are
         /// pruned hourly. `0` disables pruning (audit log grows
         /// indefinitely — useful for compliance scenarios where an
@@ -157,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
             max_commit_blob_bytes,
             tls_cert,
             tls_key,
+            shutdown_timeout_secs,
             audit_retention_days,
             allow_insecure,
         } => {
@@ -437,6 +448,7 @@ async fn main() -> anyhow::Result<()> {
                 // the span covers the full request lifecycle.
                 .layer(axum_middleware::from_fn(request_id::instrument));
 
+            let shutdown_timeout = Duration::from_secs(shutdown_timeout_secs);
             if tls_enabled {
                 // rustls 0.23 dropped the implicit default crypto
                 // provider — install ring once before any RustlsConfig
@@ -458,15 +470,50 @@ async fn main() -> anyhow::Result<()> {
                     %bind,
                     data_dir = %data_dir.display(),
                     cert = %cert.display(),
+                    shutdown_timeout_secs,
                     "artifacts listening (TLS)"
                 );
+                // axum-server exposes graceful shutdown via Handle:
+                // hand the shared handle to a signal-listener task that
+                // calls `graceful_shutdown(timeout)` when SIGTERM /
+                // SIGINT fires. The serve() call then returns once the
+                // drain completes (or hits the timeout).
+                let handle = axum_server::Handle::new();
+                spawn_shutdown_listener(handle.clone(), shutdown_timeout);
                 axum_server::bind_rustls(addr, config)
+                    .handle(handle)
                     .serve(app.into_make_service())
                     .await?;
             } else {
                 let listener = tokio::net::TcpListener::bind(&bind).await?;
-                tracing::info!(%bind, data_dir = %data_dir.display(), "artifacts listening");
-                axum::serve(listener, app).await?;
+                tracing::info!(
+                    %bind,
+                    data_dir = %data_dir.display(),
+                    shutdown_timeout_secs,
+                    "artifacts listening"
+                );
+                // axum::serve takes a future that resolves when shutdown
+                // should begin; once it does, axum stops accepting new
+                // connections and lets in-flight requests finish (up to
+                // a tower-managed deadline). The outer timeout ensures
+                // we exit even if a request is genuinely stuck.
+                let serve = axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal());
+                if shutdown_timeout.is_zero() {
+                    serve.await?;
+                } else {
+                    // Bound the total drain time. If the drain doesn't
+                    // finish in `shutdown_timeout`, we abandon it and
+                    // let the process exit — better than blocking a
+                    // rolling deploy on a stuck client.
+                    match tokio::time::timeout(shutdown_timeout, serve).await {
+                        Ok(r) => r?,
+                        Err(_) => tracing::warn!(
+                            timeout_secs = shutdown_timeout_secs,
+                            "graceful shutdown timed out — exiting with in-flight requests"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -526,6 +573,48 @@ fn check_bind_safety(
            - set --public-base-url to an https:// URL (terminator handles TLS for you)\n\
            - pass --allow-insecure if you really mean it (an ephemeral test rig, say)"
     );
+}
+
+/// Resolves on the first SIGTERM (Linux/Mac systemd / k8s graceful
+/// stop) or SIGINT (Ctrl-C in a dev shell). Both signal sources
+/// are wired up on Unix; on non-Unix platforms only Ctrl-C is
+/// available and SIGTERM-style requests have to come through the
+/// stdlib's ctrl-c handler (which Windows maps appropriately).
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("install ctrl-c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("received SIGINT, beginning graceful shutdown");
+        }
+        _ = terminate => {
+            tracing::info!("received SIGTERM, beginning graceful shutdown");
+        }
+    }
+}
+
+/// Kick off the axum-server graceful-shutdown handshake when the
+/// signal-listener fires. `timeout == 0` means "skip the drain and
+/// hard-exit" (dev-only use case); axum-server's `graceful_shutdown`
+/// takes `Option<Duration>` where `Some(ZERO)` means "drop active
+/// connections immediately" — close enough for our purposes that we
+/// just pass the timeout through.
+fn spawn_shutdown_listener(handle: axum_server::Handle, timeout: Duration) {
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        handle.graceful_shutdown(Some(timeout));
+    });
 }
 
 pub(crate) fn random_admin_token() -> String {
