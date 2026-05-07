@@ -95,11 +95,10 @@ pub struct AuditQuery {
 pub trait AuditStore: Send + Sync {
     async fn record(&self, evt: AuditEvent) -> Result<()>;
     async fn list(&self, query: AuditQuery) -> Result<Vec<AuditEvent>>;
-    /// Tests use this; production paths haven't needed it yet (admins
-    /// can SELECT COUNT(*) directly, and the list endpoint returns
-    /// up to 1000 rows). Kept on the trait so a future
-    /// `/v1/admin/audit/stats` endpoint has the cheap-counting hook.
-    #[allow(dead_code)]
+    /// Total row count. Powers `GET /v1/admin/audit/stats` so admin
+    /// tooling can surface "rows logged" without paginating through
+    /// the whole table. SQLite makes this an indexed-row count —
+    /// constant-time on a covering index.
     async fn count(&self) -> Result<u64>;
     /// Delete rows with `ts < cutoff_ts`. Returns the row count
     /// removed. The retention task in `spawn_prune_task` calls this

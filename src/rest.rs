@@ -1150,6 +1150,28 @@ pub struct AdminAuditQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminAuditStats {
+    /// Total rows in the audit_events table. Includes events that
+    /// will be pruned at the next retention sweep — there's no
+    /// pre-prune view because the prune is a delete (gone is gone).
+    pub count: u64,
+}
+
+/// `GET /v1/admin/audit/stats`
+///
+/// Returns the cheap-to-compute totals admin tooling wants without
+/// having to paginate through `/v1/admin/audit`. SQLite computes
+/// this with an indexed `SELECT COUNT(*)` — constant-time. Admin-only.
+pub async fn admin_audit_stats(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminAuditStats>> {
+    require_admin(&state, &headers)?;
+    let count = state.audit.count().await?;
+    Ok(Json(AdminAuditStats { count }))
+}
+
 /// `GET /v1/admin/audit`
 ///
 /// Returns the persisted audit log, filtered by query params.

@@ -861,6 +861,13 @@ jwt_audit_code=$(curl -sS -o /dev/null -w '%{http_code}' \
     || { echo "FAIL: JWT user GET /v1/admin/audit expected 403, got $jwt_audit_code"; exit 1; }
 echo "    audit log → $audit_count rows, all 5 expected kinds present, ?event= filter honored, JWT-user→403"
 
+# /v1/admin/audit/stats returns the same total via the cheap count.
+stats=$(curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit/stats")
+stats_count=$(echo "$stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')
+[[ "$stats_count" -ge "$audit_count" ]] \
+    || { echo "FAIL: /v1/admin/audit/stats count ($stats_count) lower than list count ($audit_count)"; exit 1; }
+echo "    /v1/admin/audit/stats → $stats_count rows (≥ list count $audit_count)"
+
 echo "==> [??] admin-token in-process rotation"
 # Admin can rotate; old token stops working immediately; new token works.
 # Then rotate it back (using the new value) so subsequent steps that rely

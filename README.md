@@ -98,6 +98,7 @@ end-to-end in a day, not a quarter.
 | `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
 | `POST /v1/admin/webhook-key/rotate` — re-encrypt every webhook secret under a fresh master key | ✅     |
 | `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
+| `GET /v1/admin/audit/stats` — cheap row-count totals             | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
@@ -460,6 +461,11 @@ audit log can be archived / rotated independently). Writes are
 best-effort — a SQLite hiccup logs a warning but doesn't fail the
 underlying mutation; the live `tracing!` call is the durable copy
 of last resort.
+
+**Cheap totals.** `GET /v1/admin/audit/stats` returns
+`{ count: <total rows> }` — backed by `SELECT COUNT(*)` against
+the indexed `audit_events` table, so admin tooling can surface
+"rows logged" without paginating through the whole list.
 
 **Retention.** Rows older than `--audit-retention-days`
 (default 90, env `ARTIFACTS_AUDIT_RETENTION_DAYS`) are pruned
