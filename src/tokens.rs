@@ -128,6 +128,17 @@ pub trait TokenStore: Send + Sync {
     /// already revoked, `Ok(false)` otherwise. Idempotent.
     async fn revoke(&self, token: &str) -> Result<bool>;
 
+    /// Count rows that would currently authorize a request — i.e. not
+    /// revoked, not expired (NULL or future). Powers the
+    /// `artifacts_tokens_active_total` Prometheus gauge.
+    ///
+    /// Default impl returns 0 — backends without a cheap aggregate
+    /// (e.g., the in-memory test store) just don't surface a count.
+    /// SQLite overrides with a single indexed COUNT(*).
+    async fn count_active(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Revoke every non-revoked, non-expired token bound to `repo_id`.
     /// Returns the number of rows that were actually flipped — useful
     /// for surfacing "rotated 3 tokens" to the caller of a rotation
@@ -244,6 +255,12 @@ impl SqliteTokenStore {
 /// Spawn a background task that calls `prune()` every `tick`. Task
 /// lives for the full process lifetime; first prune fires after the
 /// first `tick` (not immediately) so it doesn't contend with startup.
+///
+/// Also refreshes the `artifacts_tokens_active_total` gauge after
+/// each prune — piggybacks on the same hourly cadence so we don't
+/// need a separate metrics-publishing task. The startup-time
+/// `refresh_active_token_gauge` populates the initial value so the
+/// gauge isn't reported as 0 until the first tick fires.
 pub fn spawn_prune_task(
     store: Arc<SqliteTokenStore>,
     tick: Duration,
@@ -260,6 +277,39 @@ pub fn spawn_prune_task(
                 Ok(n) => tracing::info!(pruned = n, "token prune"),
                 Err(e) => tracing::error!(error = %e, "token prune failed"),
             }
+            refresh_active_token_gauge(&*store).await;
+        }
+    });
+}
+
+/// One-shot — read the active count and publish to the gauge. Called
+/// at startup (after the store is opened) and at the tail of each
+/// prune sweep. Failure is best-effort logged; the gauge keeps its
+/// previous value rather than going to zero on a transient error.
+pub async fn refresh_active_token_gauge(store: &dyn TokenStore) {
+    match store.count_active().await {
+        Ok(n) => metrics::gauge!("artifacts_tokens_active_total").set(n as f64),
+        Err(e) => tracing::warn!(error = %e, "active-token gauge refresh failed"),
+    }
+}
+
+/// Spawn a dedicated refresher for the active-token gauge. Runs at
+/// `tick` cadence (typically 60s — fast enough that the gauge tracks
+/// real activity within a minute, slow enough that a SQLite
+/// COUNT-on-indexed-predicate isn't the busiest thing the server
+/// does). The hourly prune task also refreshes after each sweep,
+/// but waiting an hour to see a token-mint reflected in metrics is
+/// too coarse for capacity-planning + anomaly detection use cases.
+pub fn spawn_active_gauge_refresher(store: Arc<dyn TokenStore>, tick: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Fire the first interval immediately — we already populate
+        // the gauge synchronously at startup, but a dropped wakeup
+        // here would leave a one-tick lag.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            refresh_active_token_gauge(&*store).await;
         }
     });
 }
@@ -339,6 +389,25 @@ impl TokenStore for SqliteTokenStore {
             params![now, repo_id],
         )?;
         Ok(affected as u64)
+    }
+
+    async fn count_active(&self) -> Result<u64> {
+        let now = now_secs() as i64;
+        let conn = self.conn.lock().await;
+        // Mirrors the lookup predicate exactly — a row is active iff it
+        // would currently resolve to a TokenRecord. Pruning is what
+        // keeps this aggregate cheap; an unbounded `tokens` table with
+        // millions of revoked rows would still run fast (PK-indexed
+        // counting with a covering predicate) but the periodic prune
+        // ensures the working set stays small.
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tokens
+             WHERE revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)",
+            params![now],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
     }
 
     async fn list_for_repo(

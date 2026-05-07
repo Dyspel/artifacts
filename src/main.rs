@@ -228,7 +228,13 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(3600),
                 Duration::from_secs(86400),
             );
+            // Populate the active-token gauge before any handler can
+            // observe it as zero, then spawn a 60-second refresher so
+            // the gauge tracks real mint/revoke activity within a
+            // minute rather than waiting for the hourly prune.
+            tokens::refresh_active_token_gauge(&*sqlite_tokens).await;
             let tokens: Arc<dyn TokenStore> = sqlite_tokens;
+            tokens::spawn_active_gauge_refresher(tokens.clone(), Duration::from_secs(60));
             // Reuses the same SQLite file for a separate `repos` table.
             // Separate table and separate connection keeps the concerns
             // cleanly split; WAL-mode lets them coexist without lock

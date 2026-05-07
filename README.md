@@ -630,6 +630,7 @@ Exposed metrics:
 | `artifacts_quota_exceeded_total`               | counter   | —                        |
 | `artifacts_audit_events_total`                 | counter   | `event`                  |
 | `artifacts_webhook_deliveries_total`           | counter   | `kind`, `outcome`        |
+| `artifacts_tokens_active_total`                | gauge     | —                        |
 | `artifacts_build_info`                         | gauge     | `version`                |
 
 The `path` label is the **route template** (`/v1/repos/:id/tokens`),

@@ -21,6 +21,12 @@
 //! - `artifacts_audit_events_total{event}` — counter (one increment per
 //!   audit-event record, labeled by event kind so dashboards can chart
 //!   `repo.create` rate vs `token.revoke` rate independently)
+//! - `artifacts_tokens_active_total` — gauge (rows in the token store
+//!   that would currently authorize a request — not revoked, not
+//!   expired). Refreshed at startup, every 60 seconds via a dedicated
+//!   tokio task, and at the tail of each hourly token-prune sweep.
+//!   Useful for capacity planning + spotting anomalous-mass token
+//!   issuance within a minute of it happening.
 //! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
 //!   (already-shipped; incremented by the webhook dispatcher with
 //!   outcome ∈ {ok, http_error, transport_error})
