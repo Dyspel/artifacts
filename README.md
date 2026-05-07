@@ -657,6 +657,7 @@ Exposed metrics:
 | `artifacts_tokens_active_total`                | gauge     | —                        |
 | `artifacts_webhooks_active_total`              | gauge     | —                        |
 | `artifacts_repos_total`                        | gauge     | —                        |
+| `artifacts_audit_events_stored_total`          | gauge     | —                        |
 | `artifacts_build_info`                         | gauge     | `version`                |
 
 The `path` label is the **route template** (`/v1/repos/:id/tokens`),

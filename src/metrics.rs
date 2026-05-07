@@ -36,6 +36,13 @@
 //!   Refreshed at startup and every 60 seconds via a dedicated tokio
 //!   task. Tracks create/delete activity within a minute — useful for
 //!   capacity planning and detecting runaway creation loops.
+//! - `artifacts_audit_events_stored_total` — gauge (rows currently in
+//!   the audit log; distinct from `artifacts_audit_events_total{event}`
+//!   which is monotonic lifetime emissions). Goes *down* when the
+//!   retention sweep prunes, so this is the metric to watch to
+//!   confirm prune is actually working and to catch unbounded growth
+//!   before disk fills. Refreshed at startup, every 60 seconds, and
+//!   at the tail of each hourly prune sweep.
 //! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
 //!   (already-shipped; incremented by the webhook dispatcher with
 //!   outcome ∈ {ok, http_error, transport_error})

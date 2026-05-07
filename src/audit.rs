@@ -263,6 +263,12 @@ impl AuditStore for SqliteAuditStore {
 ///
 /// First prune fires after the first `tick` (not at startup) so it
 /// doesn't contend with boot-time work.
+///
+/// Also refreshes the `artifacts_audit_events_stored_total` gauge at
+/// the tail of each prune sweep — the dedicated 60s refresher keeps
+/// the gauge fresh between sweeps, but a sweep that deletes a large
+/// retention-eligible batch should be reflected immediately rather
+/// than waiting up to a minute for the next ticker fire.
 pub fn spawn_prune_task(
     store: Arc<dyn AuditStore>,
     tick: std::time::Duration,
@@ -284,6 +290,45 @@ pub fn spawn_prune_task(
                 Ok(n) => tracing::info!(pruned = n, "audit prune"),
                 Err(e) => tracing::error!(error = %e, "audit prune failed"),
             }
+            refresh_events_stored_gauge(&*store).await;
+        }
+    });
+}
+
+/// One-shot — read the audit event count and publish to the
+/// `artifacts_audit_events_stored_total` gauge. Distinct from the
+/// monotonic `artifacts_audit_events_total{event}` counter (which
+/// tracks lifetime emissions): this gauge is "rows currently in the
+/// table," which goes *down* when retention prunes. Operators watch
+/// it to confirm the prune sweep is actually deleting things, and to
+/// catch unbounded growth before disk fills.
+///
+/// Failure is best-effort logged; the gauge keeps its previous
+/// value rather than going to zero on a transient SQLite error.
+pub async fn refresh_events_stored_gauge(store: &dyn AuditStore) {
+    match store.count().await {
+        Ok(n) => metrics::gauge!("artifacts_audit_events_stored_total").set(n as f64),
+        Err(e) => tracing::warn!(error = %e, "audit-events-stored gauge refresh failed"),
+    }
+}
+
+/// Spawn a dedicated refresher for the audit-events-stored gauge.
+/// Same shape as the token / webhook / repo gauges — 60s tick keeps
+/// the value fresh enough for capacity dashboards while a SQLite
+/// `SELECT COUNT(*)` against an indexed table stays cheap.
+pub fn spawn_events_stored_gauge_refresher(
+    store: Arc<dyn AuditStore>,
+    tick: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // The caller populates the gauge synchronously at startup, so
+        // skip the immediate fire and let the loop own all subsequent
+        // refreshes.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            refresh_events_stored_gauge(&*store).await;
         }
     });
 }

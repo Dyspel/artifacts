@@ -486,6 +486,19 @@ repos_gauge=$(grep '^artifacts_repos_total ' "$metrics_body" \
     || { echo "FAIL: artifacts_repos_total=$repos_gauge, expected ≥ 1 (smoke creates repos)"; exit 1; }
 echo "    artifacts_repos_total gauge → $repos_gauge"
 
+# audit-events-stored gauge: every mutating call earlier in this run
+# emitted a record into the audit log, so the gauge must be ≥ 1. The
+# distinction vs the `artifacts_audit_events_total{event}` counter
+# matters — the gauge is rows-in-table (post-prune), the counter is
+# lifetime emissions.
+audit_stored=$(grep '^artifacts_audit_events_stored_total ' "$metrics_body" \
+    | awk '{print $2}' || true)
+[[ -n "$audit_stored" ]] \
+    || { echo "FAIL: /metrics missing artifacts_audit_events_stored_total gauge"; exit 1; }
+[[ "${audit_stored%.*}" -ge 1 ]] \
+    || { echo "FAIL: artifacts_audit_events_stored_total=$audit_stored, expected ≥ 1"; exit 1; }
+echo "    artifacts_audit_events_stored_total gauge → $audit_stored"
+
 # Audit-event counter should be incremented per event kind. Counters
 # reset at the step-10 restart, so we can only assert on kinds that
 # fire AFTER the restart — repo.create and token.mint both fire

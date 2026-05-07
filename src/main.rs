@@ -278,6 +278,17 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(3600),
                 Duration::from_secs(audit_retention_days * 86400),
             );
+            // Stored-events gauge — populate before the listener
+            // starts so the first scrape isn't 0, then a 60s
+            // refresher keeps it fresh between hourly prune sweeps
+            // (the prune task itself also refreshes after each
+            // delete batch). Mirrors the token / webhook / repo
+            // gauges spawned above.
+            audit::refresh_events_stored_gauge(&*audit).await;
+            audit::spawn_events_stored_gauge_refresher(
+                audit.clone(),
+                Duration::from_secs(60),
+            );
             // Emit a startup audit event so a compliance reviewer can
             // see "when did this server boot, with what
             // security-relevant configuration." Captures the flags
