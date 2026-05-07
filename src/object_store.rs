@@ -53,6 +53,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+/// One row of `ObjectStore::list_loose`. Captures the metadata
+/// `gc` needs without an extra round-trip per object — the FS impl
+/// reads stat in the same `read_dir` walk; a future KV impl reads
+/// `oid + length(bytes) + created_at` in one row.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LooseInfo {
+    pub oid: String,
+    pub size: u64,
+    /// Unix epoch seconds when the object was last written. The FS
+    /// impl reads from mtime; a future chunked-KV impl reads from
+    /// its own `created_at` column. Used by `gc::run`'s mtime
+    /// guard — don't delete an object younger than the guard, in
+    /// case a push that landed seconds ago is mid-stream.
+    pub created_secs: i64,
+}
+
 /// Read + write view into a repo's git object database.
 ///
 /// Production paths don't route through this yet — the trait + impls
@@ -80,6 +97,23 @@ pub trait ObjectStore: Send + Sync {
     /// write never leaves a partial file at the canonical path.
     /// Mem impl just inserts into the map.
     fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Enumerate every loose object in the repo. Used by gc to
+    /// compute the on-disk set that gets diffed against the
+    /// reachable set. Order is unspecified — callers that need
+    /// determinism sort.
+    ///
+    /// Returns an empty Vec for a repo that doesn't exist or has
+    /// no loose objects yet (rather than an error) — this matches
+    /// the FS shape where a missing `objects/` dir is identical
+    /// to one with no loose subdirs.
+    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>>;
+
+    /// Delete a loose object by oid. Returns `Ok(true)` if a row
+    /// was removed, `Ok(false)` if the object wasn't there
+    /// (idempotent — a second delete of the same oid is fine).
+    /// Malformed oid is an error, mirroring `write_loose`.
+    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool>;
 }
 
 /// Filesystem-backed `ObjectStore`. Reads from
@@ -162,10 +196,74 @@ impl ObjectStore for FsObjectStore {
             }
         }
     }
+
+    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+        let objects = self.root.join(format!("{repo_id}.git")).join("objects");
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&objects) {
+            Ok(e) => e,
+            // Missing objects/ dir is identical to "no loose objects".
+            // Don't bubble — gc treats this as a no-op pass.
+            Err(_) => return Ok(out),
+        };
+        for ent in entries.flatten() {
+            let name = match ent.file_name().to_str().map(str::to_string) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Loose-object subdirs are exactly 2 hex chars. Skip
+            // `info/`, `pack/`, `.tmp-*` rename stragglers, etc.
+            if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let subdir = ent.path();
+            let inner = match std::fs::read_dir(&subdir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for f in inner.flatten() {
+                let fname = match f.file_name().to_str().map(str::to_string) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if fname.len() != 38 || !fname.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let oid = format!("{name}{fname}");
+                let meta = match f.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let created_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                out.push(LooseInfo {
+                    oid,
+                    size: meta.len(),
+                    created_secs,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        let path = self.loose_path(repo_id, oid).ok_or_else(|| {
+            Error::Other(anyhow::anyhow!("delete_loose: invalid oid {oid:?}"))
+        })?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
 }
 
 /// In-memory `ObjectStore`. Backed by an `RwLock<HashMap<(repo_id, oid),
-/// Vec<u8>>>`; reads share the lock, writes serialize. Built as the
+/// MemEntry>>`; reads share the lock, writes serialize. Built as the
 /// M2b proof-of-concept that the trait isn't FS-specific. Tests use it
 /// as a fast, deterministic alternative to spinning up a real
 /// `<repo>/objects/` tree.
@@ -177,7 +275,17 @@ impl ObjectStore for FsObjectStore {
 /// impl will satisfy.
 #[allow(dead_code)]
 pub struct MemObjectStore {
-    objects: RwLock<HashMap<(String, String), Vec<u8>>>,
+    objects: RwLock<HashMap<(String, String), MemEntry>>,
+}
+
+/// One row in `MemObjectStore`. Carries `created_secs` so the Mem
+/// impl can satisfy `list_loose`'s `LooseInfo.created_secs` contract
+/// the same way the FS impl does (mtime). Tests that need to control
+/// the timestamp use the `_with_ts` helper.
+#[derive(Debug, Clone)]
+struct MemEntry {
+    bytes: Vec<u8>,
+    created_secs: i64,
 }
 
 #[allow(dead_code)]
@@ -188,6 +296,28 @@ impl MemObjectStore {
         }
     }
 
+    /// Test-helper: insert with a chosen timestamp so the gc-prune
+    /// guard tests don't depend on wall-clock. Bypasses the trait's
+    /// validation contract — callers must pass a valid oid.
+    #[cfg(test)]
+    pub(crate) fn write_loose_with_ts(
+        &self,
+        repo_id: &str,
+        oid: &str,
+        bytes: &[u8],
+        created_secs: i64,
+    ) {
+        self.objects
+            .write()
+            .expect("MemObjectStore lock poisoned")
+            .insert(
+                (repo_id.to_string(), oid.to_string()),
+                MemEntry {
+                    bytes: bytes.to_vec(),
+                    created_secs,
+                },
+            );
+    }
 }
 
 impl Default for MemObjectStore {
@@ -206,7 +336,7 @@ impl ObjectStore for MemObjectStore {
             .read()
             .expect("MemObjectStore lock poisoned")
             .get(&(repo_id.to_string(), oid.to_string()))
-            .cloned())
+            .map(|e| e.bytes.clone()))
     }
 
     fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
@@ -215,11 +345,50 @@ impl ObjectStore for MemObjectStore {
                 "write_loose: invalid oid {oid:?}"
             )));
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.objects
             .write()
             .expect("MemObjectStore lock poisoned")
-            .insert((repo_id.to_string(), oid.to_string()), bytes.to_vec());
+            .insert(
+                (repo_id.to_string(), oid.to_string()),
+                MemEntry {
+                    bytes: bytes.to_vec(),
+                    created_secs: now,
+                },
+            );
         Ok(())
+    }
+
+    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+        Ok(self
+            .objects
+            .read()
+            .expect("MemObjectStore lock poisoned")
+            .iter()
+            .filter(|((r, _), _)| r == repo_id)
+            .map(|((_, oid), e)| LooseInfo {
+                oid: oid.clone(),
+                size: e.bytes.len() as u64,
+                created_secs: e.created_secs,
+            })
+            .collect())
+    }
+
+    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        if !oid_is_valid(oid) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "delete_loose: invalid oid {oid:?}"
+            )));
+        }
+        Ok(self
+            .objects
+            .write()
+            .expect("MemObjectStore lock poisoned")
+            .remove(&(repo_id.to_string(), oid.to_string()))
+            .is_some())
     }
 }
 
@@ -332,6 +501,65 @@ pub(crate) mod conformance {
         for bad in cases {
             let r = store.write_loose("repo", bad, b"x");
             assert!(r.is_err(), "expected write_loose({bad:?}) to error, got {r:?}");
+        }
+    }
+
+    /// `list_loose` returns every written object with a populated
+    /// LooseInfo (oid + size + non-zero created_secs). Order is
+    /// unspecified, so the test sorts before comparing.
+    pub fn list_loose_enumerates_writes<S: ObjectStore>(store: &S) {
+        let oids = [
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            "3333333333333333333333333333333333333333",
+        ];
+        for oid in oids {
+            store.write_loose("conf-repo", oid, b"some-bytes").unwrap();
+        }
+        let mut listed = store.list_loose("conf-repo").unwrap();
+        listed.sort_by(|a, b| a.oid.cmp(&b.oid));
+        let listed_oids: Vec<&str> = listed.iter().map(|i| i.oid.as_str()).collect();
+        assert_eq!(listed_oids, oids);
+        for info in &listed {
+            assert!(info.size > 0, "size must be populated, got {info:?}");
+            assert!(
+                info.created_secs > 0,
+                "created_secs must be populated, got {info:?}"
+            );
+        }
+    }
+
+    /// `list_loose` on an empty / unknown repo returns `Ok(vec![])` —
+    /// not an error. This matches the FS shape where `objects/` may
+    /// not exist yet and the chunked-KV shape where the repo's row
+    /// set is empty.
+    pub fn list_loose_empty_returns_empty_vec<S: ObjectStore>(store: &S) {
+        let listed = store.list_loose("nope").unwrap();
+        assert!(listed.is_empty(), "expected empty Vec, got {listed:?}");
+    }
+
+    /// `delete_loose` on a present oid returns `Ok(true)` then
+    /// `Ok(false)` on a second call (idempotent removal). After
+    /// delete, `read_loose` returns None. Both impls must satisfy.
+    pub fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
+        let oid = "4444444444444444444444444444444444444444";
+        store.write_loose("conf-repo", oid, b"to-delete").unwrap();
+        assert!(store.read_loose("conf-repo", oid).unwrap().is_some());
+        assert!(store.delete_loose("conf-repo", oid).unwrap(), "first delete must report true");
+        assert!(store.read_loose("conf-repo", oid).unwrap().is_none());
+        assert!(
+            !store.delete_loose("conf-repo", oid).unwrap(),
+            "second delete must report false (already gone)"
+        );
+    }
+
+    /// `delete_loose` with a malformed oid is a hard error — same
+    /// shape as `write_loose`. We won't computed-path-escape on
+    /// the way out any more than on the way in.
+    pub fn delete_loose_rejects_malformed_oid<S: ObjectStore>(store: &S) {
+        for bad in ["../something", "abc", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"] {
+            let r = store.delete_loose("repo", bad);
+            assert!(r.is_err(), "expected delete_loose({bad:?}) to error, got {r:?}");
         }
     }
 }
@@ -499,6 +727,58 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = FsObjectStore::new(tmp.path().join("repos"));
         conformance::write_loose_rejects_malformed_oid(&store);
+    }
+
+    #[test]
+    fn fs_list_loose_enumerates_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::list_loose_enumerates_writes(&store);
+    }
+
+    #[test]
+    fn fs_list_loose_empty_returns_empty_vec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::list_loose_empty_returns_empty_vec(&store);
+    }
+
+    #[test]
+    fn fs_delete_loose_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::delete_loose_round_trips(&store);
+    }
+
+    #[test]
+    fn fs_delete_loose_rejects_malformed_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::new(tmp.path().join("repos"));
+        conformance::delete_loose_rejects_malformed_oid(&store);
+    }
+
+    #[test]
+    fn mem_list_loose_enumerates_writes() {
+        let store = MemObjectStore::new();
+        conformance::list_loose_enumerates_writes(&store);
+    }
+
+    #[test]
+    fn mem_list_loose_empty_returns_empty_vec() {
+        let store = MemObjectStore::new();
+        conformance::list_loose_empty_returns_empty_vec(&store);
+    }
+
+    #[test]
+    fn mem_delete_loose_round_trips() {
+        let store = MemObjectStore::new();
+        conformance::delete_loose_round_trips(&store);
+    }
+
+    #[test]
+    fn mem_delete_loose_rejects_malformed_oid() {
+        let store = MemObjectStore::new();
+        conformance::delete_loose_rejects_malformed_oid(&store);
     }
 
     /// FS-specific: `write_loose` is atomic via tmp+rename. After a
