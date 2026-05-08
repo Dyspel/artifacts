@@ -426,6 +426,15 @@ async fn main() -> anyhow::Result<()> {
             // before in-flight drain begins.
             let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+            // Hold a clone of the audit store outside `rest_state` so
+            // we can emit a `server.shutdown` audit event after the
+            // listener returns — paired with the `server.start` event
+            // emitted at boot, this gives a compliance reviewer a
+            // bracket-record per process instance ("started at T1
+            // with config X, exited at T2 after N seconds uptime").
+            let audit_for_shutdown = audit.clone();
+            let server_started_at = std::time::Instant::now();
+
             let rest_state = RestState {
                 cfg: cfg.clone(),
                 storage,
@@ -577,6 +586,13 @@ async fn main() -> anyhow::Result<()> {
                     .handle(handle)
                     .serve(app.into_make_service())
                     .await?;
+                emit_server_shutdown(
+                    &*audit_for_shutdown,
+                    server_started_at,
+                    shutdown_timeout,
+                    "graceful",
+                )
+                .await;
             } else {
                 let listener = tokio::net::TcpListener::bind(&bind).await?;
                 tracing::info!(
@@ -595,21 +611,35 @@ async fn main() -> anyhow::Result<()> {
                         draining.clone(),
                         shutdown_drain_delay,
                     ));
-                if shutdown_timeout.is_zero() {
+                let exit_kind = if shutdown_timeout.is_zero() {
                     serve.await?;
+                    "graceful"
                 } else {
                     // Bound the total drain time. If the drain doesn't
                     // finish in `shutdown_timeout`, we abandon it and
                     // let the process exit — better than blocking a
                     // rolling deploy on a stuck client.
                     match tokio::time::timeout(shutdown_timeout, serve).await {
-                        Ok(r) => r?,
-                        Err(_) => tracing::warn!(
-                            timeout_secs = shutdown_timeout_secs,
-                            "graceful shutdown timed out — exiting with in-flight requests"
-                        ),
+                        Ok(r) => {
+                            r?;
+                            "graceful"
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_secs = shutdown_timeout_secs,
+                                "graceful shutdown timed out — exiting with in-flight requests"
+                            );
+                            "timed_out"
+                        }
                     }
-                }
+                };
+                emit_server_shutdown(
+                    &*audit_for_shutdown,
+                    server_started_at,
+                    shutdown_timeout,
+                    exit_kind,
+                )
+                .await;
             }
         }
     }
@@ -731,6 +761,50 @@ async fn shutdown_signal(
         );
         tokio::time::sleep(drain_delay).await;
     }
+}
+
+/// Emit a `server.shutdown` audit event after the listener returns.
+/// Paired with the `server.start` event emitted at boot — together
+/// they bracket a process instance in the audit log so a compliance
+/// reviewer can answer "when was this server up, and did it exit
+/// cleanly or abandon in-flight work?"
+///
+/// `kind` is `"graceful"` if the listener returned within
+/// `shutdown_timeout` (or `shutdown_timeout` was 0), or
+/// `"timed_out"` if the outer timeout fired and we abandoned the
+/// drain. The HTTP path detects the latter via
+/// `tokio::time::timeout`'s `Err`; the TLS path always reports
+/// `graceful` because `axum_server::Handle::graceful_shutdown` does
+/// not surface a "drain exceeded budget" signal we can read here.
+async fn emit_server_shutdown(
+    audit: &dyn audit::AuditStore,
+    started_at: std::time::Instant,
+    shutdown_timeout: Duration,
+    kind: &str,
+) {
+    let uptime_secs = started_at.elapsed().as_secs();
+    tracing::info!(
+        target: "audit",
+        event = "server.shutdown",
+        actor = "admin",
+        kind = %kind,
+        uptime_secs,
+        shutdown_timeout_secs = shutdown_timeout.as_secs(),
+    );
+    audit::record_silent(
+        audit,
+        "server.shutdown",
+        "admin",
+        None,
+        serde_json::json!({
+            "kind": kind,
+            "uptime_secs": uptime_secs,
+            "shutdown_timeout_secs": shutdown_timeout.as_secs(),
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+        None,
+    )
+    .await;
 }
 
 /// Kick off the axum-server graceful-shutdown handshake when the

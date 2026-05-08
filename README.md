@@ -494,6 +494,17 @@ compliance reviewer querying
 `GET /v1/admin/audit?event=server.start` gets a full process-boot
 history without needing access to the operational logs.
 
+**Shutdown audit.** Every clean exit emits a paired
+`server.shutdown` event with `kind` (`"graceful"` or
+`"timed_out"`), `uptime_secs`, and the configured
+`shutdown_timeout_secs`. Together with `server.start` this gives
+the audit log a bracket-record per process instance — "started
+at T1 with config X, exited at T2 after N seconds, drain
+completed cleanly / timed out." If a row's `server.start` has no
+matching `server.shutdown`, the process exited via SIGKILL or
+crashed (no chance to write the row), which is itself a
+useful signal.
+
 **Cheap totals.** `GET /v1/admin/audit/stats` returns
 `{ count: <total rows> }` — backed by `SELECT COUNT(*)` against
 the indexed `audit_events` table, so admin tooling can surface

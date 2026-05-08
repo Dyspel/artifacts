@@ -1007,5 +1007,26 @@ echo "    SIGTERM → readiness 503 + draining:true within drain-delay window"
 # Wait for the server to actually exit so the next teardown is clean.
 wait "$DRAIN_PID" 2>/dev/null || true
 
+# `server.shutdown` audit event must land — paired with the
+# `server.start` event emitted at boot, this gives the audit log a
+# bracket-record per process instance. Restart a server pointed at
+# the same audit DB and query for the event.
+start_server
+shutdown_audit="${WORK_DIR}/shutdown_audit.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?event=server.shutdown" \
+    -o "$shutdown_audit"
+shutdown_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$shutdown_audit")
+[[ "$shutdown_count" -ge 1 ]] \
+    || { echo "FAIL: no server.shutdown audit event recorded after SIGTERM"; cat "$shutdown_audit"; exit 1; }
+# Newest row should be the one we just produced — fields_json contains
+# `kind` + `uptime_secs`. Both must be present.
+shutdown_kind=$(python3 -c 'import json,sys; rows=json.load(sys.stdin); print(json.loads(rows[0]["fields"]).get("kind",""))' < "$shutdown_audit")
+shutdown_uptime=$(python3 -c 'import json,sys; rows=json.load(sys.stdin); print(json.loads(rows[0]["fields"]).get("uptime_secs",-1))' < "$shutdown_audit")
+[[ "$shutdown_kind" == "graceful" ]] \
+    || { echo "FAIL: server.shutdown kind=$shutdown_kind, expected 'graceful'"; exit 1; }
+[[ "$shutdown_uptime" -ge 0 ]] \
+    || { echo "FAIL: server.shutdown uptime_secs=$shutdown_uptime, expected ≥ 0"; exit 1; }
+echo "    server.shutdown audit event recorded — kind=$shutdown_kind, uptime_secs=$shutdown_uptime"
+
 echo
 echo "==> all checks passed"
