@@ -61,10 +61,15 @@ cargo build --quiet
 start_server() {
     # Tight quota + blob cap so the steps below that exercise them
     # don't have to burn through production-sized limits.
+    # `ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS=0` opts the smoke harness
+    # out of the production-default 5s pre-drain hold-off so each
+    # stop/start cycle stays fast. The drain-flip itself is exercised
+    # directly by the dedicated step at the end of this file.
     ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
     ARTIFACTS_JWT_SECRET="$JWT_SECRET" \
     ARTIFACTS_MAX_REPOS_PER_USER=3 \
     ARTIFACTS_MAX_COMMIT_BLOB_BYTES=1024 \
+    ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS=0 \
         ./target/debug/artifacts serve \
             --data-dir "$DATA_DIR" \
             --bind "$BIND" \
@@ -949,6 +954,58 @@ jwt_rotate_code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
 [[ "$jwt_rotate_code" == "403" ]] \
     || { echo "FAIL: JWT user POST /v1/admin/token/rotate expected 403, got $jwt_rotate_code"; exit 1; }
 echo "    rotate → old=401, new=200; JWT-user→403"
+
+# Drain-readiness: when SIGTERM fires, /v1/health/ready must flip to
+# 503 with `draining: true` BEFORE the listener stops accepting new
+# connections, so an orchestrator (k8s/systemd) can pull the process
+# out of rotation cleanly. We test this in isolation against a fresh
+# server that opts in to a small explicit drain delay (the rest of
+# the smoke runs with delay=0 for iteration speed).
+echo "==> [??] graceful shutdown — readiness probe drains before listener"
+stop_server
+DRAIN_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+DRAIN_BIND="127.0.0.1:${DRAIN_PORT}"
+DRAIN_BASE="http://${DRAIN_BIND}"
+ARTIFACTS_ADMIN_TOKEN="$ADMIN_TOKEN" \
+ARTIFACTS_JWT_SECRET="$JWT_SECRET" \
+ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS=2 \
+    ./target/debug/artifacts serve \
+        --data-dir "$DATA_DIR" \
+        --bind "$DRAIN_BIND" \
+        --public-base-url "$DRAIN_BASE" \
+    >>"$SERVER_LOG" 2>&1 &
+DRAIN_PID=$!
+# Wait until the new server is up.
+for _ in $(seq 1 50); do
+    if curl -fsS "$DRAIN_BASE/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+# Pre-flight: readiness must be 200 + ok=true before we touch anything.
+pre_status=$(curl -sS -o /dev/null -w '%{http_code}' "$DRAIN_BASE/v1/health/ready")
+[[ "$pre_status" == "200" ]] \
+    || { echo "FAIL: pre-shutdown readiness expected 200, got $pre_status"; kill "$DRAIN_PID" 2>/dev/null; wait "$DRAIN_PID" 2>/dev/null; exit 1; }
+# Send SIGTERM; readiness must flip within the 2s drain-delay window.
+kill -TERM "$DRAIN_PID" 2>/dev/null
+flipped=0
+for _ in $(seq 1 20); do
+    body=$(curl -sS -o /dev/null -w '%{http_code} %{stderr}' "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
+    if [[ "$code" == "503" ]]; then
+        # Confirm the body says `draining: true` — distinguishes
+        # "draining" from a generic infrastructure-failure 503.
+        ready_body=$(curl -sS "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
+        if echo "$ready_body" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("draining") is True else 1)' 2>/dev/null; then
+            flipped=1
+            break
+        fi
+    fi
+    sleep 0.1
+done
+[[ "$flipped" == "1" ]] \
+    || { echo "FAIL: readiness did not flip to 503+draining within drain-delay window"; kill "$DRAIN_PID" 2>/dev/null; wait "$DRAIN_PID" 2>/dev/null; exit 1; }
+echo "    SIGTERM → readiness 503 + draining:true within drain-delay window"
+# Wait for the server to actually exit so the next teardown is clean.
+wait "$DRAIN_PID" 2>/dev/null || true
 
 echo
 echo "==> all checks passed"

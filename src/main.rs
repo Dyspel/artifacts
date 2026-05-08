@@ -123,6 +123,21 @@ enum Cmd {
         #[arg(long, env = "ARTIFACTS_SHUTDOWN_TIMEOUT_SECS", default_value_t = 30)]
         shutdown_timeout_secs: u64,
 
+        /// Drain delay between SIGTERM and the start of axum's
+        /// graceful drain, in seconds. During this window the
+        /// readiness probe (`/v1/health/ready`) fails with 503 +
+        /// `{draining: true}` so an orchestrator can pull the process
+        /// out of its load-balancer pool *before* it stops accepting
+        /// new connections. 5s is the standard k8s recommendation
+        /// (covers a probe interval + endpoint-controller reconcile);
+        /// `0` disables the delay and matches pre-this-flag behaviour.
+        ///
+        /// The delay is part of, not in addition to, the total
+        /// shutdown budget — the listener still exits within
+        /// `shutdown_timeout_secs` worst-case.
+        #[arg(long, env = "ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS", default_value_t = 5)]
+        shutdown_drain_delay_secs: u64,
+
         /// Audit log retention, in days. Rows older than this are
         /// pruned hourly. `0` disables pruning (audit log grows
         /// indefinitely — useful for compliance scenarios where an
@@ -168,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             shutdown_timeout_secs,
+            shutdown_drain_delay_secs,
             audit_retention_days,
             allow_insecure,
         } => {
@@ -308,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                 max_repos_per_user,
                 audit_retention_days,
                 shutdown_timeout_secs,
+                shutdown_drain_delay_secs,
             );
             crate::audit::record_silent(
                 &*audit,
@@ -322,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
                     "max_repos_per_user": max_repos_per_user,
                     "audit_retention_days": audit_retention_days,
                     "shutdown_timeout_secs": shutdown_timeout_secs,
+                    "shutdown_drain_delay_secs": shutdown_drain_delay_secs,
                     "version": env!("CARGO_PKG_VERSION"),
                 }),
                 None,
@@ -400,6 +418,14 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(60),
             );
 
+            // Shared drain flag. Flipped from `false` → `true` by the
+            // shutdown listener task on first SIGTERM/SIGINT, before
+            // axum-server begins refusing connections. The readiness
+            // probe checks this and starts returning 503 immediately
+            // so an orchestrator can pull the process out of rotation
+            // before in-flight drain begins.
+            let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             let rest_state = RestState {
                 cfg: cfg.clone(),
                 storage,
@@ -413,6 +439,7 @@ async fn main() -> anyhow::Result<()> {
                 audit,
                 webhook_key_path,
                 objects,
+                draining: draining.clone(),
             };
             // Bench A/B kill-switch. Production never sets this; the
             // bench scripts toggle it to compare native vs subprocess
@@ -509,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(axum_middleware::from_fn(request_id::instrument));
 
             let shutdown_timeout = Duration::from_secs(shutdown_timeout_secs);
+            let shutdown_drain_delay = Duration::from_secs(shutdown_drain_delay_secs);
             if tls_enabled {
                 // rustls 0.23 dropped the implicit default crypto
                 // provider — install ring once before any RustlsConfig
@@ -539,7 +567,12 @@ async fn main() -> anyhow::Result<()> {
                 // SIGINT fires. The serve() call then returns once the
                 // drain completes (or hits the timeout).
                 let handle = axum_server::Handle::new();
-                spawn_shutdown_listener(handle.clone(), shutdown_timeout);
+                spawn_shutdown_listener(
+                    handle.clone(),
+                    shutdown_timeout,
+                    draining.clone(),
+                    shutdown_drain_delay,
+                );
                 axum_server::bind_rustls(addr, config)
                     .handle(handle)
                     .serve(app.into_make_service())
@@ -558,7 +591,10 @@ async fn main() -> anyhow::Result<()> {
                 // a tower-managed deadline). The outer timeout ensures
                 // we exit even if a request is genuinely stuck.
                 let serve = axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown_signal());
+                    .with_graceful_shutdown(shutdown_signal(
+                        draining.clone(),
+                        shutdown_drain_delay,
+                    ));
                 if shutdown_timeout.is_zero() {
                     serve.await?;
                 } else {
@@ -636,11 +672,28 @@ fn check_bind_safety(
 }
 
 /// Resolves on the first SIGTERM (Linux/Mac systemd / k8s graceful
-/// stop) or SIGINT (Ctrl-C in a dev shell). Both signal sources
-/// are wired up on Unix; on non-Unix platforms only Ctrl-C is
-/// available and SIGTERM-style requests have to come through the
-/// stdlib's ctrl-c handler (which Windows maps appropriately).
-async fn shutdown_signal() {
+/// stop) or SIGINT (Ctrl-C in a dev shell), then performs the
+/// pre-drain hand-off:
+///
+///   1. flip the shared `draining` flag → readiness probe begins
+///      returning 503
+///   2. sleep `drain_delay` so the orchestrator has time to notice
+///      the failing probe and pull this process out of its
+///      load-balancer pool
+///   3. resolve the future, which is what triggers axum / axum-server
+///      to stop accepting new connections and start the drain.
+///
+/// `drain_delay == ZERO` skips step 2 (legacy / dev behaviour;
+/// matches what we did before this hand-off existed).
+///
+/// Both signal sources are wired on Unix. On non-Unix only Ctrl-C is
+/// available; SIGTERM-style requests come through the stdlib's
+/// ctrl-c handler (Windows maps appropriately).
+async fn shutdown_signal(
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    drain_delay: Duration,
+) {
+    use std::sync::atomic::Ordering;
     use tokio::signal;
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install ctrl-c handler");
@@ -662,6 +715,22 @@ async fn shutdown_signal() {
             tracing::info!("received SIGTERM, beginning graceful shutdown");
         }
     }
+    // Stage 1: flip the readiness flag *before* the drain so the
+    // orchestrator's next probe gets 503. Relaxed ordering is
+    // sufficient — readers (`health_ready`) re-poll on every probe
+    // and don't care about happens-before with anything else.
+    draining.store(true, Ordering::Relaxed);
+    // Stage 2: give the orchestrator a window to react to the
+    // failing probe before we stop accepting connections. The k8s
+    // endpoint-controller takes a couple of probe intervals to
+    // reconcile, so 5s is a sane default.
+    if !drain_delay.is_zero() {
+        tracing::info!(
+            drain_delay_secs = drain_delay.as_secs(),
+            "marked draining; sleeping so orchestrator can pull from rotation",
+        );
+        tokio::time::sleep(drain_delay).await;
+    }
 }
 
 /// Kick off the axum-server graceful-shutdown handshake when the
@@ -670,9 +739,17 @@ async fn shutdown_signal() {
 /// takes `Option<Duration>` where `Some(ZERO)` means "drop active
 /// connections immediately" — close enough for our purposes that we
 /// just pass the timeout through.
-fn spawn_shutdown_listener(handle: axum_server::Handle, timeout: Duration) {
+///
+/// `draining` and `drain_delay` are forwarded to `shutdown_signal`
+/// so the readiness-flag hand-off happens before the drain starts.
+fn spawn_shutdown_listener(
+    handle: axum_server::Handle,
+    timeout: Duration,
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    drain_delay: Duration,
+) {
     tokio::spawn(async move {
-        shutdown_signal().await;
+        shutdown_signal(draining, drain_delay).await;
         handle.graceful_shutdown(Some(timeout));
     });
 }

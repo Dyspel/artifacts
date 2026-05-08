@@ -297,6 +297,8 @@ deadline each):
 { "ok": true,  "components": {"tokens": "ok", "audit": "ok"} }
 // unhealthy — returns HTTP 503 so k8s/systemd refuses traffic
 { "ok": false, "components": {"tokens": "ok", "audit": "fail"} }
+// shutting down — also 503; distinguishable from infra failure
+{ "ok": false, "draining": true }
 ```
 
 Distinct from `/v1/health` so a stuck SQLite read doesn't fail the
@@ -304,6 +306,12 @@ liveness probe (which would trigger a restart loop) — readiness
 fails first, the orchestrator drains traffic, and only then does
 the liveness probe drive a restart if the underlying issue
 persists.
+
+On SIGTERM/SIGINT the probe flips to the `draining` shape
+*before* the listener stops accepting connections (see the
+graceful-shutdown section). This is the canonical k8s sequence:
+mark unready → orchestrator pulls from rotation → existing
+in-flight requests finish → process exits.
 
 ### Create repo
 
@@ -826,6 +834,18 @@ env `ARTIFACTS_SHUTDOWN_TIMEOUT_SECS`) for in-flight requests to
 finish before exiting. Useful so a rolling deploy doesn't drop a
 git push mid-stream. Set the timeout to 0 for an immediate
 hard-exit (dev only).
+
+Before the drain begins, the readiness probe
+(`/v1/health/ready`) flips to 503 + `{draining: true}` and the
+process holds for `--shutdown-drain-delay-secs` (default 5, env
+`ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS`). That gives an orchestrator
+(k8s endpoint controller, etc.) time to notice the failing probe
+and pull the process out of its load-balancer pool *before* it
+stops accepting new connections. Without this hold-off, the
+orchestrator could route a fresh request onto a process that's
+about to refuse it at the TCP level. Set the delay to 0 to skip
+the hold-off (matches pre-feature behaviour; appropriate for
+non-orchestrated dev runs).
 
 TLS terminates in-process when both `--tls-cert <path>` and
 `--tls-key <path>` are set (PEM files, also via env

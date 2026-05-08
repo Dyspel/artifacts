@@ -68,6 +68,15 @@ pub struct RestState {
     /// through this trait now. A future chunked-KV backend swaps
     /// in by satisfying the same trait.
     pub objects: Arc<dyn crate::object_store::ObjectStore>,
+    /// Set to `true` once a SIGTERM/SIGINT has been received, before
+    /// the axum-server graceful drain begins. The readiness probe
+    /// short-circuits to 503 when this is set, so an orchestrator
+    /// (k8s, systemd) sees the process leave the load-balancer pool
+    /// *before* it stops accepting new connections. Without this the
+    /// orchestrator could route a fresh request onto a process that's
+    /// about to refuse it at the TCP level. Cheap relaxed atomic load
+    /// per probe — readiness is hit at most every couple of seconds.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -796,7 +805,25 @@ pub async fn health_ready(
     State(state): State<RestState>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     use axum::http::StatusCode;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    // Drain check first — if a shutdown signal has fired, we want
+    // readiness to start failing *before* axum-server stops accepting
+    // new connections. The orchestrator notices via the probe and
+    // pulls the pod out of rotation, so traffic ramps down while
+    // existing in-flight requests finish during the drain window.
+    // Skipping the store probes when draining keeps the response
+    // fast even if the stores are themselves under load.
+    if state.draining.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "draining": true,
+            })),
+        );
+    }
 
     let deadline = Duration::from_secs(1);
     // Cheap query that hits the tokens table — `lookup` of a known-
