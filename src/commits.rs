@@ -122,8 +122,8 @@ pub async fn create_commit(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Commit)?;
-    crate::storage::validate_repo_id(&repo_id)?;
-    if !state.data.storage.exists(&repo_id) {
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    if !state.data.storage.exists(&repo_id_typed) {
         return Err(Error::RepoNotFound(repo_id));
     }
     enforce_owner(&*state.data.ownership, &principal, &repo_id).await?;
@@ -170,7 +170,6 @@ pub async fn create_commit(
     // find_object error path. The Oid shape itself is already valid
     // (validated by serde at JSON decode); we only check repo-side
     // presence here.
-    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
     if let Some(parent_oid) = &body.parent {
         if !state.data.objects.exists(&repo_id_typed, parent_oid)? {
             return Err(Error::BadRequest(format!(

@@ -52,7 +52,8 @@ pub async fn create_webhook(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Token)?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
@@ -79,7 +80,8 @@ pub async fn list_webhooks(
         state.cfg.jwt_expected_aud(),
         state.cfg.jwt_expected_iss(),
     )?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
@@ -99,7 +101,8 @@ pub async fn delete_webhook(
         state.cfg.jwt_expected_aud(),
         state.cfg.jwt_expected_iss(),
     )?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
@@ -142,7 +145,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
-        storage.create(REPO).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(REPO).unwrap())
+            .unwrap();
 
         let cfg = crate::config::Config::new(
             data_dir.clone(),

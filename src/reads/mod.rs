@@ -61,8 +61,8 @@ async fn authorize_read(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Default)?;
-    crate::storage::validate_repo_id(repo_id)?;
-    if !state.data.storage.exists(repo_id) {
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id)?;
+    if !state.data.storage.exists(&repo_id_typed) {
         return Err(Error::RepoNotFound(repo_id.to_string()));
     }
     enforce_owner(&*state.data.ownership, &principal, repo_id).await?;

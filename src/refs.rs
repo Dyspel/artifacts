@@ -626,7 +626,9 @@ mod tests {
         let repos_dir = tmp.join("repos");
         let storage = FsStorage::new(&repos_dir).unwrap();
         let repo_id_str = new_repo_id();
-        storage.create(&repo_id_str).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id_str.as_str()).unwrap())
+            .unwrap();
         let refs = FsRefStore::new(repos_dir);
         (tmp, rid(&repo_id_str), refs)
     }

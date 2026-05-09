@@ -62,7 +62,7 @@ pub async fn create_repo(
             .expect("new_repo_id() output satisfies the RepoId contract")
     });
     let id_str = id_typed.as_str().to_owned();
-    state.data.storage.create(&id_str)?;
+    state.data.storage.create(&id_typed)?;
     // Record ownership *before* minting the token so a crash between the
     // two leaves a repo we can identify the owner of.
     let owner_typed = match principal.subject() {
@@ -134,7 +134,8 @@ pub async fn fork_repo(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Create)?;
-    if !state.data.storage.exists(&source_id) {
+    let source_id_typed = crate::ids::RepoId::try_from(source_id.as_str())?;
+    if !state.data.storage.exists(&source_id_typed) {
         return Err(Error::RepoNotFound(source_id));
     }
     enforce_owner(&*state.data.ownership, &principal, &source_id).await?;
@@ -152,7 +153,7 @@ pub async fn fork_repo(
             .expect("new_repo_id() output satisfies the RepoId contract")
     });
     let fork_id_str = fork_id_typed.as_str().to_owned();
-    state.data.storage.fork(&source_id, &fork_id_str)?;
+    state.data.storage.fork(&source_id_typed, &fork_id_typed)?;
     let owner_typed = match principal.subject() {
         Some(s) => Some(crate::ids::Subject::try_from(s)?),
         None => None,
@@ -239,8 +240,8 @@ pub async fn delete_repo(
         }
         let mut deleted = Vec::with_capacity(order.len());
         for dep in &order {
-            state.data.storage.delete(dep)?;
             let dep_typed = crate::ids::RepoId::try_from(dep.as_str())?;
+            state.data.storage.delete(&dep_typed)?;
             state.data.ownership.delete(&dep_typed).await?;
             state.data.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
@@ -279,8 +280,8 @@ pub async fn delete_repo(
         }
     }
 
-    state.data.storage.delete(&id)?;
     let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    state.data.storage.delete(&id_typed)?;
     state.data.ownership.delete(&id_typed).await?;
     state.data.alternates_cache.invalidate(&id);
     let mode = if force { "force" } else { "default" };

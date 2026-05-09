@@ -15,6 +15,7 @@
 //! alongside a protocol rewrite (M1) without touching REST handlers.
 
 use crate::error::{Error, Result};
+use crate::ids::RepoId;
 use std::path::{Path, PathBuf};
 
 /// Enforce the per-repo byte quota at a mutation boundary. Walks the
@@ -47,18 +48,18 @@ pub fn check_repo_byte_quota(repos_dir: &Path, repo_id: &str, limit: u64) -> Res
 /// exists semantics. `FsStorage` is the one impl today.
 pub trait Storage: Send + Sync {
     /// `true` iff a repo with this id exists.
-    fn exists(&self, repo_id: &str) -> bool;
+    fn exists(&self, repo_id: &RepoId) -> bool;
 
     /// Create a new empty repo. Errors on `RepoExists` if the id is taken.
-    fn create(&self, repo_id: &str) -> Result<()>;
+    fn create(&self, repo_id: &RepoId) -> Result<()>;
 
     /// Create `fork_id` as a fork of `source_id`. O(1) for impls that
     /// share object storage — the whole point.
-    fn fork(&self, source_id: &str, fork_id: &str) -> Result<()>;
+    fn fork(&self, source_id: &RepoId, fork_id: &RepoId) -> Result<()>;
 
     /// Remove a repo. Implementations may soft-delete; this trait makes
     /// no guarantees about GC of shared objects.
-    fn delete(&self, repo_id: &str) -> Result<()>;
+    fn delete(&self, repo_id: &RepoId) -> Result<()>;
 }
 
 /// Repo ID format: 24 chars, [a-z0-9]. Derived from UUIDv4, base32-ish.
@@ -176,8 +177,8 @@ fn path_is_safe_descendant(root: &Path, joined: &Path) -> std::result::Result<()
 }
 
 impl Storage for FsStorage {
-    fn exists(&self, id: &str) -> bool {
-        self.repo_path(id).is_dir()
+    fn exists(&self, id: &RepoId) -> bool {
+        self.repo_path(id.as_str()).is_dir()
     }
 
     /// Initialize a new empty bare repo. Fails if the repo already exists.
@@ -191,9 +192,8 @@ impl Storage for FsStorage {
     /// `Storage` impl) and removes the `git` binary requirement
     /// from the create path. Same shape as `fork()` already writes
     /// by hand for the same reasons.
-    fn create(&self, id: &str) -> Result<()> {
-        validate_repo_id(id)?;
-        let path = self.repo_path(id);
+    fn create(&self, id: &RepoId) -> Result<()> {
+        let path = self.repo_path(id.as_str());
         if path.exists() {
             return Err(Error::RepoExists(id.to_string()));
         }
@@ -212,13 +212,12 @@ impl Storage for FsStorage {
     /// `alternates` mechanism. New objects written to the fork live only in
     /// the fork's own objects dir; `git gc` on either repo respects the
     /// relationship.
-    fn fork(&self, source_id: &str, fork_id: &str) -> Result<()> {
-        validate_repo_id(fork_id)?;
-        let source = self.repo_path(source_id);
+    fn fork(&self, source_id: &RepoId, fork_id: &RepoId) -> Result<()> {
+        let source = self.repo_path(source_id.as_str());
         if !source.is_dir() {
             return Err(Error::RepoNotFound(source_id.to_string()));
         }
-        let fork = self.repo_path(fork_id);
+        let fork = self.repo_path(fork_id.as_str());
         if fork.exists() {
             return Err(Error::RepoExists(fork_id.to_string()));
         }
@@ -271,8 +270,8 @@ impl Storage for FsStorage {
     /// Delete a repo. For M0 this is a rm -rf; production needs
     /// soft-delete and GC ordering (can't delete a repo that's the
     /// alternates source for another live repo).
-    fn delete(&self, id: &str) -> Result<()> {
-        let path = self.repo_path(id);
+    fn delete(&self, id: &RepoId) -> Result<()> {
+        let path = self.repo_path(id.as_str());
         if !path.is_dir() {
             return Err(Error::RepoNotFound(id.to_string()));
         }
@@ -417,7 +416,9 @@ mod tests {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let id = new_repo_id();
-        storage.create(&id).unwrap();
+        storage
+            .create(&RepoId::try_from(id.as_str()).unwrap())
+            .unwrap();
         let path = storage.repo_path(&id);
 
         // Sanity: HEAD points at refs/heads/main, config has
@@ -457,7 +458,9 @@ mod tests {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let id = new_repo_id();
-        storage.create(&id).unwrap();
+        storage
+            .create(&RepoId::try_from(id.as_str()).unwrap())
+            .unwrap();
         // `limit = 0` always allows, regardless of size.
         assert!(check_repo_byte_quota(&tmp.join("repos"), &id, 0).is_ok());
     }
@@ -467,7 +470,9 @@ mod tests {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let id = new_repo_id();
-        storage.create(&id).unwrap();
+        storage
+            .create(&RepoId::try_from(id.as_str()).unwrap())
+            .unwrap();
         // Fresh bare-repo layout is a few hundred bytes; 100 MiB is
         // generous headroom.
         assert!(check_repo_byte_quota(&tmp.join("repos"), &id, 100 * 1024 * 1024).is_ok());
@@ -478,7 +483,9 @@ mod tests {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let id = new_repo_id();
-        storage.create(&id).unwrap();
+        storage
+            .create(&RepoId::try_from(id.as_str()).unwrap())
+            .unwrap();
         // Limit of 1 byte will fail — every fresh repo has at least
         // a HEAD file (~20 bytes) on disk.
         let err = check_repo_byte_quota(&tmp.join("repos"), &id, 1).unwrap_err();
@@ -552,7 +559,9 @@ mod tests {
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let a = new_repo_id();
         let b = new_repo_id();
-        storage.create(&a).unwrap();
+        storage
+            .create(&RepoId::try_from(a.as_str()).unwrap())
+            .unwrap();
 
         // Seed source with a real commit. A bogus all-zeros SHA would
         // work for a direct-file-copy fork, but the new
@@ -585,7 +594,12 @@ mod tests {
             .unwrap();
         assert!(st.success());
 
-        storage.fork(&a, &b).unwrap();
+        storage
+            .fork(
+                &RepoId::try_from(a.as_str()).unwrap(),
+                &RepoId::try_from(b.as_str()).unwrap(),
+            )
+            .unwrap();
 
         // alternates file points back at source.
         let alt =
@@ -610,8 +624,15 @@ mod tests {
         let storage = FsStorage::new(tmp.join("repos")).unwrap();
         let a = new_repo_id();
         let b = new_repo_id();
-        storage.create(&a).unwrap();
-        storage.fork(&a, &b).unwrap();
+        storage
+            .create(&RepoId::try_from(a.as_str()).unwrap())
+            .unwrap();
+        storage
+            .fork(
+                &RepoId::try_from(a.as_str()).unwrap(),
+                &RepoId::try_from(b.as_str()).unwrap(),
+            )
+            .unwrap();
         assert!(!storage.repo_path(&b).join("packed-refs").exists());
     }
 

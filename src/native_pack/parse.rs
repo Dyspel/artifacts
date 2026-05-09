@@ -1028,7 +1028,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = FsStorage::new(tmp.path()).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = tmp.path().join(format!("{repo_id}.git"));
 
         // Seed the repo with one commit via plumbing so there's

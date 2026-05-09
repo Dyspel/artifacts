@@ -327,7 +327,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         let pack = generate_pack(&git_dir, &[], &[]).unwrap();
@@ -346,7 +348,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         // Plumbing-only commit: hash-object → mktree → commit-tree.

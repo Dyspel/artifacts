@@ -38,7 +38,9 @@ fn fs_fixture() -> (tempfile::TempDir, FsObjectStore, RepoId, Oid) {
     let repos = tmp.path().join("repos");
     let storage = FsStorage::new(&repos).unwrap();
     let repo_id_str = new_repo_id();
-    storage.create(&repo_id_str).unwrap();
+    storage
+        .create(&crate::ids::RepoId::try_from(repo_id_str.as_str()).unwrap())
+        .unwrap();
     let git_dir = repos.join(format!("{repo_id_str}.git"));
     let oid_str = write_blob(&git_dir, b"hello\n");
     let store = FsObjectStore::new(&repos);

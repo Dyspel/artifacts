@@ -50,12 +50,12 @@ pub async fn mint_token(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Token)?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
     let subject_typed = match principal.subject() {
         Some(s) => Some(crate::ids::Subject::try_from(s)?),
         None => None,
@@ -208,11 +208,11 @@ pub async fn list_tokens(
         state.cfg.jwt_expected_aud(),
         state.cfg.jwt_expected_iss(),
     )?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
-    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
     let subject_filter_typed = match &principal {
         crate::auth::Principal::Admin => None,
         crate::auth::Principal::User { subject } => {
@@ -256,12 +256,12 @@ pub async fn rotate_tokens(
         state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Token)?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
 
-    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
     let subject_typed = match principal.subject() {
         Some(s) => Some(crate::ids::Subject::try_from(s)?),
         None => None,

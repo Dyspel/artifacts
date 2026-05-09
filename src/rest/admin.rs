@@ -141,7 +141,8 @@ pub async fn admin_gc_preview(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     let preview = crate::gc::preview(
@@ -181,7 +182,8 @@ pub async fn admin_gc_run(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
-    if !state.data.storage.exists(&id) {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
     let result = crate::gc::run(

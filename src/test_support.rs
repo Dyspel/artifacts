@@ -52,7 +52,9 @@ impl TestRepo {
         let repos_dir = tmp.path().join("repos");
         let storage = FsStorage::new(&repos_dir).expect("FsStorage::new");
         let repo_id = new_repo_id();
-        storage.create(&repo_id).expect("create repo");
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .expect("create repo");
         let git_dir = repos_dir.join(format!("{repo_id}.git"));
         Self {
             tmp,

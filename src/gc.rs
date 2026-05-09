@@ -458,7 +458,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         // hash-object → mktree → commit-tree, the same plumbing dance
@@ -584,7 +586,12 @@ mod tests {
         let (tmp, storage, source_id) = seed_repo();
         let repos_dir = storage_repos_dir(&tmp, &storage);
         let fork_id = new_repo_id();
-        storage.fork(&source_id, &fork_id).unwrap();
+        storage
+            .fork(
+                &crate::ids::RepoId::try_from(source_id.as_str()).unwrap(),
+                &crate::ids::RepoId::try_from(fork_id.as_str()).unwrap(),
+            )
+            .unwrap();
 
         let cache = AlternatesCache::new();
         let objects = fs_objects(&repos_dir);
@@ -674,7 +681,9 @@ mod tests {
         let mut repos_setup: Vec<(String, String, String)> = Vec::new();
         for _ in 0..2 {
             let repo_id = new_repo_id();
-            storage.create(&repo_id).unwrap();
+            storage
+                .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+                .unwrap();
             let git_dir = repos.join(format!("{repo_id}.git"));
             // Seed a reachable commit so run() doesn't error on a
             // ref-less repo.
