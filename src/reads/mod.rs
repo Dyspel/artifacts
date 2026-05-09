@@ -898,3 +898,59 @@ fn count_forks_of(
 ) -> std::io::Result<u64> {
     Ok(list_forks_of(repos_dir, repo_id, cache)?.len() as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_diff, parse_log_records, DiffStatus};
+
+    #[test]
+    fn parse_log_records_extracts_fields_and_skips_malformed() {
+        // git log emits NUL-delimited records, \x01-delimited fields.
+        let mut input: Vec<u8> = Vec::new();
+        for f in [
+            "abc123def",
+            "p1 p2",
+            "Alice",
+            "a@x",
+            "Bob",
+            "b@x",
+            "1700000000",
+        ] {
+            input.extend_from_slice(f.as_bytes());
+            input.push(1);
+        }
+        // message field (index 7); git leaves a leading newline after %ct.
+        input.extend_from_slice(b"\nfirst line\nbody");
+        input.push(0);
+        // A malformed record (fewer than 8 fields) must be skipped, not panic.
+        input.extend_from_slice(b"only-one-field");
+        input.push(0);
+
+        let out = parse_log_records(&input).unwrap();
+        assert_eq!(out.len(), 1, "the malformed record is dropped");
+        assert_eq!(out[0].sha, "abc123def");
+        assert_eq!(out[0].parents, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(out[0].author.name, "Alice");
+        assert_eq!(out[0].committer.email, "b@x");
+        assert_eq!(out[0].timestamp, 1_700_000_000);
+        assert_eq!(out[0].message, "first line\nbody");
+    }
+
+    #[test]
+    fn parse_diff_reads_numstat_counts_and_rename() {
+        let numstat = "3\t1\tsrc/a.rs\n0\t0\told.rs => new.rs\n";
+        let patch = "diff --git a/src/a.rs b/src/a.rs\n@@ -1,2 +1,4 @@\n+added\n";
+        let files = parse_diff(numstat, patch);
+        assert_eq!(files.len(), 2);
+
+        let modified = files.iter().find(|f| f.path == "src/a.rs").unwrap();
+        assert_eq!(modified.additions, 3);
+        assert_eq!(modified.deletions, 1);
+        assert!(matches!(modified.status, DiffStatus::Modified));
+        assert!(!modified.hunks.is_empty(), "patch pass attaches the hunk");
+
+        let renamed = files.iter().find(|f| f.path == "new.rs").unwrap();
+        assert!(matches!(renamed.status, DiffStatus::Renamed));
+        assert_eq!(renamed.old_path.as_deref(), Some("old.rs"));
+    }
+}

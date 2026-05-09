@@ -359,6 +359,8 @@ mod router_tests {
         admin_gc_preview, admin_list_repos, create_repo, list_repos, mint_token, AuthnState,
         DataState, ObservState, RestState, RuntimeState,
     };
+    use crate::merge::merge_branches;
+    use crate::reads::get_blob;
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
@@ -421,6 +423,8 @@ mod router_tests {
         Router::new()
             .route("/v1/repos", post(create_repo).get(list_repos))
             .route("/v1/repos/:id/tokens", post(mint_token))
+            .route("/v1/repos/:id/merge", post(merge_branches))
+            .route("/v1/repos/:id/blob", get(get_blob))
             .route("/v1/admin/repos", get(admin_list_repos))
             .route("/v1/admin/repos/:id/gc-preview", get(admin_gc_preview))
             .with_state(build_state(dir))
@@ -548,6 +552,62 @@ mod router_tests {
             req(
                 "GET",
                 "/v1/admin/repos/no-such-repo/gc-preview",
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn merge_on_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo/merge",
+                Some(ADMIN),
+                Some(r#"{"sourceBranch":"feature","targetBranch":"main"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn merge_with_invalid_branch_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        // Create a repo so the merge handler reaches branch validation.
+        let (status, body) = send(&app, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["id"].as_str().unwrap();
+        // A branch name with a space is rejected before any git work.
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                &format!("/v1/repos/{id}/merge"),
+                Some(ADMIN),
+                Some(r#"{"sourceBranch":"bad branch","targetBranch":"main"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn blob_on_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(
+            &app,
+            req(
+                "GET",
+                "/v1/repos/no-such-repo/blob?ref=HEAD&path=README.md",
                 Some(ADMIN),
                 None,
             ),
