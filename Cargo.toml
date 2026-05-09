@@ -21,6 +21,10 @@ unsafe_op_in_unsafe_fn = "deny"
 # deliberate or pure noise for a server binary. Everything not allowed
 # here is enforced — including the lints we cleaned up to get to green.
 pedantic = { level = "warn", priority = -1 }
+# Nursery group too (also priority -1). These are newer/sharper lints;
+# the few that are noisy or unstable for this codebase are opted out
+# below alongside the pedantic exceptions.
+nursery = { level = "warn", priority = -1 }
 # Unsafe discipline (restriction group): every `unsafe` block must carry
 # a `// SAFETY:` comment and perform exactly one unsafe operation.
 undocumented_unsafe_blocks = "warn"
@@ -80,6 +84,22 @@ unused_async = "allow"
 #    `<id>.git` directory suffix as literally lowercase, so a
 #    case-sensitive `ends_with` is correct, not a bug.
 case_sensitive_file_extension_comparisons = "allow"
+
+# -- Nursery exceptions. The nursery group is on (above), but these
+#    specific lints are unstable/noisy or fight this codebase's
+#    deliberate choices, so they're opted out. Everything else in
+#    nursery is enforced (we fixed redundant_clone + or_fun_call to get
+#    here).
+too_long_first_doc_paragraph = "allow"  # narrative module/fn docs are intentional
+use_self = "allow"                      # explicit type names read clearer in impls; high churn
+option_if_let_else = "allow"            # `map_or_else` is often *less* readable than `if let`
+missing_const_for_fn = "allow"          # nursery, over-eager; const-ness isn't a goal here
+redundant_pub_crate = "allow"           # pairs with the unreachable_pub policy; would fight it
+cognitive_complexity = "allow"          # large protocol/route dispatch fns (see too_many_lines)
+significant_drop_tightening = "allow"   # drop-order rewrites are subtle; not worth the risk
+needless_pass_by_ref_mut = "allow"      # several are trait-signature-constrained
+suboptimal_flops = "allow"              # token-bucket float math is clearer as written
+branches_sharing_code = "allow"         # hoisting shared arms often hurts readability
 
 [[bin]]
 name = "artifacts"

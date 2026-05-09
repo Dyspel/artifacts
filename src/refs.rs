@@ -503,7 +503,7 @@ fn enumerate_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
     // Loose refs override packed. Walk `refs/` recursively.
     let refs_dir = git_dir.join("refs");
     if refs_dir.is_dir() {
-        let mut stack = vec![refs_dir.clone()];
+        let mut stack = vec![refs_dir];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,

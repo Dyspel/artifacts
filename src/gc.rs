@@ -529,7 +529,7 @@ mod tests {
         let objects = fs_objects(&repos_dir);
         let p = preview(&repos_dir, &repo_id, &cache, &objects).unwrap();
 
-        assert_eq!(p.network, vec![repo_id.clone()]);
+        assert_eq!(p.network, vec![repo_id]);
         assert!(p.reachable_oids >= 3, "commit + tree + blob = 3+");
         assert_eq!(p.unreachable_loose, 0);
         assert_eq!(p.unreachable_bytes, 0);

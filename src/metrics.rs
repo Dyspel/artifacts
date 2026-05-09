@@ -212,7 +212,7 @@ pub async fn track_metrics(req: Request, next: Next) -> Response {
         "artifacts_requests_total",
         "method" => method.clone(),
         "path" => path.clone(),
-        "status" => status.clone(),
+        "status" => status,
     )
     .increment(1);
     metrics::histogram!(

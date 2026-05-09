@@ -238,7 +238,7 @@ mod tests {
         if body.is_some() {
             b = b.header(header::CONTENT_TYPE, "application/json");
         }
-        b.body(body.map_or(Body::empty(), |s| Body::from(s.to_string())))
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
             .unwrap()
     }
 

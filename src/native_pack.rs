@@ -88,7 +88,7 @@ pub fn index_pack_into_repo(repo_path: &Path, pack_bytes: &[u8]) -> Result<()> {
         Some(&pack_dir),
         &mut progress,
         &interrupt,
-        Some(repo.objects.clone()),
+        Some(repo.objects),
         gix_pack::bundle::write::Options {
             thread_limit: Some(1),
             iteration_mode: gix_pack::data::input::Mode::Verify,
