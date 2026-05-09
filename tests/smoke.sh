@@ -1003,16 +1003,15 @@ pre_status=$(curl -sS -o /dev/null -w '%{http_code}' "$DRAIN_BASE/v1/health/read
 kill -TERM "$DRAIN_PID" 2>/dev/null
 flipped=0
 for _ in $(seq 1 20); do
-    body=$(curl -sS -o /dev/null -w '%{http_code} %{stderr}' "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
-    code=$(curl -sS -o /dev/null -w '%{http_code}' "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
-    if [[ "$code" == "503" ]]; then
-        # Confirm the body says `draining: true` — distinguishes
-        # "draining" from a generic infrastructure-failure 503.
-        ready_body=$(curl -sS "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
-        if echo "$ready_body" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("draining") is True else 1)' 2>/dev/null; then
-            flipped=1
-            break
-        fi
+    # Single curl per iteration: capture body and HTTP status in one
+    # round-trip. `-w "\n%{http_code}"` appends the status on its
+    # own line so we can split body from code without a second probe.
+    resp=$(curl -sS -w "\n%{http_code}" "$DRAIN_BASE/v1/health/ready" 2>/dev/null || true)
+    code="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [[ "$code" == "503" ]] && echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("draining") is True else 1)' 2>/dev/null; then
+        flipped=1
+        break
     fi
     sleep 0.1
 done
