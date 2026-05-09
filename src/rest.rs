@@ -98,6 +98,12 @@ pub struct ObservState {
     /// Webhook subscriptions registry. In-memory `MemRegistry` today;
     /// SQLite-backed when subscriptions need to survive a restart.
     pub webhooks: Arc<dyn crate::webhooks::WebhookRegistry>,
+    /// Durable delivery outbox — `Some` only for the SQLite backend.
+    /// When present, handlers enqueue webhook deliveries at publish time
+    /// (via `webhooks::publish_event`) so a broadcast lag can't drop
+    /// them; `None` (MemRegistry) falls back to the bus dispatcher's
+    /// direct dispatch.
+    pub webhook_outbox: Option<Arc<dyn crate::webhooks::DeliveryOutbox>>,
     /// Path to the on-disk webhook master key file. `None` for
     /// env-var-only deployments. `admin_rotate_webhook_key` rewrites
     /// it post-rotation so a restart picks up the new key.

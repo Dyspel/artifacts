@@ -92,10 +92,11 @@ pub async fn create_repo(
     // Emit a status transition so subscribers pick up brand-new repos
     // without polling. "unknown → idle" matches the repo's initial
     // state in the Fleet UI's RepoStatus enum.
-    state
-        .observ
-        .events
-        .publish(crate::events::Event::status(&id_str, "unknown", "idle"));
+    crate::webhooks::publish_event(
+        &state.observ.events,
+        state.observ.webhook_outbox.as_deref(),
+        crate::events::Event::status(&id_str, "unknown", "idle"),
+    );
     Ok(Json(RepoHandle {
         id: id_str,
         remote,
@@ -179,10 +180,11 @@ pub async fn fork_repo(
         None,
     )
     .await;
-    state
-        .observ
-        .events
-        .publish(crate::events::Event::fork(&source_id, &fork_id_str));
+    crate::webhooks::publish_event(
+        &state.observ.events,
+        state.observ.webhook_outbox.as_deref(),
+        crate::events::Event::fork(&source_id, &fork_id_str),
+    );
     Ok(Json(RepoHandle {
         id: fork_id_str,
         remote,

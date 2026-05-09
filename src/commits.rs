@@ -292,12 +292,11 @@ pub async fn create_commit(
     // to the first line so the event payload stays small regardless of
     // whatever multi-paragraph commit template the caller uses.
     let message_first_line = body.message.split('\n').next().unwrap_or("").to_string();
-    state.observ.events.publish(crate::events::Event::commit(
-        repo_id,
-        &commit_sha,
-        &body.branch,
-        message_first_line,
-    ));
+    crate::webhooks::publish_event(
+        &state.observ.events,
+        state.observ.webhook_outbox.as_deref(),
+        crate::events::Event::commit(repo_id, &commit_sha, &body.branch, message_first_line),
+    );
 
     Ok(Json(CommitResult {
         commit: commit_sha,

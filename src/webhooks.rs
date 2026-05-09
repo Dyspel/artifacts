@@ -955,14 +955,15 @@ fn record_dispatcher_lag(dropped: u64) {
     metrics::counter!("artifacts_webhook_events_dropped_total").increment(dropped);
 }
 
-/// Long-lived task that subscribes to the event bus and enqueues each
-/// event into the durable outbox (K3). For registries that don't
-/// implement `enqueue_delivery` (MemRegistry), falls back to the
-/// legacy in-process direct-dispatch path so test deployments that
-/// don't open the SQLite store still see webhook firings.
+/// MemRegistry-only webhook dispatcher. The SQLite backend enqueues
+/// deliveries at publish time (durable, lag-proof — see [`publish_event`])
+/// and a worker drains them, so it needs no dispatcher. This exists only
+/// for the in-memory `MemRegistry`, which has no outbox and instead
+/// direct-dispatches each event off the live bus. The broadcast is lossy,
+/// so a lag drops events (surfaced via the drop counter) — acceptable for
+/// the dev/test in-memory path, never the durable one.
 pub fn spawn_dispatcher(
     registry: Arc<dyn WebhookRegistry>,
-    outbox: Option<Arc<dyn DeliveryOutbox>>,
     bus: crate::events::EventBus,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -971,7 +972,7 @@ pub fn spawn_dispatcher(
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Ok(ev) => dispatch_event(&*registry, outbox.as_deref(), &ev).await,
+                    Ok(ev) => dispatch_event(&*registry, &ev),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         record_dispatcher_lag(n);
                     }
@@ -1181,21 +1182,47 @@ fn finalize_exhausted(
     );
 }
 
-async fn dispatch_event(
-    registry: &dyn WebhookRegistry,
+/// Publish an event to the live bus AND, when a durable outbox is
+/// present, synchronously enqueue its webhook deliveries.
+///
+/// Enqueuing here — at publish time, in the same call the handler makes
+/// to announce the event — rather than off the lossy in-process
+/// broadcast in the dispatcher is the durability fix: a broadcast lag
+/// can no longer drop a webhook delivery, because the durable
+/// `webhook_deliveries` row exists before this returns. The bus
+/// broadcast still drives the SSE stream and the MemRegistry
+/// direct-dispatch path; only the durable enqueue moved off it.
+///
+/// Enqueue failures are logged, not propagated: webhook delivery is
+/// best-effort and must never fail the mutation that produced the event.
+pub fn publish_event(
+    bus: &crate::events::EventBus,
     outbox: Option<&dyn DeliveryOutbox>,
-    ev: &Event,
+    ev: Event,
 ) {
-    let (repo_id_str, kind) = repo_and_kind(ev);
-    // Event repo-ids always come from a valid repo; a malformed one
-    // can't be a real subscription target, so skip the event.
-    let Ok(repo_id) = crate::ids::RepoId::try_from(repo_id_str) else {
-        tracing::warn!(
-            repo_id = repo_id_str,
-            "webhook dispatch: invalid repo id; skipping"
-        );
-        return;
-    };
+    if let Some(outbox) = outbox {
+        let (repo_id_str, kind) = repo_and_kind(&ev);
+        match crate::ids::RepoId::try_from(repo_id_str) {
+            Ok(repo_id) => match serde_json::to_vec(&ev) {
+                Ok(body) => {
+                    if let Err(e) = outbox.enqueue_delivery(&repo_id, kind, &body) {
+                        tracing::error!(error = %e, "webhook enqueue-at-publish failed");
+                    }
+                },
+                Err(e) => tracing::error!(error = %e, "webhook publish: event serialize failed"),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, repo_id = repo_id_str, "webhook publish: invalid repo id");
+            },
+        }
+    }
+    bus.publish(ev);
+}
+
+/// Direct-dispatch one event for the MemRegistry path: serialize and
+/// fan out to matching subscriptions, single attempt. The SQLite path
+/// never reaches here — it enqueues at publish ([`publish_event`]).
+fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
     let body = match serde_json::to_vec(ev) {
         Ok(b) => b,
         Err(e) => {
@@ -1203,24 +1230,7 @@ async fn dispatch_event(
             return;
         },
     };
-    // Try the durable outbox first when one is present (SQLite-backed
-    // deployment). Ok(n) with n > 0 means rows are queued; the delivery
-    // worker picks them up on its next tick. Ok(0) means no matching
-    // subs — fall back to legacy direct dispatch so the in-memory test
-    // path still fires hooks. With no outbox at all (MemRegistry),
-    // direct dispatch is the only path.
-    let Some(outbox) = outbox else {
-        legacy_direct_dispatch(registry, ev, body);
-        return;
-    };
-    match outbox.enqueue_delivery(&repo_id, kind, &body) {
-        Ok(n) if n > 0 => {},
-        Ok(_) => legacy_direct_dispatch(registry, ev, body),
-        Err(e) => {
-            tracing::error!(error = %e, "webhook enqueue failed; falling back to direct dispatch");
-            legacy_direct_dispatch(registry, ev, body);
-        },
-    }
+    legacy_direct_dispatch(registry, ev, body);
 }
 
 /// Pre-K3 single-attempt direct dispatch — kept so MemRegistry-backed
@@ -2038,7 +2048,7 @@ mod tests {
         let registry: Arc<dyn WebhookRegistry> = Arc::new(MemRegistry::new());
         let bus = crate::events::EventBus::new();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_dispatcher(registry, None, bus, cancel.clone());
+        let handle = spawn_dispatcher(registry, bus, cancel.clone());
         // Give the dispatcher a beat to subscribe and block on recv.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         cancel.cancel();
@@ -2261,5 +2271,32 @@ mod tests {
             },
             other => panic!("drop counter was not recorded: {other:?}"),
         }
+    }
+
+    #[test]
+    fn publish_event_enqueues_durably_without_the_bus() {
+        // N5 durability property: publish_event enqueues into the outbox
+        // synchronously, so a delivery row exists with no dispatcher and
+        // nothing drained off the broadcast — a bus lag cannot drop it.
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: rid("repo-a"),
+            url: "http://hook.invalid".into(),
+            secret: None,
+            events: vec![],
+        })
+        .unwrap();
+        let bus = crate::events::EventBus::new();
+        let ev = crate::events::Event::commit("repo-a", "0".repeat(40), "main", "m");
+        // No subscriber is attached to `bus`; the durable enqueue is the
+        // only delivery path under test.
+        publish_event(&bus, Some(&r), ev);
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "publish_event must enqueue a durable delivery row at publish time"
+        );
     }
 }

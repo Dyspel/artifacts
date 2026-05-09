@@ -572,18 +572,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             webhook_outbox = None;
         },
     }
-    // Spawn the webhook dispatcher *before* any handler can publish, so
-    // the broadcast subscriber registers before events start flying. It
-    // enqueues into the outbox when present, else direct-dispatches.
-    bg_handles.push(webhooks::spawn_dispatcher(
-        webhook_registry.clone(),
-        webhook_outbox.clone(),
-        event_bus.clone(),
-        bg_cancel.child_token(),
-    ));
-    // The durable-outbox delivery worker (K3) and finalized-row prune
-    // (L4) only exist when there IS an outbox — i.e. the SQLite backend.
-    // MemRegistry deployments rely on the dispatcher's direct dispatch.
+    // Webhook delivery splits by backend:
+    //   - SQLite (outbox present): handlers enqueue at publish time
+    //     (durable, lag-proof) and the worker drains the outbox. No
+    //     dispatcher — there's nothing for it to do.
+    //   - MemRegistry (no outbox): the dispatcher subscribes to the bus
+    //     and direct-dispatches each event (lossy, dev/test only).
     if let Some(outbox) = &webhook_outbox {
         bg_handles.push(webhooks::spawn_delivery_worker(
             outbox.clone(),
@@ -598,6 +592,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         ) {
             bg_handles.push(h);
         }
+    } else {
+        // No outbox (MemRegistry): the dispatcher must register on the
+        // bus before any handler publishes, so it doesn't miss the first
+        // boot-time event.
+        bg_handles.push(webhooks::spawn_dispatcher(
+            webhook_registry.clone(),
+            event_bus.clone(),
+            bg_cancel.child_token(),
+        ));
     }
     webhooks::refresh_active_webhook_gauge(&*webhook_registry);
     bg_handles.push(webhooks::spawn_active_gauge_refresher(
@@ -682,6 +685,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             audit,
             events: event_bus,
             webhooks: webhook_registry,
+            webhook_outbox,
             webhook_key_path,
             jwt_key_path: jwt_key_path.clone(),
         },

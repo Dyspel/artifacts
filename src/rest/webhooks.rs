@@ -185,6 +185,7 @@ mod tests {
                 audit: Arc::new(crate::audit::NoopAuditStore),
                 events: crate::events::EventBus::new(),
                 webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
                 webhook_key_path: None,
                 jwt_key_path: None,
             },
