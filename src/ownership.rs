@@ -673,4 +673,54 @@ mod tests {
         assert_eq!(rows[0].id, "new");
         assert_eq!(rows[1].id, "old");
     }
+
+    #[tokio::test]
+    async fn pagination_walks_full_dataset_without_overlap() {
+        // Pin the contract paginating-callers depend on: paging
+        // through the full dataset in `limit`-sized chunks must
+        // visit every row exactly once. This is what the SQLite
+        // override of `list_paginated` makes efficient (push-down
+        // `LIMIT/OFFSET`) — but the contract is independent of
+        // pushdown vs. default-impl-slice. A future refactor that
+        // breaks the override will at minimum still need to
+        // satisfy this assertion.
+        //
+        // count_all must agree with the rows we actually inserted —
+        // separately exercises the `SELECT COUNT(*)` override.
+        let (_d, store) = fresh_store();
+        let total: u32 = 100;
+        for i in 0..total {
+            store
+                .record_owner(&format!("repo-{i:03}"), Some("alice"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count_all().await.unwrap(), total as u64);
+
+        // Walk in chunks of 25 and accumulate every id we see.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let chunk: u32 = 25;
+        let mut offset: u32 = 0;
+        loop {
+            let page = store.list_paginated(chunk, offset).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                assert!(
+                    seen.insert(row.id.clone()),
+                    "row {} appeared on more than one page (offset bug?)",
+                    row.id,
+                );
+            }
+            offset += chunk;
+            // Cheap guard against an off-by-N that keeps returning
+            // forever — we never need more pages than rows.
+            assert!(offset <= total + chunk, "paged past the dataset");
+        }
+        assert_eq!(seen.len(), total as usize);
+
+        // Offset past the end must terminate cleanly.
+        assert!(store.list_paginated(10, total).await.unwrap().is_empty());
+    }
 }
