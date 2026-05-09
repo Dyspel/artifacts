@@ -918,6 +918,21 @@ jwt_audit_code=$(curl -sS -o /dev/null -w '%{http_code}' \
     || { echo "FAIL: JWT user GET /v1/admin/audit expected 403, got $jwt_audit_code"; exit 1; }
 echo "    audit log → $audit_count rows, all 5 expected kinds present, ?event= filter honored, JWT-user→403"
 
+# Pagination: ?limit=2&offset=1 must skip the very newest row and
+# return the next two. Symmetric with /v1/admin/repos pagination.
+page0="${WORK_DIR}/audit_page0.json"
+page1="${WORK_DIR}/audit_page1.json"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?limit=2" -o "$page0"
+curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?limit=2&offset=2" -o "$page1"
+page0_ids=$(python3 -c 'import json,sys; print(",".join(str(r["id"]) for r in json.load(sys.stdin)))' < "$page0")
+page1_ids=$(python3 -c 'import json,sys; print(",".join(str(r["id"]) for r in json.load(sys.stdin)))' < "$page1")
+# IDs are monotonic-on-insert; offset=2 must yield strictly older
+# IDs than the first page. Disjoint set guarantees no overlap.
+disjoint=$(python3 -c "p0=set('$page0_ids'.split(',')); p1=set('$page1_ids'.split(',')); print(p0.isdisjoint(p1))")
+[[ "$disjoint" == "True" ]] \
+    || { echo "FAIL: audit pages overlapped — page0=$page0_ids page1=$page1_ids"; exit 1; }
+echo "    audit ?offset= → page0=$page0_ids, page1=$page1_ids (disjoint)"
+
 # /v1/admin/audit/stats returns the same total via the cheap count.
 stats=$(curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit/stats")
 stats_count=$(echo "$stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')

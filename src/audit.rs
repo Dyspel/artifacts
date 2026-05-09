@@ -87,6 +87,11 @@ pub struct AuditQuery {
     pub repo_id: Option<String>,
     /// Hard-capped by the store at 1000.
     pub limit: Option<u32>,
+    /// Number of newest-first rows to skip before returning. Used
+    /// for paginating audit history for compliance walks.
+    /// Symmetric with `/v1/admin/repos?offset=`. `None` is treated
+    /// as 0 by the store.
+    pub offset: Option<u32>,
 }
 
 /// The contract the rest of the system depends on. One trait so tests
@@ -212,8 +217,9 @@ impl AuditStore for SqliteAuditStore {
             sql.push_str(" AND repo_id = ?");
             binds.push(Box::new(repo_id.clone()));
         }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
         binds.push(Box::new(limit));
+        binds.push(Box::new(q.offset.unwrap_or(0) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
@@ -495,6 +501,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lim.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn offset_skips_newest_rows() {
+        // Insert 5 events; query limit=2 offset=1 must return rows
+        // 4 and 3 (in newest-first order), skipping the very newest.
+        // This is the contract callers paginating compliance-walks
+        // depend on: page N+1 starts where page N ended.
+        let (_d, s) = store();
+        for i in 0..5 {
+            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+        }
+        let page = s
+            .list(AuditQuery {
+                limit: Some(2),
+                offset: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let names: Vec<&str> = page.iter().map(|r| r.event.as_str()).collect();
+        assert_eq!(names, vec!["e3", "e2"]);
+    }
+
+    #[tokio::test]
+    async fn offset_past_end_returns_empty() {
+        let (_d, s) = store();
+        s.record(evt("only", "admin", None)).await.unwrap();
+        let page = s
+            .list(AuditQuery {
+                limit: Some(10),
+                offset: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(page.is_empty());
     }
 
     #[tokio::test]

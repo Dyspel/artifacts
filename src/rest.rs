@@ -1303,6 +1303,10 @@ pub struct AdminAuditQuery {
     pub repo_id: Option<String>,
     /// Page size. Server-capped at 1000.
     pub limit: Option<u32>,
+    /// Number of newest-first rows to skip. Symmetric with
+    /// `/v1/admin/repos?offset=`. Use this to walk historical
+    /// pages without growing the `limit` past the cap.
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1351,6 +1355,7 @@ pub async fn admin_list_audit(
             actor: q.actor,
             repo_id: q.repo_id,
             limit: q.limit,
+            offset: q.offset,
         })
         .await?;
     Ok(Json(rows))

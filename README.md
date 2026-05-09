@@ -453,6 +453,7 @@ GET /v1/admin/audit
   &actor=<admin|jwt-subject>
   &repoId=<id>
   &limit=<n>            # default 100, capped 1000
+  &offset=<n>           # default 0; skips newest-first rows
 Authorization: Bearer <admin>
 ```
 
