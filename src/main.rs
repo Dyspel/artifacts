@@ -434,6 +434,15 @@ async fn main() -> anyhow::Result<()> {
             // with config X, exited at T2 after N seconds uptime").
             let audit_for_shutdown = audit.clone();
             let server_started_at = std::time::Instant::now();
+            // Shared cell the signal listener writes when the drain
+            // begins; the foreground task reads it after the
+            // listener exits to classify the shutdown as graceful
+            // vs timed_out. Path-independent: the same calculation
+            // works for HTTP (where the budget is enforced by an
+            // outer `tokio::time::timeout`) and TLS (where it's
+            // enforced inside `axum_server::Handle::graceful_shutdown`).
+            let drain_started: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+                Arc::new(std::sync::Mutex::new(None));
 
             let rest_state = RestState {
                 cfg: cfg.clone(),
@@ -581,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
                     shutdown_timeout,
                     draining.clone(),
                     shutdown_drain_delay,
+                    drain_started.clone(),
                 );
                 axum_server::bind_rustls(addr, config)
                     .handle(handle)
@@ -590,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
                     &*audit_for_shutdown,
                     server_started_at,
                     shutdown_timeout,
-                    "graceful",
+                    drain_started.clone(),
                 )
                 .await;
             } else {
@@ -610,34 +620,31 @@ async fn main() -> anyhow::Result<()> {
                     .with_graceful_shutdown(shutdown_signal(
                         draining.clone(),
                         shutdown_drain_delay,
+                        drain_started.clone(),
                     ));
-                let exit_kind = if shutdown_timeout.is_zero() {
+                if shutdown_timeout.is_zero() {
                     serve.await?;
-                    "graceful"
                 } else {
                     // Bound the total drain time. If the drain doesn't
                     // finish in `shutdown_timeout`, we abandon it and
                     // let the process exit — better than blocking a
-                    // rolling deploy on a stuck client.
+                    // rolling deploy on a stuck client. The
+                    // timed-out classification is computed inside
+                    // `emit_server_shutdown` from `drain_started`,
+                    // so a path-specific kind argument isn't needed.
                     match tokio::time::timeout(shutdown_timeout, serve).await {
-                        Ok(r) => {
-                            r?;
-                            "graceful"
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                timeout_secs = shutdown_timeout_secs,
-                                "graceful shutdown timed out — exiting with in-flight requests"
-                            );
-                            "timed_out"
-                        }
+                        Ok(r) => r?,
+                        Err(_) => tracing::warn!(
+                            timeout_secs = shutdown_timeout_secs,
+                            "graceful shutdown timed out — exiting with in-flight requests"
+                        ),
                     }
-                };
+                }
                 emit_server_shutdown(
                     &*audit_for_shutdown,
                     server_started_at,
                     shutdown_timeout,
-                    exit_kind,
+                    drain_started.clone(),
                 )
                 .await;
             }
@@ -722,6 +729,7 @@ fn check_bind_safety(
 async fn shutdown_signal(
     draining: Arc<std::sync::atomic::AtomicBool>,
     drain_delay: Duration,
+    drain_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::signal;
@@ -761,6 +769,59 @@ async fn shutdown_signal(
         );
         tokio::time::sleep(drain_delay).await;
     }
+    // Record the moment the drain begins. The foreground task reads
+    // this after the listener exits and uses it to classify the
+    // `server.shutdown` audit event as `graceful` or `timed_out` —
+    // the same calculation works for both bind paths, where TLS
+    // would otherwise have no observable "drain exceeded budget"
+    // signal. HTTP's drain begins exactly here (this future
+    // resolving is what tells axum::serve to drain). TLS's drain
+    // begins a few microseconds later, when spawn_shutdown_listener
+    // wakes from this await and calls handle.graceful_shutdown — the
+    // gap is small enough not to matter for second-resolution audit.
+    *drain_started.lock().expect("drain_started mutex poisoned") =
+        Some(std::time::Instant::now());
+}
+
+/// Classify the drain outcome for the `server.shutdown` audit event.
+///
+/// `drain_started` is `Some(t)` when `shutdown_signal` recorded the
+/// instant the drain began, or `None` if the listener returned
+/// without ever receiving a signal (rare — usually means the bind
+/// path errored out). The classification is deliberately path-
+/// independent: the same elapsed-vs-budget check works for both
+/// HTTP (where `tokio::time::timeout` enforces the budget from the
+/// outside) and TLS (where `axum_server::Handle::graceful_shutdown`
+/// enforces it from the inside). 100ms epsilon absorbs the tiny
+/// scheduling delay between budget-exhausted and listener-returning
+/// so a clean drain that finishes a hair under the deadline isn't
+/// misclassified.
+fn classify_shutdown_kind(
+    drain_started: Option<std::time::Instant>,
+    shutdown_timeout: Duration,
+) -> &'static str {
+    // `shutdown_timeout == 0` is "skip drain entirely" (dev opt-in).
+    // The operator chose that; not a timeout.
+    if shutdown_timeout.is_zero() {
+        return "graceful";
+    }
+    let Some(start) = drain_started else {
+        return "graceful";
+    };
+    // We forgive up to `epsilon` of overshoot past the deadline
+    // because the listener returns a few ms after the budget
+    // actually fires (scheduling, drop ordering). A drain whose
+    // measured elapsed is *under* the budget is unambiguously
+    // graceful; a drain whose elapsed is *significantly over* is
+    // unambiguously timed_out. Without the epsilon, a clean
+    // 30.000-second drain whose elapsed reads 30.001 would be
+    // misclassified.
+    let epsilon = Duration::from_millis(100);
+    if start.elapsed() >= shutdown_timeout + epsilon {
+        "timed_out"
+    } else {
+        "graceful"
+    }
 }
 
 /// Emit a `server.shutdown` audit event after the listener returns.
@@ -769,19 +830,20 @@ async fn shutdown_signal(
 /// reviewer can answer "when was this server up, and did it exit
 /// cleanly or abandon in-flight work?"
 ///
-/// `kind` is `"graceful"` if the listener returned within
-/// `shutdown_timeout` (or `shutdown_timeout` was 0), or
-/// `"timed_out"` if the outer timeout fired and we abandoned the
-/// drain. The HTTP path detects the latter via
-/// `tokio::time::timeout`'s `Err`; the TLS path always reports
-/// `graceful` because `axum_server::Handle::graceful_shutdown` does
-/// not surface a "drain exceeded budget" signal we can read here.
+/// `kind` is computed from the shared `drain_started` cell that
+/// `shutdown_signal` writes when the drain begins; see
+/// `classify_shutdown_kind`. Both bind paths use the same logic so
+/// the audit log shape is consistent across HTTP/TLS deployments.
 async fn emit_server_shutdown(
     audit: &dyn audit::AuditStore,
     started_at: std::time::Instant,
     shutdown_timeout: Duration,
-    kind: &str,
+    drain_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
+    let kind = classify_shutdown_kind(
+        *drain_started.lock().expect("drain_started mutex poisoned"),
+        shutdown_timeout,
+    );
     let uptime_secs = started_at.elapsed().as_secs();
     tracing::info!(
         target: "audit",
@@ -814,16 +876,20 @@ async fn emit_server_shutdown(
 /// connections immediately" — close enough for our purposes that we
 /// just pass the timeout through.
 ///
-/// `draining` and `drain_delay` are forwarded to `shutdown_signal`
-/// so the readiness-flag hand-off happens before the drain starts.
+/// `draining`, `drain_delay`, and `drain_started` are forwarded to
+/// `shutdown_signal` so (a) the readiness-flag hand-off happens
+/// before the drain starts and (b) the foreground task can read the
+/// drain-start instant to classify the `server.shutdown` audit
+/// event.
 fn spawn_shutdown_listener(
     handle: axum_server::Handle,
     timeout: Duration,
     draining: Arc<std::sync::atomic::AtomicBool>,
     drain_delay: Duration,
+    drain_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
     tokio::spawn(async move {
-        shutdown_signal(draining, drain_delay).await;
+        shutdown_signal(draining, drain_delay, drain_started).await;
         handle.graceful_shutdown(Some(timeout));
     });
 }
@@ -890,5 +956,64 @@ mod bind_safety_tests {
         // matched on the bracketed string and treated [::1] as
         // non-loopback.
         assert!(check_bind_safety("[::1]:8787", "http://[::1]:8787", false, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_classification_tests {
+    use super::*;
+
+    #[test]
+    fn no_drain_started_is_graceful() {
+        // Listener returned without ever recording a drain start —
+        // typically means the bind path errored out before serving.
+        // Not a timeout; just classify as graceful.
+        assert_eq!(classify_shutdown_kind(None, Duration::from_secs(30)), "graceful");
+    }
+
+    #[test]
+    fn zero_timeout_is_always_graceful() {
+        // shutdown-timeout=0 is the explicit "skip drain, hard exit"
+        // dev opt-in. The operator chose this; it's not a timeout
+        // even if a drain instant somehow got recorded.
+        assert_eq!(
+            classify_shutdown_kind(Some(std::time::Instant::now()), Duration::from_secs(0)),
+            "graceful",
+        );
+    }
+
+    #[test]
+    fn fast_drain_is_graceful() {
+        // A drain that began ~now with a 30s budget left can't have
+        // exhausted it. Must classify as graceful.
+        let just_now = std::time::Instant::now();
+        assert_eq!(
+            classify_shutdown_kind(Some(just_now), Duration::from_secs(30)),
+            "graceful",
+        );
+    }
+
+    #[test]
+    fn elapsed_past_budget_is_timed_out() {
+        // Simulate "drain began long enough ago that the budget
+        // ran out" by passing an Instant from far in the past.
+        // 60s ago vs 30s budget → timed_out.
+        let long_ago = std::time::Instant::now() - Duration::from_secs(60);
+        assert_eq!(
+            classify_shutdown_kind(Some(long_ago), Duration::from_secs(30)),
+            "timed_out",
+        );
+    }
+
+    #[test]
+    fn within_epsilon_of_budget_still_graceful() {
+        // The 100ms epsilon absorbs scheduling jitter so a drain
+        // that finishes a hair under the deadline isn't
+        // misclassified. 50ms past a 30s budget → still graceful.
+        let near_deadline = std::time::Instant::now() - Duration::from_millis(29_950);
+        assert_eq!(
+            classify_shutdown_kind(Some(near_deadline), Duration::from_secs(30)),
+            "graceful",
+        );
     }
 }
