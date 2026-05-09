@@ -40,14 +40,15 @@
 //!     .map_err(|_| Error::InvalidRepoId(repo_id_str.clone()))?;
 //! ```
 //!
-//! From there inward, the object/ref/token/ownership trait surfaces
-//! (`ObjectStore`, `RefStore`, `TokenStore`, `OwnershipStore`) take
-//! `&RepoId` / `&Oid`. The `Storage`, `WebhookRegistry`, and
-//! `AuditStore` traits still take `&str` — a known, not-yet-closed
-//! consistency gap, called out so this doc stays honest about the
-//! migration's actual reach rather than claiming full coverage. Inside
-//! an impl that needs the raw `&str` (e.g. a SQL parameter), call
-//! `.as_str()` or `.as_ref()`.
+//! From there inward, every core store trait — `Storage`, `RefStore`,
+//! `ObjectStore`, `TokenStore`, `OwnershipStore`, `WebhookRegistry`,
+//! and the `AuditEvent` carried by `AuditStore` — takes `&RepoId` /
+//! `&Oid` (or holds a `RepoId`). The one deliberate exception is
+//! `AuditQuery::repo_id`, which stays a `String`: it's a filter
+//! predicate where matching an arbitrary or since-deleted repo id is
+//! legitimate, not an authorization input. Inside an impl that needs
+//! the raw `&str` (e.g. a SQL parameter), call `.as_str()` or
+//! `.as_ref()`.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
