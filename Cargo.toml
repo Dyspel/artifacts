@@ -240,6 +240,18 @@ metrics-util = "0.17"
 # tests use to drive handlers in-process (no socket). Same 0.5 line the
 # production `tower` dep already resolves to — no new graph version.
 tower = { version = "0.5", features = ["util"] }
+# Bench harness for `cargo bench` (benches/pack.rs). B3 ("concurrent
+# load bench") was driven by an ad-hoc script with no reproducible
+# entry point; this gives one. default-features off drops the
+# plotters/gnuplot HTML-report stack (and its license/transitive
+# baggage) — we keep only `cargo_bench_support`, which is what makes
+# the binary a working `cargo bench` target. CLI timing output is all
+# we need; no HTML reports.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pack"
+harness = false
 
 [profile.release]
 lto = "thin"
