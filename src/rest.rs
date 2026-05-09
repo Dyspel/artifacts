@@ -348,3 +348,211 @@ pub(crate) fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 // `crate::alternates_cache::tests`. No duplicate coverage here.
 
 // Health-readiness tests live alongside the handler in `health.rs`.
+
+#[cfg(test)]
+mod router_tests {
+    //! In-process `oneshot` router tests for the repos / tokens / admin
+    //! HTTP surfaces. The integration smoke drives these out-of-process
+    //! (invisible to in-process coverage); these exercise auth, 404, and
+    //! owner/admin-enforcement branches through the real handlers.
+    use super::{
+        admin_gc_preview, admin_list_repos, create_repo, list_repos, mint_token, AuthnState,
+        DataState, ObservState, RestState, RuntimeState,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::{get, post},
+        Router,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    use tower::ServiceExt;
+
+    const ADMIN: &str = "admin-token-for-rest-router-tests-01234567";
+    const JWT_SECRET: &str = "rest-router-test-secret";
+
+    fn build_state(dir: &std::path::Path) -> RestState {
+        let data_dir = dir.to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        RestState {
+            cfg: Arc::new(cfg),
+            data: DataState {
+                storage: Arc::new(storage),
+                ownership: Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: Arc::new(crate::refs::MemRefStore::new()),
+                objects: Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: Arc::new(crate::alternates_cache::AlternatesCache::new()),
+            },
+            authn: AuthnState {
+                tokens: Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .route("/v1/repos", post(create_repo).get(list_repos))
+            .route("/v1/repos/:id/tokens", post(mint_token))
+            .route("/v1/admin/repos", get(admin_list_repos))
+            .route("/v1/admin/repos/:id/gc-preview", get(admin_gc_preview))
+            .with_state(build_state(dir))
+    }
+
+    fn user_jwt(subject: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: String,
+            exp: usize,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        encode(
+            &Header::default(),
+            &Claims {
+                sub: subject.to_string(),
+                exp,
+            },
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map_or_else(Body::empty, |s| Body::from(s.to_string())))
+            .unwrap()
+    }
+
+    async fn send(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_repo_requires_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(&app, req("POST", "/v1/repos", None, Some("{}"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_create_then_list_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, body) = send(&app, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["id"].as_str().is_some());
+        assert!(body["token"].as_str().is_some());
+        let (status, body) = send(&app, req("GET", "/v1/repos", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().map(|a| a.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn mint_token_on_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo/tokens",
+                Some(ADMIN),
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mint_token_requires_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/repos/whatever-repo/tokens",
+                None,
+                Some(r#"{"scope":"read"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_repos_forbidden_for_jwt_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let jwt = user_jwt("mallory");
+        let (status, _) = send(&app, req("GET", "/v1/admin/repos", Some(&jwt), None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // …and admin succeeds.
+        let (status, body) = send(&app, req("GET", "/v1/admin/repos", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_array());
+    }
+
+    #[tokio::test]
+    async fn admin_gc_preview_on_missing_repo_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app(tmp.path());
+        let (status, _) = send(
+            &app,
+            req(
+                "GET",
+                "/v1/admin/repos/no-such-repo/gc-preview",
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
