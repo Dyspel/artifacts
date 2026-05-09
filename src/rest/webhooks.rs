@@ -28,8 +28,10 @@ pub struct CreateWebhookBody {
     pub secret: Option<String>,
     /// Empty list means "all event kinds for this repo". Otherwise
     /// only events whose `kind` matches one of these are delivered.
+    /// Typed as `EventKind`, so a misspelled kind (`"comit"`) is a 400
+    /// at creation rather than a subscription that silently never fires.
     #[serde(default)]
-    pub events: Vec<String>,
+    pub events: Vec<crate::events::EventKind>,
 }
 
 #[derive(Debug, Serialize)]
@@ -333,5 +335,20 @@ mod tests {
         let (status, body) = send(&app, req("GET", &base, Some(ADMIN), None)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn create_body_rejects_unknown_event_kind() {
+        // The N3 win: a misspelled kind fails to deserialize, so the
+        // subscription is rejected at creation rather than silently
+        // never matching any event.
+        let ok = serde_json::from_str::<super::CreateWebhookBody>(
+            r#"{"url":"http://x.invalid","events":["commit","fork"]}"#,
+        );
+        assert!(ok.is_ok(), "valid kinds must parse");
+        let bad = serde_json::from_str::<super::CreateWebhookBody>(
+            r#"{"url":"http://x.invalid","events":["comit"]}"#,
+        );
+        assert!(bad.is_err(), "a typo'd kind must be rejected, not dropped");
     }
 }

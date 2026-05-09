@@ -65,8 +65,10 @@ pub struct Subscription {
     /// stored hashed the same way TokenStore does.
     #[serde(skip_serializing)]
     pub secret: Option<String>,
-    /// Subset of event kinds to fire on. Empty = all kinds.
-    pub events: Vec<String>,
+    /// Subset of event kinds to fire on. Empty = all kinds. Typed as
+    /// `EventKind` so a misspelled kind is rejected when the
+    /// subscription is created, not silently dropped at match time.
+    pub events: Vec<crate::events::EventKind>,
 }
 
 /// One row of the durable delivery outbox (K3). Returned by
@@ -446,7 +448,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         match self.list(repo_id) {
             Ok(subs) => subs
                 .into_iter()
-                .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
+                .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e.as_str() == kind))
                 .collect(),
             Err(e) => {
                 tracing::warn!(error = %e, repo_id = %repo_id, "webhook matching: list failed; treating as no matches");
@@ -506,8 +508,9 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         };
         let mut inserted: u64 = 0;
         for (hook_id, url, sec_b64, nonce, events_json) in rows {
-            let events: Vec<String> = serde_json::from_str(&events_json).unwrap_or_default();
-            if !events.is_empty() && !events.iter().any(|e| e == kind) {
+            let events: Vec<crate::events::EventKind> =
+                serde_json::from_str(&events_json).unwrap_or_default();
+            if !events.is_empty() && !events.iter().any(|e| e.as_str() == kind) {
                 continue;
             }
             // Re-encode the sealed secret as a BLOB-shaped column in
@@ -794,7 +797,8 @@ fn row_to_sub(
     let stored_secret: Option<String> = row.get(3)?;
     let nonce_blob: Option<Vec<u8>> = row.get(4)?;
     let events_json: String = row.get(5)?;
-    let events: Vec<String> = serde_json::from_str(&events_json).unwrap_or_default();
+    let events: Vec<crate::events::EventKind> =
+        serde_json::from_str(&events_json).unwrap_or_default();
 
     // Three cases for the secret column:
     //   1. (None, _)              — no secret was registered. Nothing to decrypt.
@@ -910,7 +914,7 @@ impl WebhookRegistry for MemRegistry {
         self.lock()
             .iter()
             .filter(|s| s.repo_id == *repo_id)
-            .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
+            .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e.as_str() == kind))
             .cloned()
             .collect()
     }
@@ -1430,7 +1434,7 @@ mod tests {
             repo_id: rid("repo-a"),
             url: "u-commit".into(),
             secret: None,
-            events: vec!["commit".into()],
+            events: vec![crate::events::EventKind::Commit],
         })
         .unwrap();
         let m_commit = r.matching(&rid("repo-a"), "commit");
@@ -1478,14 +1482,14 @@ mod tests {
                 repo_id: rid("repo-a"),
                 url: "http://example".into(),
                 secret: Some("s".into()),
-                events: vec!["commit".into()],
+                events: vec![crate::events::EventKind::Commit],
             })
             .unwrap();
         let listed = r.list(&rid("repo-a")).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].secret.as_deref(), Some("s"));
-        assert_eq!(listed[0].events, vec!["commit".to_string()]);
+        assert_eq!(listed[0].events, vec![crate::events::EventKind::Commit]);
     }
 
     #[test]
@@ -1548,7 +1552,7 @@ mod tests {
             repo_id: rid("repo-a"),
             url: "u-commit".into(),
             secret: None,
-            events: vec!["commit".into()],
+            events: vec![crate::events::EventKind::Commit],
         })
         .unwrap();
         let m_commit = r.matching(&rid("repo-a"), "commit");
@@ -1936,7 +1940,10 @@ mod tests {
             repo_id: rid("repo-a"),
             url: "http://nowhere.invalid".into(),
             secret: None,
-            events: vec!["commit".into(), "fork".into()],
+            events: vec![
+                crate::events::EventKind::Commit,
+                crate::events::EventKind::Fork,
+            ],
         })
         .unwrap();
         // Plus a subscription that doesn't match this kind.
@@ -1945,7 +1952,7 @@ mod tests {
             repo_id: rid("repo-a"),
             url: "http://nowhere2.invalid".into(),
             secret: None,
-            events: vec!["fork".into()],
+            events: vec![crate::events::EventKind::Fork],
         })
         .unwrap();
         // Plus a subscription on a different repo.

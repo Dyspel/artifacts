@@ -29,7 +29,7 @@ use axum::{
     response::sse::{Event as SseEvent, KeepAlive, Sse},
 };
 use futures::stream::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     time::{SystemTime, UNIX_EPOCH},
@@ -111,6 +111,31 @@ pub enum Event {
         to: String,
         t: i64,
     },
+}
+
+/// The kind of an [`Event`], reified so a webhook subscription that
+/// filters on a misspelled kind is rejected at creation time (the
+/// `events` array fails to deserialize) rather than silently never
+/// matching any event. The wire form is the lowercase variant name,
+/// matching the `kind` tag the `Event` enum serializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventKind {
+    Commit,
+    Fork,
+    Status,
+}
+
+impl EventKind {
+    /// The wire string: `"commit"`, `"fork"`, or `"status"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Commit => "commit",
+            EventKind::Fork => "fork",
+            EventKind::Status => "status",
+        }
+    }
 }
 
 impl Event {
