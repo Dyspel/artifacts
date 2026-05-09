@@ -106,3 +106,227 @@ pub async fn delete_webhook(
     let removed = state.observ.webhooks.remove(&id, &hook_id)?;
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
+
+#[cfg(test)]
+mod tests {
+    //! In-process router tests for the webhook HTTP surface. These drive
+    //! the real handlers through an `axum::Router` via `oneshot` (no
+    //! socket, no spawned server), so the auth / owner-enforcement /
+    //! 404 / body-deserialization / registry wiring is exercised AND
+    //! visible to in-process coverage — the integration smoke spawns the
+    //! server out-of-process, which the line counter can't see, and it
+    //! never touches `/webhooks` at all.
+    use super::{create_webhook, delete_webhook, list_webhooks};
+    use crate::rest::{AuthnState, DataState, ObservState, RestState, RuntimeState};
+    use crate::storage::Storage as _;
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::{delete, post},
+        Router,
+    };
+    use std::sync::{atomic::AtomicBool, Arc};
+    use tower::ServiceExt;
+
+    const ADMIN: &str = "admin-token-for-router-tests-0123456789";
+    const JWT_SECRET: &str = "rest-webhook-router-test-secret";
+    const REPO: &str = "webhook-router-repo";
+
+    /// Build a `Router` over the three webhook routes with a fully-wired
+    /// `RestState`: a real `FsStorage` (with `REPO` created so
+    /// `exists()` is true), SQLite ownership/token stores on a tempdir,
+    /// in-memory refs/objects/webhooks, and a `NoopAuditStore`. The repo
+    /// is intentionally left *unregistered* in ownership, so a non-admin
+    /// principal hits the "admin-owned or unregistered" 403 branch.
+    fn build_app() -> (tempfile::TempDir, Router) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        storage.create(REPO).unwrap();
+
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        let state = RestState {
+            cfg: Arc::new(cfg),
+            data: DataState {
+                storage: Arc::new(storage),
+                ownership: Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("ownership.db"))
+                        .unwrap(),
+                ),
+                refs: Arc::new(crate::refs::MemRefStore::new()),
+                objects: Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: Arc::new(crate::alternates_cache::AlternatesCache::new()),
+            },
+            authn: AuthnState {
+                tokens: Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tokens.db")).unwrap(),
+                ),
+                rate_limit: Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: Arc::new(AtomicBool::new(false)),
+            },
+        };
+        let app = Router::new()
+            .route(
+                "/v1/repos/:id/webhooks",
+                post(create_webhook).get(list_webhooks),
+            )
+            .route("/v1/repos/:id/webhooks/:hook_id", delete(delete_webhook))
+            .with_state(state);
+        (tmp, app)
+    }
+
+    /// Mint an HS256 JWT (sub + exp) signed with the test secret, so
+    /// `authorize_rest` resolves it to `Principal::User { subject }`.
+    fn user_jwt(subject: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims {
+            sub: String,
+            exp: usize,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 3600;
+        encode(
+            &Header::default(),
+            &Claims {
+                sub: subject.to_string(),
+                exp,
+            },
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    async fn send(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn req(method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        b.body(body.map_or(Body::empty(), |s| Body::from(s.to_string())))
+            .unwrap()
+    }
+
+    const BODY: &str = r#"{"url":"http://hook.invalid/x","events":["commit"]}"#;
+
+    #[tokio::test]
+    async fn create_without_auth_is_401() {
+        let (_t, app) = build_app();
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                &format!("/v1/repos/{REPO}/webhooks"),
+                None,
+                Some(BODY),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_on_missing_repo_is_404() {
+        let (_t, app) = build_app();
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/repos/no-such-repo-here/webhooks",
+                Some(ADMIN),
+                Some(BODY),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn non_owner_user_is_403() {
+        // REPO has no ownership record, so a non-admin principal must be
+        // refused even though the repo exists and they're authenticated.
+        let (_t, app) = build_app();
+        let jwt = user_jwt("mallory");
+        let (status, _) = send(
+            &app,
+            req(
+                "GET",
+                &format!("/v1/repos/{REPO}/webhooks"),
+                Some(&jwt),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_create_list_delete_round_trip() {
+        let (_t, app) = build_app();
+        let base = format!("/v1/repos/{REPO}/webhooks");
+
+        // Create.
+        let (status, body) = send(&app, req("POST", &base, Some(ADMIN), Some(BODY))).await;
+        assert_eq!(status, StatusCode::OK);
+        let hook_id = body["id"].as_str().expect("created id").to_string();
+        assert!(!hook_id.is_empty());
+
+        // List shows exactly the one we created.
+        let (status, body) = send(&app, req("GET", &base, Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("list is an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["url"], "http://hook.invalid/x");
+
+        // Delete it → removed: true.
+        let del = format!("{base}/{hook_id}");
+        let (status, body) = send(&app, req("DELETE", &del, Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["removed"], true);
+
+        // Deleting again → removed: false (idempotent).
+        let (status, body) = send(&app, req("DELETE", &del, Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["removed"], false);
+
+        // List is empty again.
+        let (status, body) = send(&app, req("GET", &base, Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+}

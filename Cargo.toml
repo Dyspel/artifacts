@@ -210,6 +210,10 @@ libc = "0.2"
 # already in the tree transitively via metrics-exporter-prometheus, so
 # this introduces no new version into the graph.
 metrics-util = "0.17"
+# `util` feature pulls in `ServiceExt::oneshot`, which the rest/* router
+# tests use to drive handlers in-process (no socket). Same 0.5 line the
+# production `tower` dep already resolves to — no new graph version.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"
