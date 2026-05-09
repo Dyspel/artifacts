@@ -1,3 +1,12 @@
+//! Server configuration.
+//!
+//! [`Config`] is assembled once at startup from CLI flags + environment
+//! and then shared (as `Arc<Config>`) across every handler. Most fields
+//! are immutable for the process lifetime; the few that an admin can
+//! rotate at runtime (the admin token, the JWT signing secret) sit
+//! behind a `RwLock` and are read through accessor methods rather than
+//! exposed directly, so a rotation is atomic from a handler's view.
+
 use std::path::PathBuf;
 use std::sync::RwLock;
 

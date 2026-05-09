@@ -28,9 +28,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Native v2 fetch response. Generates a packfile via the in-process
 /// gix-pack path and wraps it in the v2 fetch response framing:
 ///
-///     PKT-LINE("packfile\n")
-///     *PKT-LINE([0x01]<chunk>)        -- band-1 sideband (pack data)
-///     PKT-LINE flush
+/// ```text
+/// PKT-LINE("packfile\n")
+/// *PKT-LINE([0x01]<chunk>)        -- band-1 sideband (pack data)
+/// PKT-LINE flush
+/// ```
 ///
 /// If the native generator errors we fall back to a `pack-objects`
 /// subprocess. M1b-3-gix will delete the fallback once gix-pack is

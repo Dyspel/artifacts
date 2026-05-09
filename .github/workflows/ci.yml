@@ -74,6 +74,9 @@ jobs:
         run: git --version
       - run: cargo build --all-features --all-targets
       - run: cargo test --all-features --all-targets
+      # `--all-targets` excludes doctests, so run them explicitly to keep
+      # the runnable `# Examples` in the public API (e.g. src/ids.rs) green.
+      - run: cargo test --all-features --doc
 
   supply-chain:
     name: cargo deny + cargo machete

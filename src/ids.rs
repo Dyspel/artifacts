@@ -16,7 +16,10 @@
 //!   pre-existing `String` parameters; the win is at the type
 //!   system, not the runtime.
 //! - Validates at construction via `TryFrom<&str>` / `TryFrom<String>`,
-//!   returning [`crate::error::Error::BadRequest`] on invalid input.
+//!   returning an [`crate::error::Error`] on invalid input
+//!   ([`Error::InvalidRepoId`](crate::error::Error::InvalidRepoId) for
+//!   [`RepoId`], [`BadRequest`](crate::error::Error::BadRequest) for the
+//!   rest).
 //! - Implements `AsRef<str>`, `Display`, `Debug`, `Clone`, `PartialEq`,
 //!   `Eq`, `Hash` so the migration is mostly drop-in at call sites:
 //!   pass `&repo_id` where `&str` used to fit (the `AsRef<str>` impl
@@ -37,17 +40,37 @@
 //!     .map_err(|_| Error::InvalidRepoId(repo_id_str.clone()))?;
 //! ```
 //!
-//! Trait surfaces from there inward use `&RepoId`, `&Oid`, etc.
-//! Inside an impl that needs the raw `&str` (e.g., to pass into
-//! a SQL parameter), call `.as_str()` or `.as_ref()`.
+//! From there inward, the object/ref/token/ownership trait surfaces
+//! (`ObjectStore`, `RefStore`, `TokenStore`, `OwnershipStore`) take
+//! `&RepoId` / `&Oid`. The `Storage`, `WebhookRegistry`, and
+//! `AuditStore` traits still take `&str` — a known, not-yet-closed
+//! consistency gap, called out so this doc stays honest about the
+//! migration's actual reach rather than claiming full coverage. Inside
+//! an impl that needs the raw `&str` (e.g. a SQL parameter), call
+//! `.as_str()` or `.as_ref()`.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// A repository identifier. Validated to match the same constraints
-/// `crate::storage::validate_repo_id` enforces: 1–63 chars of
-/// `[A-Za-z0-9_-]`, no path separators, no leading dash, no `.git`
-/// suffix collisions.
+/// A repository identifier, validated by
+/// [`crate::storage::validate_repo_id`]: 4–64 characters drawn from
+/// `[a-z0-9_-]` (lowercase only; no path separators, dots, or other
+/// punctuation, so an id can never escape the repos directory or
+/// collide with a `.git` suffix).
+///
+/// # Examples
+///
+/// ```
+/// use artifacts::ids::RepoId;
+///
+/// let id = RepoId::try_from("my-repo_01").unwrap();
+/// assert_eq!(id.as_str(), "my-repo_01");
+///
+/// // Rejected: too short (<4), uppercase, or a path separator.
+/// assert!(RepoId::try_from("ab").is_err());
+/// assert!(RepoId::try_from("Repo").is_err());
+/// assert!(RepoId::try_from("a/b").is_err());
+/// ```
 // `try_from` makes Deserialize run validation; `into` keeps Serialize
 // transparent over the inner String. The pair beats plain
 // `#[serde(transparent)]`, which would deserialize without validation
@@ -104,6 +127,20 @@ impl TryFrom<String> for RepoId {
 }
 
 /// A git object id — exactly 40 lowercase hex characters (SHA-1).
+///
+/// # Examples
+///
+/// ```
+/// use artifacts::ids::Oid;
+///
+/// let oid = Oid::try_from("0123456789abcdef0123456789abcdef01234567").unwrap();
+/// assert_eq!(oid.as_str().len(), 40);
+///
+/// // Rejected: wrong length, uppercase hex, or non-hex characters.
+/// assert!(Oid::try_from("0123").is_err());
+/// assert!(Oid::try_from("0123456789ABCDEF0123456789abcdef01234567").is_err());
+/// assert!(Oid::try_from("z123456789abcdef0123456789abcdef01234567").is_err());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Oid(String);

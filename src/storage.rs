@@ -72,6 +72,17 @@ pub fn new_repo_id() -> String {
         .collect()
 }
 
+/// Validate a repository identifier: 4–64 characters of `[a-z0-9_-]`
+/// (lowercase only). This is the single chokepoint guaranteeing a repo
+/// id can never contain a path separator, `..`, or other punctuation,
+/// so it is always safe to interpolate into a filesystem path or a
+/// `.git` directory name. [`crate::ids::RepoId`] is the typed wrapper
+/// that runs this at construction time.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidRepoId`] if `id` is shorter than 4 or longer
+/// than 64 bytes, or contains any character outside `[a-z0-9_-]`.
 pub fn validate_repo_id(id: &str) -> Result<()> {
     if id.len() < 4
         || id.len() > 64
@@ -325,10 +336,12 @@ pub(crate) fn write_bare_repo_layout(path: &Path) -> Result<()> {
 ///
 /// Output format matches git's packed-refs:
 ///
-///     # pack-refs with: peeled fully-peeled sorted
-///     <sha> refs/heads/main
-///     <sha> refs/heads/feature
-///     ...
+/// ```text
+/// # pack-refs with: peeled fully-peeled sorted
+/// <sha> refs/heads/main
+/// <sha> refs/heads/feature
+/// ...
+/// ```
 ///
 /// Empty source (no refs) → no packed-refs file. git handles that fine.
 fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {

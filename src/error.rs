@@ -1,3 +1,21 @@
+//! The crate's error type and its HTTP-response contract.
+//!
+//! [`Error`] is the single enum every fallible operation returns (via
+//! the [`Result`] alias), and its [`IntoResponse`] impl is the
+//! authoritative map from error to HTTP status + JSON body. Two
+//! invariants are worth knowing before touching this module:
+//!
+//! - **5xx bodies are redacted.** Server-error variants log their full
+//!   `Display` chain via `tracing::error!` but emit only
+//!   `{"error":{"code":"internal","message":"internal"}}` on the wire,
+//!   so filesystem paths, gix internals, and `anyhow` context never
+//!   leak to a caller. 4xx variants keep their (user-input-shaped)
+//!   message because it's already safe to echo.
+//! - **Typed causes are preserved where they change behavior.**
+//!   [`Error::Db`] keeps the underlying `rusqlite::Error` as its
+//!   `source()`, which lets a transient busy/locked database map to a
+//!   503 + `Retry-After` instead of an opaque 500.
+
 use axum::{
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
