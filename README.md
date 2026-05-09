@@ -2,274 +2,154 @@
 
 A versioned filesystem that speaks Git. Agent-first. Fork in a metadata write.
 
-This is a **feasibility prototype**. It is not production software. It exists
-to prove that the architectural claims of an Artifacts-style product — real
-Git client interop, O(1) forks, a REST side-door — can be made to work
-end-to-end in a day, not a quarter.
+This is a **feasibility prototype**, not production software. It exists to
+prove that the architectural claims of an Artifacts-style product — real Git
+client interop, O(1) forks, a REST side-door for agents — hold up end-to-end,
+and to make the path to a production system concrete.
 
-> If you want the *why*, read [ARCHITECTURE.md](./ARCHITECTURE.md). This file
-> is the *what* — the surface, the numbers, and the commands. For wiring
-> this into the [Dyspel collaborative AI IDE](https://github.com/dyspel),
-> see [DYSPEL.md](./DYSPEL.md) — it covers the JWT handoff, the
-> gitSyncService migration, and what's still open before production
-> traffic. For a live view of what the server knows about itself —
-> repos, forks, metrics — see [GUI.md](./GUI.md) (eframe/egui,
-> Wayland-ready).
+> The *why* is in [ARCHITECTURE.md](./ARCHITECTURE.md). This file is the
+> *what*: the surface, the numbers, the commands. For wiring into the
+> [Dyspel collaborative AI IDE](https://github.com/dyspel) (JWT handoff,
+> gitSyncService migration) see [DYSPEL.md](./DYSPEL.md). For the live
+> server visualizer see [GUI.md](./GUI.md). Security disclosure policy is in
+> [SECURITY.md](./SECURITY.md).
 
-## What this is *not*, plainly
+## Read this first (what it is *not*)
 
-- **Plaintext by default; TLS opt-in.** The server speaks HTTP unless
-  you pass `--tls-cert` and `--tls-key` (terminates TLS in-process via
-  rustls). Tokens travel in the URL (as git clients do); without TLS
-  on the wire — either in-process or via an external terminator
-  (nginx / caddy / cloudflare-tunnel) — you're broadcasting
-  credentials. The bind-safety check refuses to start in the
-  worst-case combination (non-loopback bind + no TLS + no
-  https:// public URL) unless `--allow-insecure` is set. See
-  [Security](#security-in-one-paragraph).
-- **Admin bypasses rate limiting and quotas.** Per-subject token-bucket
-  rate limiting and per-user repo-count quotas are enforced for JWT
-  users; the admin Bearer is the break-glass principal and bypasses
-  both. An insider with the admin token can fill the disk and burn
-  inodes. The audit-event stream (`target: "audit"` tracing events on
-  every mutating call) records actor + repo_id + action — pipe it to a
-  durable sink and you have an after-the-fact paper trail; we don't
-  yet persist it ourselves.
-- **Not a drop-in for a multi-backend storage story.** `Storage` and
-  `RefStore` are traits with one filesystem impl each. They're trait
-  boundaries, not Spring-style pluggable backends — any real second impl
-  of either depends on the git protocol layer going native (M1b-next),
-  which hasn't happened yet. See [Design decisions](#design-decisions-worth-arguing-about).
-- **Not tested against non-`git` clients.** The protocol work is
-  delegated to `git upload-pack` / `git receive-pack` (for the
-  expensive half) and to a small native pkt-line writer (for the v2
-  capability advertisement). It should work with `libgit2`,
-  `isomorphic-git`, `go-git`, `jgit` — all of them speak the same wire
-  protocol — but the smoke test only exercises CLI `git`.
+- **Plaintext by default; TLS opt-in.** The server speaks HTTP unless you pass
+  `--tls-cert` + `--tls-key` (rustls terminates in-process). Tokens travel in
+  the URL, as git clients send them — without TLS on the wire (in-process or
+  via an external terminator) you're broadcasting credentials. A bind-safety
+  check refuses to start in the worst case (non-loopback bind + no TLS + no
+  `https://` public URL) unless `--allow-insecure` is set.
+- **Admin is break-glass.** The static admin Bearer token bypasses per-subject
+  rate limits and per-user quotas. An insider holding it can fill the disk.
+  Every mutating call is recorded in a tamper-evident audit log (below) — that
+  is the after-the-fact control, not prevention.
+- **Single-node.** `Storage`/`RefStore`/`ObjectStore` are trait boundaries with
+  filesystem + SQLite impls, but there is no distributed ref consensus yet
+  (that's M3b). Running two processes against one data dir is unsupported.
+- **Exercised against CLI `git`.** The wire protocol is implemented natively
+  (gitoxide) and *should* interoperate with any client that speaks
+  smart-HTTP v0/v1/v2 — `libgit2`, `isomorphic-git`, `go-git`, `jgit` — but the
+  test suite drives stock `git`.
 
 ## Table of contents
 
 - [Status](#status)
-- [What's next](#whats-next)
-- [Numbers we just measured](#numbers-we-just-measured)
+- [Architecture in one screen](#architecture-in-one-screen)
+- [Measured numbers](#measured-numbers)
 - [Quickstart](#quickstart)
+- [Configuration](#configuration)
 - [API reference](#api-reference)
-- [Directory layout](#directory-layout)
 - [How a fork works](#how-a-fork-works)
+- [Security](#security)
+- [Directory layout](#directory-layout)
 - [Development](#development)
+- [Deployment](#deployment)
 - [Roadmap](#roadmap)
 - [Design decisions worth arguing about](#design-decisions-worth-arguing-about)
 
 ## Status
 
-**What works end-to-end today:**
+The git wire protocol is served **natively** (gitoxide), not by shelling out to
+`git http-backend` or `git upload-pack`/`receive-pack`. `git` is still required
+on `$PATH` for three narrow jobs: the default push pack-indexer
+(`git unpack-objects`), the connectivity check and GC reachability walk
+(`git rev-list`), and a subprocess protocol fallback when the native path is
+disabled. REST-side commits are built in-process with `gix` (no plumbing
+subprocesses, no temp index dirs).
 
-| Feature                                                          | Status |
-| ---------------------------------------------------------------- | ------ |
-| `POST /v1/repos` — create empty repo, get `{ remote, token }`    | ✅     |
-| `GET /v1/repos` — list caller's repos (admin sees all); paginated | ✅     |
-| `POST /v1/repos/:id/forks` — O(1) fork via `alternates`          | ✅     |
-| `POST /v1/repos/:id/tokens` — mint additional scoped tokens      | ✅     |
-| `DELETE /v1/repos/:id` — alternates-aware (refuses if forks live) | ✅     |
-| `DELETE /v1/repos/:id?cascade=true` — delete repo + all dependent forks | ✅     |
-| `git clone https://x:$TOKEN@host/git/:id.git`                    | ✅     |
-| `git push` / `git fetch` / `git pull`                            | ✅     |
-| `git clone` of a fork — objects transparently via `alternates`   | ✅     |
-| Per-repo token scoping (`read` vs `write`, enforced on push)     | ✅     |
-| `readOnly: true` forks that reject pushes                        | ✅     |
-| v1 + v2 git protocol (inherited from `git http-backend`)         | ✅     |
-| `POST /v1/repos/:id/commits` — REST-side commits (no git client) | ✅     |
-| CAS refs: 409 `ref_conflict` with `expected` + `current` fields  | ✅     |
-| `RefStore` trait abstraction (FS-backed M0 impl)                 | ✅     |
-| `Storage` trait abstraction (FS-backed M0 impl)                  | ✅     |
-| `TokenStore` trait + SQLite persistence across restart           | ✅     |
-| Tokens with TTL, revocation endpoint, SHA-256 hashed at rest     | ✅     |
-| `git-http-backend` CGI removed — direct pack-handler shell-outs   | ✅     |
-| Native v2 `info/refs` — no subprocess for the discovery request  | ✅     |
-| JWT verification on REST (Dyspel-signed HS256 accepted)          | ✅     |
-| Per-repo ownership + cross-user 403 enforcement                  | ✅     |
-| Refuse non-loopback HTTP bind without `--allow-insecure`         | ✅     |
-| Per-user repo-count quota (429 `quota_exceeded`)                 | ✅     |
-| Per-subject token-bucket rate limiter (429 `rate_limited`)       | ✅     |
-| Per-blob size cap on REST commits                                | ✅     |
-| Prometheus `/metrics` endpoint (request counts, latencies, errors) | ✅   |
-| `X-Request-Id` header roundtrip + structured per-request log     | ✅     |
-| `GET /v1/admin/repos` list + `GET /v1/admin/repos/:id` detail    | ✅     |
-| `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
-| `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
-| `POST /v1/admin/webhook-key/rotate` — re-encrypt every webhook secret under a fresh master key | ✅     |
-| `POST /v1/admin/jwt-key/rotate` — swap the in-process JWT signing secret (file-backed `<data-dir>/jwt-key.bin` when not env-pinned) | ✅     |
-| `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
-| `GET /v1/admin/audit/stats` — cheap row-count totals             | ✅     |
-| `GET /v1/admin/audit/verify-chain` — SHA-256 hash-chain tamper detection | ✅     |
-| Per-IP rate limit on unauth `/v1/health*` (burst 60, sustain 2/s) | ✅     |
-| 1 MiB body cap on `/v1/*` (git smart-HTTP stays at 1 GiB)        | ✅     |
-| Forward-only schema migrator (`schema_version` per store)        | ✅     |
-| SQLite lock-wait histogram (`artifacts_sqlite_lock_wait_seconds`) | ✅     |
-| `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
-| `r2d2_sqlite` connection pool — N readers + 1 writer per store, plus `_pool_size`/`_pool_in_use` gauges per store | ✅     |
-| Online `backup.sh` (SQLite `.backup` API + tar of `repos/`) + matching `restore.sh` + Rust round-trip test | ✅     |
-| REST commits via `gix::Repository::write_blob` + `edit_tree` + `write_object` (was 5 git subprocesses + temp index dir) | ✅     |
-| `Command::new("git")` centralized — exactly one production call site (inside `git_cmd`) | ✅     |
-| `cargo-fuzz` harnesses for `pkt_line` + `git_wire::proto` parsers (nightly CI + `workflow_dispatch`) | ✅     |
-| GitHub Actions CI — fmt + clippy `-D warnings` + `cargo test --all-targets` on pinned Rust 1.88 | ✅     |
-| Crate splits as lib + bin — `cargo test --lib` works; integration tests link the lib | ✅     |
-| `deploy/` — Dockerfile (multi-stage) + hardened systemd unit + single-replica k8s manifests (Recreate strategy, RWO PVC) | ✅     |
+**Working end-to-end today:**
 
-**Known not-yet:**
+| Area | What works |
+| --- | --- |
+| Git client interop | `clone` / `push` / `fetch` / `pull` over smart-HTTP v0/v1/v2, served from in-process Rust (pkt-line parsing, sideband framing, ref CAS, `gix-pack` fetch generation). Per-repo token scope (`read`/`write`) enforced on push; `readOnly` forks reject pushes. |
+| O(1) forks | `POST /v1/repos/:id/forks` — ~228 bytes/fork via `objects/info/alternates`, independent of source size. Clone of a fork resolves objects transparently. |
+| REST commits | `POST /v1/repos/:id/commits` — build a commit with no git client (write/delete changes, base64 blobs), CAS on the parent SHA, `409 ref_conflict` carrying `expected`+`current`. Built via `gix::Repository::write_blob`/`edit_tree`/`write_object`. |
+| Reads & collab | `GET` `/tree` · `/blob` · `/diff` · `/notes` · `/refs` · `/commits` (log) · repo detail; `POST /merge` (fast-forward + three-way); `GET /v1/events` (SSE commit/fork/status stream). |
+| Tokens | Mint (scoped, optional TTL), list, revoke, per-repo bulk rotate. SHA-256-hashed at rest in SQLite; survive restart. Constant-time admin compare. |
+| Identity | Static admin Bearer + optional Dyspel-signed HS256 JWT (`aud`/`iss` pinnable). Per-repo ownership with cross-user 403. |
+| Webhooks | HMAC-SHA256-signed delivery with a **durable SQLite outbox** (enqueue → poll → deliver, exponential backoff, finalized-row retention prune). Secrets AES-256-GCM-sealed at rest under an env-pinnable, rotatable master key. |
+| Admin | List/detail repos; alternates-aware GC (preview + run, plus a periodic sweep); persistent audit log (filter/paginate, cheap totals, SHA-256 hash-chain verify); in-process rotation of the admin token, JWT signing secret, and webhook master key. |
+| Hardening | Connectivity check before any ref advances (no ref points at a missing object); pack-parser allocation caps (decompression-bomb + oversized-delta guard); fsync of objects before the ref CAS; per-route body caps; per-request timeout; typed DB errors (SQLITE_BUSY → 503 + `Retry-After`); 5xx bodies redacted to `"internal"`. |
+| Ops | Prometheus `/metrics`, `X-Request-Id` round-trip, OTLP trace export, graceful drain (readiness-flip → drain → exit), `r2d2` SQLite pools with per-store gauges, forward-only schema migrator, online backup/restore, multi-stage Dockerfile + hardened systemd unit + single-replica k8s manifests. |
 
-| Feature                                                          | Status |
-| ---------------------------------------------------------------- | ------ |
-| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait + `MemObjectStore` + atomic-write `FsObjectStore` + `SqliteObjectStore` (KV-shaped second backend) + conformance suite. `gc` / commits-parent-exists / blob-read / native receive-pack writes all routed through the trait. `SqliteObjectStore::ingest_pack` resolves Direct + REF_DELTA + OFS_DELTA against the KV — no filesystem touch on the push path. | ✅ M2b |
-| Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
-| Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
-| Admin-token rotation (in-process) | ✅ M4b-key-rotation |
-| Webhooks (HMAC-signed) + Prometheus metrics + retries + SQLite registry | ✅ M6 |
-| Webhook secrets encrypted at rest (AES-256-GCM, env-pinnable master key) | ✅ M6-deliver-secrets |
-| LFS, replication, PITR | 🟡 M6-other |
+**Not yet:**
 
-## What's next
+- **Distributed `RefStore` (M3b).** `MemRefStore` + a concurrent-CAS conformance
+  suite exist; the consensus log (per-repo state machine / Raft) is the work.
+- **LFS, cross-region replication, point-in-time restore (M6-other).** Each is
+  genuinely multi-week.
 
-**The CGI layer is gone (M1a).** `git-http-backend` was a wrapper — a
-process that parsed CGI env vars and re-spawned `git upload-pack` or
-`git receive-pack` internally. We now spawn the pack handlers directly,
-which cut clone-latency p99 by ~27% and max by ~63%.
+## Architecture in one screen
 
-**The full v2 native protocol layer is in (M1b-1 / M1b-2 / M1b-3).**
-Every endpoint under `/git/:id.git/*` — `info/refs`,
-`command=ls-refs`, `command=fetch`, and `git-receive-pack` — is
-served from in-process Rust: pkt-line parsing, sideband framing,
-ref CAS through `RefStore`. Pack generation on the fetch side
-goes through `gix-pack` natively (M1b-2c) — p50 clone latency
-is 10.4 ms vs 13.0 ms after M1b-1. Pack indexing on the push side
-defaults to `git unpack-objects` after a bench showed `gix-pack`
-is currently ~4× slower for typical small pushes; the native
-indexer (M1b-3-gix) is opt-in via `ARTIFACTS_NATIVE_INDEX_PACK=1`
-so a future chunked-KV `Storage` impl has a working native path
-when subprocess isn't an option.
+Three hard problems, and where each stands:
 
-Remaining, in order:
+1. **Forks must be cheap.** Solved with git's native `alternates` — a fork is a
+   directory + a one-line pointer file + a ref copy. ~228 bytes regardless of
+   source size. This is how GitHub has run fork networks since ~2009; `gc`,
+   `repack`, and `fsck` all understand it.
+2. **The wire protocol must be exactly git's.** Served natively via gitoxide:
+   `info/refs` advertisement, v2 `ls-refs`/`fetch`, and `receive-pack`
+   (ref-update parsing, sideband report-status, CAS through `RefStore`) all run
+   in-process. Fetch packs are generated with `gix-pack`. The push pack-indexer
+   defaults to `git unpack-objects` (a bench showed `gix-pack`'s indexer is
+   ~4× slower on small pushes); the native indexer is opt-in via
+   `ARTIFACTS_NATIVE_INDEX_PACK=1` so a future no-filesystem backend has a path.
+3. **Storage must be swappable toward a chunked KV.** `Storage`, `RefStore`,
+   and `ObjectStore` are traits. `ObjectStore` has three impls — `FsObjectStore`
+   (atomic tmp+rename+fsync), `MemObjectStore`, and `SqliteObjectStore` (the
+   KV-shaped target) — behind one conformance suite. The hand-rolled pack parser
+   (`src/native_pack/parse.rs`) resolves Direct/REF_DELTA/OFS_DELTA against the
+   KV with no filesystem touch.
 
-1. **M2b — chunked-KV `Storage` impl** ✅. `ObjectStore` trait
-   (`read_loose` + `write_loose` + `list_loose` + `delete_loose` +
-   `exists` + `ingest_pack` + `read_object`) + three impls —
-   `FsObjectStore` with atomic tmp+rename writes, `MemObjectStore`,
-   and `SqliteObjectStore` (the KV-shaped second backend matching
-   the DO+SQLite production target). Shared conformance suite covers
-   all three. `SqliteObjectStore::ingest_pack` runs through a
-   hand-rolled pack parser + delta resolver
-   (`src/native_pack/parse.rs`) that handles Direct, REF_DELTA, and
-   OFS_DELTA entries against the KV directly — no filesystem touch,
-   no tempdir, no gix-pack dependency on the push path.
-   **Four production paths go through the trait**: `admin_gc_preview`
-   / `admin_gc_run` enumerate and delete loose objects;
-   `create_commit`'s parent-exists check goes through
-   `ObjectStore::exists` (replacing a `cat-file -e` subprocess —
-   FS impl stats the loose path first, falls back to a gix-driven
-   pack-index walk); the **native receive-pack** branch (enabled
-   by `ARTIFACTS_NATIVE_INDEX_PACK=1`) writes through
-   `ObjectStore::ingest_pack`; and the **blob-read endpoint**
-   (`GET /v1/repos/:id/blob`) resolves `<commit>:<path>` via gix
-   then fetches the bytes through `ObjectStore::read_object`,
-   replacing the `cat-file blob` subprocess. The default receive
-   path is still subprocess `git unpack-objects` because gix-pack
-   is ~4× slower on small pushes; opt-in stays in place for the
-   chunked-KV target (which can't shell out).
-2. **M3b — distributed `RefStore` impl.** `MemRefStore` + a
-   concurrent-CAS conformance test landed; the consensus log
-   (openraft) + per-repo state machine + leader election +
-   snapshot install remain.
-3. **M6-other — LFS, replication, PITR.** Each is genuinely
-   multi-week.
+## Measured numbers
 
-## Numbers we just measured
+Captured on a release build during the protocol-nativization work. Re-run any
+of them with the scripts under `scripts/`.
 
-10,000 forks of a real 28 KB seed repo (30 files across `src/`, `docs/`,
-`tests/`), parallelism 32, on this host's release build:
+**Forks** — 10,000 forks of a 28 KB seed repo (30 files), parallelism 32:
 
 ```
 forks done in 3.52s (2837 forks/sec wall clock)
 latency ms: p50=0.34  p95=0.63  p99=50.2  max=230.0
-repos dir total:    2,308,837 bytes
-source alone:          28,837 bytes
-added by forks:     2,280,000 bytes  →  228 bytes/fork
-(a full copy would have added ~288,370,000 bytes)
+added by forks: 2,280,000 bytes  →  228 bytes/fork
+(a full copy would have added ~288,370,000 bytes — ~126× more)
 ```
 
-**228 bytes/fork vs ~28 KB/copy — ~126× less disk per fork.** After all
-10,000 forks a random one clones cleanly and its working tree byte-matches
-the source.
+**Clone latency** (sequential, 28 KB seed, `scripts/bench_clone.sh`, 200 iters):
 
-### Clone latency (sequential clones of a 28 KB seed repo)
+|     | M0 (CGI) | direct subprocess | + native v2 info/refs | + gix-pack fetch (current) |
+| --- | -------: | ----------------: | --------------------: | -------------------------: |
+| p50 | 14.5 ms  | 13.4 ms           | 13.0 ms               | **10.4 ms**                |
+| p99 | 21.5 ms  | 15.6 ms           | 16.1 ms               | **12.8 ms**                |
+| max | 45.8 ms  | 16.9 ms           | 17.9 ms               | **13.2 ms**                |
 
-Measured via `scripts/bench_clone.sh` (200 iterations, release build):
+Killing the CGI wrapper took the big tail-latency win (p99 −27%, max −63%);
+native `gix-pack` fetch generation took another p50 −22%.
 
-|        | M0 (CGI) | M1a (direct) | M1b-1 (+ native v2 info/refs) | M1b-2c (+ gix-pack on fetch) |
-| ------ | -------: | -----------: | ----------------------------: | ---------------------------: |
-| p50    | 14.5 ms  | 13.4 ms      | 13.0 ms                       | 10.4 ms                      |
-| p95    | 17.2 ms  | 14.9 ms      | 15.0 ms                       | 12.3 ms                      |
-| p99    | 21.5 ms  | 15.6 ms      | 16.1 ms                       | 12.8 ms                      |
-| max    | 45.8 ms  | 16.9 ms      | 17.9 ms                       | 13.2 ms                      |
+**Push latency** (sequential small commit, `scripts/bench_push.sh`, 200 iters):
 
-M1a killed the CGI wrapper — that's where the big tail-latency win
-lives (p99 −27%, max −63%). M1b-1 went native on the discovery
-response; a small p50 nudge because that endpoint was the cheaper
-of the two git subprocesses. M1b-2c swapped `git pack-objects` for
-`gix-pack`: another p50 −22% on the fetch hot path.
+|     | all-subprocess (legacy) | native protocol + subprocess pack-indexing (current) |
+| --- | ----------------------: | ---------------------------------------------------: |
+| p50 | 14.7 ms                 | **12.1 ms**                                          |
+| p99 | 18.2 ms                 | **14.1 ms**                                          |
 
-### Concurrent load (32 parallel clones + 32 parallel pushes)
+**Concurrent fan-in** (`scripts/bench_concurrent.sh`, N=32):
 
-Measured via `scripts/bench_concurrent.sh` (N=32 by default, release
-build, all clients on the same host). Each clone is the full 28 KB
-seed; each push is a small commit to a distinct repo so the bench
-exercises the SQLite pool + smart-HTTP layer without converging on
-a single ref's CAS:
+|      | 32 concurrent clones | 32 concurrent pushes |
+| ---- | -------------------: | -------------------: |
+| p99  | 108.8 ms             | 53.3 ms              |
+| tput | 288 ops/s            | 572 ops/s            |
 
-|        | 32 concurrent clones | 32 concurrent pushes |
-| ------ | --------------------: | --------------------: |
-| wall   | 111 ms                | 56 ms                 |
-| p50    | 75.0 ms               | 25.5 ms               |
-| p95    | 108.4 ms              | 49.9 ms               |
-| p99    | 108.8 ms              | 53.3 ms               |
-| tput   | 288 ops/s             | 572 ops/s             |
-
-These are fan-in burst numbers, not steady-state throughput — the
-right way to read them is "is p99 well-behaved when 32 clients
-arrive at once?" The `r2d2_sqlite` pool (max 8 connections per
-store) doesn't saturate at this fan-in; `artifacts_sqlite_pool_in_use`
-returns to 0 by the time the post-bench scrape runs.
-
-### Push latency (sequential pushes of a small commit)
-
-Measured via `scripts/bench_push.sh` (200 iterations, release
-build, A/B'd against the legacy paths via `ARTIFACTS_DISABLE_NATIVE`):
-
-|        | All-subprocess (legacy) | Native protocol + subprocess pack-indexing (current default) |
-| ------ | ----------------------: | -----------------------------------------------------------: |
-| p50    | 14.7 ms                 | 12.1 ms                                                      |
-| p95    | 16.3 ms                 | 13.3 ms                                                      |
-| p99    | 18.2 ms                 | 14.1 ms                                                      |
-| max    | 18.4 ms                 | 16.3 ms                                                      |
-
-The push path's protocol layer (M1b-3) is fully native — pkt-line
-parsing, sideband framing, ref CAS through `RefStore`, native
-deletes. The pack-indexing leaf (M1b-3-gix) is available natively
-via `gix-pack`, but the bench shows `gix-pack`'s
-`Bundle::write_to_directory` is ~4× slower than `git unpack-objects`
-on typical small pushes (gix has substantial per-call setup; the
-crossover is well past anything an interactive push generates). So
-the default is the subprocess for now, with the native indexer
-available behind `ARTIFACTS_NATIVE_INDEX_PACK=1` for backends that
-genuinely can't shell out (a future chunked-KV `Storage` impl).
+The `r2d2` pool (max 8 connections/store) doesn't saturate at this fan-in;
+`artifacts_sqlite_pool_in_use` returns to 0 by the post-bench scrape.
 
 ## Quickstart
 
-**Requirements:** Rust 1.88 (pinned via `rust-toolchain.toml`) and
-`git` ≥ 2.30 on `$PATH`. We invoke `git upload-pack` and `git
-receive-pack` directly for smart-HTTP (no CGI wrapper, no
-git-http-backend dep).
-
-Run the server:
+**Requirements:** Rust 1.88 (pinned via `rust-toolchain.toml`) and `git` ≥ 2.30
+on `$PATH`.
 
 ```sh
 cargo run --release -- serve \
@@ -278,963 +158,345 @@ cargo run --release -- serve \
     --public-base-url http://127.0.0.1:8787
 ```
 
-On startup the server prints an admin token to stderr. Use that token for
-REST calls, or set `ARTIFACTS_ADMIN_TOKEN` to pin it.
-
-Create a repo, clone it, push to it:
+On startup the server prints an admin token to stderr (or pin it with
+`ARTIFACTS_ADMIN_TOKEN`). Then:
 
 ```sh
 ADMIN="<admin token from stderr>"
 
-# Create a repo. The response gives you a ready-to-clone URL.
-curl -sS -X POST \
-    -H "Authorization: Bearer $ADMIN" \
+# Create a repo — the response gives a ready-to-clone URL with creds embedded.
+curl -sS -X POST -H "Authorization: Bearer $ADMIN" \
     http://127.0.0.1:8787/v1/repos
-# → {"id":"abc...","remote":"http://x:TOKEN@127.0.0.1:8787/git/abc....git","token":"TOKEN"}
+# → {"id":"abc…","remote":"http://x:TOKEN@127.0.0.1:8787/git/abc….git","token":"TOKEN"}
 
-# Clone. The credentials are already in the URL, so no prompting.
-git clone "http://x:TOKEN@127.0.0.1:8787/git/abc....git" ./work
+git clone "http://x:TOKEN@127.0.0.1:8787/git/abc….git" ./work
+cd work && echo hi > README.md && git add . && git commit -m first && git push -u origin main
 
-cd work
-echo "hi" > README.md
-git add . && git commit -m "first"
-git push -u origin main
-```
-
-Fork it:
-
-```sh
-curl -sS -X POST \
-    -H "Authorization: Bearer $ADMIN" \
-    -H 'Content-Type: application/json' \
+# Fork it (O(1)).
+curl -sS -X POST -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
     -d '{"readOnly": false}' \
-    "http://127.0.0.1:8787/v1/repos/abc.../forks"
-# → {"id":"def...","remote":"http://x:TOKEN2@127.0.0.1:8787/git/def....git","token":"TOKEN2"}
+    "http://127.0.0.1:8787/v1/repos/abc…/forks"
 ```
 
-Run the test suite:
+## Configuration
 
-```sh
-cargo test --all-targets  # 283 lib + 26 gui + 2 Rust integration tests
-./tests/smoke.sh          # thin shim → cargo test --test integration_smoke
-./scripts/bench_fork.sh   # fork benchmark (FORKS=10000 PARALLEL=64 by default)
-```
+All flags accept an env var (shown) and have sane defaults; the server runs with
+none of them set.
+
+| Flag / env | Default | Purpose |
+| --- | --- | --- |
+| `--data-dir` | `./data` | Entire mutable surface (repos + SQLite DBs). |
+| `--bind` | `127.0.0.1:8787` | Listen address. |
+| `--public-base-url` | `http://127.0.0.1:8787` | Base for generated clone URLs. |
+| `--admin-token` / `ARTIFACTS_ADMIN_TOKEN` | generated | Static admin Bearer; printed to stderr if unset. |
+| `--jwt-secret` / `ARTIFACTS_JWT_SECRET` | off | HS256 secret; enables JWT auth on REST. |
+| `--jwt-expected-aud` / `…_AUD`, `--jwt-expected-iss` / `…_ISS` | off | Pin JWT `aud`/`iss` (set these when sharing the secret across services). |
+| `--max-repos-per-user` / `…_MAX_REPOS_PER_USER` | 100 | Per-user repo quota (admin exempt). |
+| `--max-commit-blob-bytes` / `…_MAX_COMMIT_BLOB_BYTES` | 8 MiB | Per-file cap on REST commits. |
+| `--max-repo-bytes` / `…_MAX_REPO_BYTES` | 0 (off) | Per-repo on-disk byte quota. |
+| `--rest-body-limit-bytes` / `…_REST_BODY_LIMIT_BYTES` | 1 MiB | Body cap on `/v1/*`. |
+| `--git-body-limit-bytes` / `…_GIT_BODY_LIMIT_BYTES` | 2 GiB | Body cap on `/git/*`. |
+| `--request-timeout-secs` / `…_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (0 = off; not recommended). |
+| `--tls-cert` / `…_TLS_CERT`, `--tls-key` / `…_TLS_KEY` | off | In-process rustls termination. |
+| `--allow-insecure` | off | Permit non-loopback HTTP bind. |
+| `--audit-retention-days` / `…_AUDIT_RETENTION_DAYS` | 90 | Audit-log prune window (0 = keep forever). |
+| `--webhook-delivery-retention-days` / `…_WEBHOOK_DELIVERY_RETENTION_DAYS` | 30 | Finalized webhook-delivery prune window. |
+| `--gc-interval-secs` / `…_GC_INTERVAL_SECS` | 86400 | Periodic GC sweep cadence (0 = off). |
+| `--gc-min-object-age-secs` / `…_GC_MIN_OBJECT_AGE_SECS` | 7200 | GC anti-race: skip loose objects younger than this. |
+| `--shutdown-timeout-secs` / `…_SHUTDOWN_TIMEOUT_SECS` | 30 | Graceful-drain budget. |
+| `--shutdown-drain-delay-secs` / `…_SHUTDOWN_DRAIN_DELAY_SECS` | 5 | Readiness-503 hold-off before drain. |
+| `--readiness-write-check` / `…_READINESS_WRITE_CHECK` | true | Exercise each store's write path in `/health/ready`. |
+| `--otlp-endpoint` / `…_OTLP_ENDPOINT` | off | OTLP/gRPC trace export. |
+
+Other env knobs: `ARTIFACTS_WEBHOOK_KEY` (base64 32-byte master key),
+`ARTIFACTS_WEBHOOK_DB` (registry path), `ARTIFACTS_SQLITE_POOL_SIZE` (pool max),
+`ARTIFACTS_NATIVE_INDEX_PACK=1` (opt into the native pack indexer),
+`ARTIFACTS_DISABLE_NATIVE=1` (force the subprocess protocol fallback, for A/B).
 
 ## API reference
 
 ### Authentication
 
-Two auth schemes, used for different paths.
-
-| Scheme | Header | Used by | Carrying |
-| ------ | ------ | ------- | -------- |
-| Bearer | `Authorization: Bearer $ADMIN_TOKEN` | all `/v1/*` REST endpoints | the static admin token |
-| Basic  | `Authorization: Basic base64(x:$TOKEN)` | all `/git/*` endpoints   | a per-repo token minted by the REST API |
-
-For git endpoints, the expected way to pass the token is by embedding it in
-the clone URL: `https://x:$TOKEN@host/git/$ID.git`. Git handles the HTTP
-Basic handshake automatically from there, including the initial probe + 401
-challenge dance.
-
-### Health
-
-`GET /v1/health` → `{"ok":true}` — cheap liveness probe, no auth.
-
-`GET /v1/health/ready` — readiness probe, no auth. Exercises the
-tokens, audit, and ownership SQLite stores via cheap queries
-(1-second deadline each):
-
-```json
-// healthy
-{ "ok": true,  "components": {"tokens": "ok", "audit": "ok", "ownership": "ok"} }
-// unhealthy — returns HTTP 503 so k8s/systemd refuses traffic
-{ "ok": false, "components": {"tokens": "ok", "audit": "fail", "ownership": "ok"} }
-// shutting down — also 503; distinguishable from infra failure
-{ "ok": false, "draining": true }
-```
-
-Distinct from `/v1/health` so a stuck SQLite read doesn't fail the
-liveness probe (which would trigger a restart loop) — readiness
-fails first, the orchestrator drains traffic, and only then does
-the liveness probe drive a restart if the underlying issue
-persists.
-
-On SIGTERM/SIGINT the probe flips to the `draining` shape
-*before* the listener stops accepting connections (see the
-graceful-shutdown section). This is the canonical k8s sequence:
-mark unready → orchestrator pulls from rotation → existing
-in-flight requests finish → process exits.
-
-### Create repo
-
-```
-POST /v1/repos
-Authorization: Bearer <admin>
-Content-Type: application/json
-
-{ "id": "optional-caller-supplied-id" }
-```
-
-Response:
-
-```json
-{
-  "id": "n11g4bw6j4vwoy0ackf1ubv7",
-  "remote": "http://x:8O3F6me...@127.0.0.1:8787/git/n11g4bw6j4vwoy0ackf1ubv7.git",
-  "token": "8O3F6me..."
-}
-```
-
-The returned token has **write** scope. If you don't pass an `id`, the
-server generates a 24-character lowercase-alphanumeric one.
-
-### Fork a repo
-
-```
-POST /v1/repos/:id/forks
-Authorization: Bearer <admin>
-Content-Type: application/json
-
-{ "id": "optional-fork-id", "readOnly": false }
-```
-
-Response is the same shape as create. `readOnly: true` mints a read-only
-token; any push to that fork will be rejected with 403. The fork itself is
-still pushable — you can call `POST /tokens` later to mint a write token for
-it.
-
-Fork is O(1) in both time and disk (see [How a fork works](#how-a-fork-works)).
-
-### Mint a token
-
-```
-POST /v1/repos/:id/tokens
-Authorization: Bearer <admin>
-Content-Type: application/json
-
-{
-  "scope": "read",
-  "ttlSeconds": 3600          // optional; omit for no expiry
-}
-```
-
-Scope is `"read"` or `"write"`. Response:
-
-```json
-{
-  "token":    "...",
-  "remote":   "http://x:...@host/git/...git",
-  "expiresAt": 1734567890     // unix epoch seconds, null if no TTL
-}
-```
-
-Tokens are stored as SHA-256 hashes in `<data-dir>/tokens.db` (SQLite).
-A restart of the server does *not* invalidate them — this is the
-whole point of M4's persistence layer.
-
-### Revoke a token
-
-```
-POST /v1/tokens/revoke
-Authorization: Bearer <admin>
-Content-Type: application/json
-
-{ "token": "<the raw token>" }
-```
-
-Response:
-
-```json
-{ "revoked": true }           // false = already revoked or unknown
-```
-
-Why POST with the token in the body instead of `DELETE /tokens/:token`?
-Because paths land in access logs. Bodies don't. This keeps revoked
-tokens out of log archives.
-
-Revocation is idempotent. A second revoke of the same token returns
-`{ "revoked": false }`.
-
-### Rotate the webhook master key
-
-```
-POST /v1/admin/webhook-key/rotate
-Authorization: Bearer <admin>
-```
-
-Response:
-
-```json
-{
-  "rotated": 17,
-  "key": "<base64-encoded 32-byte key>"
-}
-```
-
-Generates a fresh AES-256 master key, re-encrypts every webhook
-secret in the SQLite registry under it (single transaction —
-partial failure rolls back), atomically swaps the in-memory key,
-and returns the new key in the response body.
-
-The `rotated` count is the number of rows re-encrypted. Legacy
-plaintext rows (pre-M6-deliver-secrets, `secret_nonce IS NULL`)
-are intentionally skipped, so the count can be lower than the
-total subscription count.
-
-The on-disk key file (`<data-dir>/webhook-key.bin`) is rewritten
-when one is in use, so a restart picks up the new key. Env-var
-deployments (`ARTIFACTS_WEBHOOK_KEY` set) skip the file rewrite
-— the response body is the only place the new key surfaces, and
-the operator must update the env var out of band before the
-process restarts (otherwise every encrypted row becomes
-unreadable). Audit event `admin.webhook_key.rotate` includes
-the rotated count.
-
-Admin-only. JWT principals get 403. In-memory `MemRegistry`
-deployments accept the call (the trait's default `rotate_master_key`
-is a no-op returning 0); the new key is still generated and
-returned for parity with the SQLite path.
-
-### Audit log (persistent)
-
-```
-GET /v1/admin/audit
-  ?since=<unix-ts>
-  &until=<unix-ts>
-  &event=<kind>
-  &actor=<admin|jwt-subject>
-  &repoId=<id>
-  &limit=<n>            # default 100, capped 1000
-  &offset=<n>           # default 0; skips newest-first rows
-Authorization: Bearer <admin>
-```
-
-Returns newest-first list of `AuditEvent` rows persisted by the
-server. Every mutating endpoint (repo create / fork / delete,
-token mint / revoke / rotate, admin-token rotate) writes a row
-here in addition to the live `tracing!(target: "audit")` event.
-
-Each row:
-
-```json
-{
-  "id": 42,
-  "ts": 1734567890,
-  "event": "repo.create",
-  "actor": "u-alice",
-  "repoId": "n11g4bw6...",
-  "fields": "{\"scope\":\"Write\",\"ttl_seconds\":null}",
-  "requestId": "abc..."
-}
-```
-
-`fields` is a JSON-string blob — kept as a string so adding a new
-event kind with new fields doesn't require a schema migration.
-Server-side filters compose with AND. To page past the 1000 cap,
-take the oldest `ts` in a page and pass it as `until` on the
-next request.
-
-Stored in `<data-dir>/audit.db` (separate from `tokens.db` so the
-audit log can be archived / rotated independently). Writes are
-best-effort — a SQLite hiccup logs a warning but doesn't fail the
-underlying mutation; the live `tracing!` call is the durable copy
-of last resort.
-
-**Boot audit.** Every server start emits a `server.start` event
-with `bind`, `public_base_url`, `tls_enabled`, `allow_insecure`,
-quota / retention / shutdown knobs, and the build version. A
-compliance reviewer querying
-`GET /v1/admin/audit?event=server.start` gets a full process-boot
-history without needing access to the operational logs.
-
-**Shutdown audit.** Every clean exit emits a paired
-`server.shutdown` event with `kind` (`"graceful"` or
-`"timed_out"`), `uptime_secs`, and the configured
-`shutdown_timeout_secs`. Together with `server.start` this gives
-the audit log a bracket-record per process instance — "started
-at T1 with config X, exited at T2 after N seconds, drain
-completed cleanly / timed out." If a row's `server.start` has no
-matching `server.shutdown`, the process exited via SIGKILL or
-crashed (no chance to write the row), which is itself a
-useful signal.
-
-**Cheap totals.** `GET /v1/admin/audit/stats` returns
-`{ count: <total rows> }` — backed by `SELECT COUNT(*)` against
-the indexed `audit_events` table, so admin tooling can surface
-"rows logged" without paginating through the whole list.
-
-**Retention.** Rows older than `--audit-retention-days`
-(default 90, env `ARTIFACTS_AUDIT_RETENTION_DAYS`) are pruned
-hourly. Set to `0` to disable pruning entirely — useful for
-compliance scenarios where an external archiver moves rows out
-before they age out.
-
-Admin-only. JWT principals get 403.
-
-### Rotate the JWT signing secret
-
-```
-POST /v1/admin/jwt-key/rotate
-Authorization: Bearer <admin>
-```
-
-Response:
-
-```json
-{
-  "key": "<base64-url-no-pad, 32 bytes of entropy>",
-  "persisted": true
-}
-```
-
-Generates a fresh HS256 secret, atomically swaps it into the in-memory
-cell, and returns it. After this call returns, every JWT minted under
-the previous secret stops verifying — coordinate with whatever identity
-provider (Dyspel backend, etc.) signs JWTs so both sides switch in
-lockstep.
-
-`persisted` is `true` when the new key was written to
-`<data-dir>/jwt-key.bin` (0600) — i.e., the deployment is file-backed
-(no `ARTIFACTS_JWT_SECRET` env var). `false` for env-pinned
-deployments: the response body is the only place the new key
-surfaces, and the operator must update the env var out of band
-before the process restarts.
-
-Admin-only. JWT principals get 403 (which is the only sane answer —
-rotating the JWT key while authenticating as a JWT user would lock
-the caller out mid-flight). Emits an `admin.jwt_key.rotate` audit
-event with `{persisted: bool}` — no key bytes in the event.
-
-### Rotate the admin token
-
-```
-POST /v1/admin/token/rotate
-Authorization: Bearer <admin>
-```
-
-Response:
-
-```json
-{ "token": "<the new admin token>" }
-```
-
-Generates a fresh process-wide admin token, atomically swaps the
-in-memory cell, and returns it. The previous admin token stops
-working on the next request — there is no grace period, so
-in-flight clients should stash the new token before discarding the
-old one.
-
-Admin-only. JWT principals get 403. Use this after a suspected
-leak or before walking away from a shared session — it's the
-in-process counterpart to restarting the server with a different
-`ARTIFACTS_ADMIN_TOKEN`. The `admin.token.rotate` audit event is
-emitted on success (no token bytes in the event — just the fact of
-rotation).
-
-### Delete a repo
-
-```
-DELETE /v1/repos/:id              # safe default: refuses if forks exist
-DELETE /v1/repos/:id?force=true   # admin override: orphans dependent forks
-DELETE /v1/repos/:id?cascade=true # delete this repo + every transitive fork
-Authorization: Bearer <admin>     # or owner JWT
-```
-
-Response (no flags / `?force=true`): `{"ok":true}`. Response
-(`?cascade=true`): `{"ok":true,"deleted":[<id>, ...]}` — the order is
-deepest-first so no fork is briefly orphaned mid-cascade.
-
-If the repo has live forks (other repos whose `alternates` source is
-this repo), the default `DELETE` returns `409 fork_dependency` with
-the list of dependent IDs in the body so the caller can decide
-whether to delete those first or pass `?force=true` /
-`?cascade=true`. `force` and `cascade` are mutually exclusive
-(asking for both is `400`).
-
-### Garbage-collect unreachable loose objects
-
-```
-GET  /v1/admin/repos/:id/gc-preview                 # read-only analysis
-POST /v1/admin/repos/:id/gc?minAgeSecs=7200         # actually delete
-Authorization: Bearer <admin>
-```
-
-The preview walks the full alternates network around the repo
-(both ancestors and descendants), unions every reachable OID via
-`git rev-list --objects --all` per member, and diffs against the
-analyzed repo's loose objects on disk. Returns
-`{ network, reachableOids, looseOnDisk, unreachableLoose,
-unreachableBytes, sample }` where `sample` is the first ≤32
-unreachable OIDs.
-
-The run endpoint applies the same analysis, then unlinks each
-candidate older than `minAgeSecs` (default 7200 — 2 hours,
-conservative). The mtime guard is the anti-race: a push that
-landed seconds ago might be in the middle of writing the ref
-that points at the new objects, and deleting them would break
-the in-flight state. Pass `minAgeSecs=0` to disable the guard
-for one-shot cleanups where you know nothing is in flight.
-
-Response shape (run): the GcPreview fields plus
-`{ deleted, deletedBytes, skippedTooYoung }`.
-
-### Create a commit (no git client required)
-
-```
-POST /v1/repos/:id/commits
-Authorization: Bearer <admin>
-Content-Type: application/json
-
-{
-  "branch": "main",
-  "parent": null,                        // or "abc123..." — CAS predicate
-  "message": "update README",
-  "author": { "name": "Agent", "email": "agent@example.com" },
-  "changes": [
-    { "op": "write",  "path": "README.md", "content": "# Hello\n" },
-    { "op": "write",  "path": "img/logo.png", "contentBase64": "iVBORw0…", "mode": "100644" },
-    { "op": "delete", "path": "old/thing.txt" }
-  ]
-}
-```
-
-Response:
-
-```json
-{
-  "commit": "a1b2c3…",
-  "tree":   "d4e5f6…",
-  "branch": "main"
-}
-```
-
-Semantics:
-
-- `parent` is the **compare-and-swap predicate.** The commit is only
-  applied if the branch currently points at `parent`. `null` means the
-  branch must not yet exist (i.e. this is the initial commit / new branch).
-- Changes are applied **in order** on top of `parent`'s tree. If the same
-  path appears twice, the later write wins.
-- `content` is UTF-8. `contentBase64` is arbitrary bytes. One or the other,
-  not both. If neither is set, the file is written as empty.
-- `mode` defaults to `100644` (regular file); `100755` is also accepted
-  (executable).
-- Paths must be relative, have no `..` or `.` components, and no empty
-  path segments.
-
-On CAS miss:
-
-```
-HTTP 409 Conflict
-
-{
-  "error": {
-    "code": "ref_conflict",
-    "message": "ref conflict on branch main",
-    "branch": "main",
-    "expected": "a1b2c3…",     // the SHA the caller thought was current
-    "current":  "9f8e7d…"      // the SHA actually on the branch right now
-  }
-}
-```
-
-Clients should re-read, rebase their change set, and retry. The `current`
-field lets them do that without a second round trip.
+| Scheme | Header | Used by | Carries |
+| --- | --- | --- | --- |
+| Bearer | `Authorization: Bearer <admin-or-jwt>` | `/v1/*` REST | admin token, or a Dyspel HS256 JWT |
+| Basic | `Authorization: Basic base64(x:<token>)` | `/git/*` | a per-repo token from the REST API |
+
+Git endpoints expect the token in the clone URL (`https://x:TOKEN@host/git/ID.git`);
+git does the Basic handshake from there.
+
+### Endpoint map
+
+**Health & metrics** (no auth)
+- `GET /v1/health` → `{"ok":true}` — liveness.
+- `GET /v1/health/ready` — readiness; probes the SQLite stores (and their write
+  path when enabled). Returns 503 on failure or while draining
+  (`{"ok":false,"draining":true}`).
+- `GET /metrics` — Prometheus text.
+
+**Repos & forks** (admin or owner JWT)
+- `POST /v1/repos` — create; returns `{id, remote, token}` (write-scoped token).
+- `GET /v1/repos` — list (admin: all; JWT: owned), `?limit=&offset=`, `X-Total-Count`.
+- `GET /v1/repos/:id` — detail (size, refs).
+- `POST /v1/repos/:id/forks` — O(1) fork; `{readOnly?, id?}`.
+- `DELETE /v1/repos/:id` — refuses with `409 fork_dependency` if forks live;
+  `?force=true` orphans them; `?cascade=true` deletes the subtree deepest-first.
+
+**Tokens**
+- `POST /v1/repos/:id/tokens` — mint `{scope:"read"|"write", ttlSeconds?}`.
+- `GET /v1/repos/:id/tokens` — list (metadata only, never the secret).
+- `POST /v1/repos/:id/tokens/rotate` — revoke + reissue this repo's tokens.
+- `POST /v1/tokens/revoke` — `{token}` in the body (keeps tokens out of access
+  logs); idempotent.
+
+**Commits, reads & collaboration**
+- `POST /v1/repos/:id/commits` — build a commit; `parent` is the CAS predicate
+  (`null` = new branch), `changes[]` are ordered `write`/`delete` ops with
+  `content` (UTF-8) or `contentBase64`. CAS miss → `409 ref_conflict` with
+  `expected`+`current`.
+- `GET /v1/repos/:id/commits` — log.
+- `POST /v1/repos/:id/merge` — fast-forward or three-way; `409 merge_conflict`
+  lists conflicting paths.
+- `GET /v1/repos/:id/{tree,blob,diff,notes,refs}` — read trees, blobs
+  (`<commit>:<path>`), diffs, git notes, and the ref list.
+- `GET /v1/events` — Server-Sent Events stream of commit/fork/status events.
+
+**Webhooks** (admin or owner)
+- `POST /v1/repos/:id/webhooks` — `{url, secret?, events?}` (empty `events` = all
+  kinds). Deliveries are HMAC-SHA256-signed and retried from a durable outbox.
+- `GET /v1/repos/:id/webhooks`, `DELETE /v1/repos/:id/webhooks/:hook_id`.
+
+**Admin** (admin only; JWT → 403)
+- `GET /v1/admin/repos`, `GET /v1/admin/repos/:id`.
+- `GET /v1/admin/repos/:id/gc-preview`, `POST /v1/admin/repos/:id/gc?minAgeSecs=`
+  — alternates-network-aware unreachable-loose-object sweep (preview is
+  read-only; run deletes objects older than `minAgeSecs`, default 7200).
+- `GET /v1/admin/audit` (`?since=&until=&event=&actor=&repoId=&limit=&offset=`),
+  `GET /v1/admin/audit/stats` (cheap totals), `GET /v1/admin/audit/verify-chain`
+  (recompute the SHA-256 row-hash chain; reports the first tampered row id).
+- `POST /v1/admin/token/rotate`, `POST /v1/admin/jwt-key/rotate`,
+  `POST /v1/admin/webhook-key/rotate` — in-process secret rotation; each returns
+  the new secret and emits an audit event (no secret bytes in the event).
+
+**Git** (Basic auth, repo token; scope enforced)
+- `GET /git/:id.git/info/refs?service=git-{upload,receive}-pack`
+- `POST /git/:id.git/git-{upload,receive}-pack`
+
+### Audit log
+
+Every mutating endpoint writes a row to `<data-dir>/audit.db` (in addition to a
+live `tracing!(target:"audit")` event). Rows are SHA-256 hash-chained — a
+tampered or deleted row breaks the chain at its successor, and
+`verify-chain` names the offending id. Process boundaries are bracketed by
+`server.start` / `server.shutdown` events (a `start` with no matching
+`shutdown` means SIGKILL or crash). Writes are best-effort: a SQLite hiccup logs
+a warning but never fails the underlying mutation.
 
 ### Metrics
 
-```
-GET /metrics
-```
+Prometheus text at `GET /metrics`. The `path` label is the route template
+(`/v1/repos/:id/tokens`), so cardinality is bounded by the route table, not by
+repo count.
 
-Returns Prometheus text format (no auth). Scrape at whatever interval
-your monitor prefers.
+| Metric | Kind | Labels |
+| --- | --- | --- |
+| `artifacts_requests_total` | counter | `method`,`path`,`status` |
+| `artifacts_request_duration_seconds` | histogram | `method`,`path` |
+| `artifacts_object_reads_total`, `artifacts_object_read_duration_seconds` | counter, histogram | `backend`,`outcome` |
+| `artifacts_rate_limited_total`, `artifacts_quota_exceeded_total`, `artifacts_repo_byte_quota_exceeded_total` | counter | — |
+| `artifacts_audit_events_total` | counter | `event` |
+| `artifacts_webhook_deliveries_total` | counter | `kind`,`outcome` |
+| `artifacts_webhook_events_dropped_total` | counter | — (event-bus lag) |
+| `artifacts_tokens_active_total`, `artifacts_webhooks_active_total`, `artifacts_repos_total`, `artifacts_audit_events_stored_total` | gauge | — |
+| `artifacts_sqlite_lock_wait_seconds` | histogram | `store` |
+| `artifacts_sqlite_pool_size` / `_pool_in_use` | gauge | `store` |
+| `artifacts_build_info` | gauge | `version` |
 
-Exposed metrics:
+## How a fork works
 
-| Name                                           | Kind      | Labels                   |
-| ---------------------------------------------- | --------- | ------------------------ |
-| `artifacts_requests_total`                     | counter   | `method`, `path`, `status` |
-| `artifacts_request_duration_seconds`           | histogram | `method`, `path`         |
-| `artifacts_rate_limited_total`                 | counter   | —                        |
-| `artifacts_quota_exceeded_total`               | counter   | —                        |
-| `artifacts_audit_events_total`                 | counter   | `event`                  |
-| `artifacts_webhook_deliveries_total`           | counter   | `kind`, `outcome`        |
-| `artifacts_tokens_active_total`                | gauge     | —                        |
-| `artifacts_webhooks_active_total`              | gauge     | —                        |
-| `artifacts_repos_total`                        | gauge     | —                        |
-| `artifacts_audit_events_stored_total`          | gauge     | —                        |
-| `artifacts_sqlite_lock_wait_seconds`           | histogram | `store`                  |
-| `artifacts_build_info`                         | gauge     | `version`                |
+A fork is a handful of file writes — no object copies, no git invocation, no
+network:
 
-The `path` label is the **route template** (`/v1/repos/:id/tokens`),
-not the concrete URI. Cardinality is bounded by the route table, not
-by the number of repos created.
+1. Create `repos/<fork-id>.git/` with `objects/{info,pack}` + `refs/{heads,tags}`.
+2. Write `objects/info/alternates` pointing at the source's `objects/` dir.
+   **This one file is the whole trick** — every object reachable from the source
+   is now reachable from the fork via git's native alternates mechanism.
+3. Copy `HEAD`, write a minimal bare `config`, copy the source's `refs/` tree
+   (and `packed-refs` if present).
+4. Mint a token scoped to the fork.
 
-Histogram buckets are tuned for HTTP latency (1 ms through 10 s, 12
-buckets). Good for percentile approximation up to p99-ish; if you
-need finer resolution, tighten the bucket list in `src/metrics.rs`.
+~228 bytes on disk regardless of source size. `gc`/`repack`/`fsck` all
+understand alternates, so this is not a wrapper trick — it's how the git
+reference implementation models shared object stores.
 
-### Request IDs
+## Security
 
-Every response carries an `X-Request-Id: <id>` header. If the caller
-supplied one on the request and it's well-formed (≤128 chars of
-`[A-Za-z0-9_-]`), we echo it back; otherwise we generate a UUIDv4
-(32-char hex). The id is attached to the per-request tracing span so
-every log line the handler emits carries `request_id=<id>` as a
-structured field — grep-friendly for incident debugging.
+See [SECURITY.md](./SECURITY.md) for the disclosure policy and threat model.
+In brief:
 
-### Listing your repos
+- **Tokens** are SHA-256-hashed in SQLite (DB exfil yields hashes, not tokens);
+  presented as HTTP Basic; admin/JWT compares are constant-time
+  (`subtle::ConstantTimeEq`).
+- **JWT** verification pins HS256 (no `alg=none`/confusion), requires `exp`,
+  honors `nbf`, and pins `aud`/`iss` when configured.
+- **Path traversal** has two lines of defense: `validate_repo_id` rejects
+  slashes/dots at ingress, and `FsStorage::repo_path` re-checks every joined
+  path's components.
+- **Push integrity:** a connectivity walk runs before any ref advances, so a
+  thin/truncated/partial push can never leave a ref pointing at a missing
+  object; objects are fsync'd before the ref CAS.
+- **Resource bounds:** the pack parser caps per-entry output and rejects
+  oversized delta targets (decompression-bomb guard); per-route body caps and a
+  per-request timeout bound memory and connection-hold; non-busy SQLite errors
+  are redacted to a 500, `SQLITE_BUSY` maps to 503 + `Retry-After`.
+- **Webhook secrets** are AES-256-GCM-sealed at rest (fresh per-row nonce) under
+  a master key from `ARTIFACTS_WEBHOOK_KEY` or `<data-dir>/webhook-key.bin`
+  (0600), rotatable in-process.
+- **Secrets rotate** in-process: admin token, JWT signing secret, webhook master
+  key — each invalidates the prior value on the next request.
 
-```
-GET /v1/repos                                →  [{ id, owner, createdAt, sourceId? }, ...]
-GET /v1/repos?limit=N&offset=M               →  same, paginated
-```
-
-Scoped by who's asking: an admin token returns every repo the server
-knows about; a JWT principal returns only repos that user owns
-(admin-owned rows are excluded from user listings). Same
-`limit`/`offset`/`X-Total-Count` shape as the admin endpoint below —
-the defaults and 5000-row cap apply to both. Distinct from
-`/v1/admin/repos` because the user path's auth model is different
-(JWT subject filter on `owner_subject`) and shouldn't require the
-admin token.
-
-### Admin inspection (read-only)
-
-```
-GET /v1/admin/repos                          →  [{ id, owner, createdAt, sourceId? }, ...]
-GET /v1/admin/repos?limit=N&offset=M         →  same, paginated
-GET /v1/admin/repos/:id                      →  { …summary, sizeBytes, refs: [{ name, sha }] }
-```
-
-Admin-only. `sourceId` is derived by reading the repo's
-`objects/info/alternates` file, so forks are discoverable via the
-admin list without a separate column. The list endpoint intentionally
-omits size and ref walks (O(n_repos) each); those live on the detail
-endpoint, which walks only the requested repo.
-
-The list endpoint accepts optional `limit` (default 1000, capped at
-5000) and `offset` (default 0) query params, and always returns the
-full row count in the `X-Total-Count` response header so callers can
-detect when they need another page. The default of 1000 is high
-enough that realistic prototype-stage callers (the GUI poller, the
-smoke harness) hit it implicitly; the cap is a safety bound on a
-previously-unbounded endpoint, not a behaviour change.
-
-Powers [`artifacts-gui`](./GUI.md) — the Wayland/X11 live viewer — and
-any other tooling that needs to browse server state out-of-band.
-
-### Git endpoints
-
-The standard smart-HTTP surface, exposed under `/git/:id.git/`:
-
-```
-GET  /git/:id.git/info/refs?service=git-upload-pack    # fetch/clone discovery
-GET  /git/:id.git/info/refs?service=git-receive-pack   # push discovery
-POST /git/:id.git/git-upload-pack                      # fetch/clone
-POST /git/:id.git/git-receive-pack                     # push
-```
-
-You don't call these by hand — they exist for git clients. Auth is HTTP
-Basic with the repo token; scope is enforced (`receive-pack` requires
-`write`).
+Still open: a real KMS-backed webhook-secret path (the at-rest encryption is
+done; KMS unwrap-per-delivery is the refinement).
 
 ## Directory layout
 
 ```
-artifacts/
-├── Cargo.toml                 cargo manifest
-├── rust-toolchain.toml        pinned 1.88 — local dev + CI agree
-├── README.md                  this file
-├── ARCHITECTURE.md            the three hard problems, prototype vs production
-├── .github/workflows/
-│   ├── ci.yml                 fmt / clippy / build+test on every PR
-│   └── fuzz.yml               nightly cargo-fuzz + workflow_dispatch
-├── src/
-│   ├── lib.rs                 library root — every module declared here
-│   ├── main.rs                thin bin shim: clap parse → app::serve
-│   ├── app.rs                 server bring-up (router, shutdown listener)
-│   ├── config.rs              runtime config (data dir, base URL, admin token)
-│   ├── error.rs               error type + IntoResponse + WWW-Authenticate
-│   ├── auth.rs                Basic/Bearer extraction + authorization helpers
-│   ├── jwt.rs                 HS256 verification (Dyspel `userId` / `sub`)
-│   ├── tokens.rs              TokenStore trait + InMemory + SQLite-pool impls
-│   ├── ownership.rs           OwnershipStore trait + SQLite repos table + quota
-│   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
-│   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
-│   ├── object_store/          ObjectStore trait + Fs / Mem / SQLite impls + conformance suite
-│   ├── alternates_cache.rs    memoizes alternates → source_id lookups
-│   ├── smart_http.rs          native v2 pack handlers + pack-handler shell-out fallback
-│   ├── pkt_line.rs            git smart-HTTP pkt-line parser
-│   ├── git_wire/              v2 ls-refs + fetch + push body parsers + response builders
-│   ├── native_pack.rs         empty-pack / sideband helpers used by smart_http
-│   ├── git_cmd.rs             *the* single seam for spawning `git` subprocesses
-│   ├── commits.rs             REST-side commits via gix (POST /v1/repos/:id/commits)
-│   ├── merge.rs               three-way + fast-forward merge
-│   ├── reads/                 read APIs (tree / blob / diff / notes / forks-of)
-│   ├── gc.rs                  alternates-aware loose-object reachability sweep
-│   ├── events.rs              in-process EventBus + SSE bridge
-│   ├── webhooks.rs            WebhookRegistry trait + SQLite/Mem impls + dispatcher
-│   ├── secrets.rs             AES-256-GCM master key (env + file resolver)
-│   ├── audit.rs               persistent audit log + SHA-256 hash-chain
-│   ├── db_migrate.rs          forward-only schema migrator + `r2d2_sqlite` pool builder
-│   ├── metrics.rs             Prometheus exporter + pool-gauge refresher
-│   ├── rate_limit.rs          per-subject token bucket
-│   ├── ip_rate_limit.rs       per-IP token bucket for unauth /v1/health*
-│   ├── request_id.rs          X-Request-Id roundtrip + per-request span
-│   ├── blocking.rs            spawn_blocking + JoinError mapping helper
-│   ├── test_support.rs        #[cfg(test)] TestRepo fixture
-│   ├── rest.rs                shared RestState + helpers; handlers in rest/*
-│   ├── rest/                  repos.rs / tokens.rs / webhooks.rs / admin.rs / health.rs
-│   └── bin/
-│       └── artifacts-gui/     feature-gated: eframe/egui Wayland/X11 visualizer
-├── tests/
-│   ├── smoke.sh                       thin shim → `cargo test --test integration_smoke`
-│   ├── integration_smoke.rs           Rust port of the bash smoke; 22 scenarios in one #[test]
-│   └── backup_restore_roundtrip.rs    round-trips repo + token through backup.sh / restore.sh
-├── fuzz/                              cargo-fuzz workspace (own [workspace] block)
-│   ├── Cargo.toml
-│   └── fuzz_targets/
-│       ├── pkt_line.rs                arbitrary bytes → pkt_line::read
-│       └── git_proto.rs               arbitrary bytes → v2 + push parsers
-├── deploy/                            Dockerfile + systemd unit + k8s manifests
-└── scripts/
-    ├── bench_fork.sh           10,000-fork benchmark; measures disk + latency
-    ├── bench_clone.sh          sequential-clone latency; p50/p95/p99/max
-    ├── bench_push.sh           sequential-push latency; same shape
-    ├── bench_concurrent.sh     N=32 parallel clones + pushes; fan-in p99
-    ├── backup.sh               online data-dir snapshot (SQLite .backup + tar)
-    └── restore.sh              inverse — restore a backup into a fresh data dir
+src/
+├── lib.rs / main.rs        library root + thin clap→serve bin shim
+├── app.rs                  server bring-up: router, layers, shutdown, bg tasks
+├── config.rs / error.rs    runtime config; error type + IntoResponse (5xx redaction, DB→503)
+├── auth.rs / jwt.rs        Basic/Bearer extraction; HS256 verification
+├── ids.rs                  validated newtypes: RepoId / Oid / RefName / Subject / Token
+├── storage.rs              Storage trait + FsStorage (fork-via-alternates — THE CORE)
+├── refs.rs                 RefStore trait + FsRefStore (CAS) + MemRefStore
+├── object_store/           ObjectStore trait + Fs/Mem/SQLite impls + conformance suite
+├── tokens.rs / ownership.rs / audit.rs   SQLite-backed stores (+ hash-chain in audit)
+├── db_migrate.rs           forward-only migrator + r2d2 pool + store-boilerplate macro
+├── smart_http.rs           native git_handler + connectivity gate + subprocess fallback
+├── git_wire/ pkt_line.rs   v2 ls-refs/fetch + push parsers; pkt-line codec
+├── native_pack(/parse.rs)  hand-rolled pack parser + delta engine (bounded allocations)
+├── git_cmd.rs              the single seam for spawning `git`
+├── commits.rs / merge.rs   REST commits via gix; fast-forward + three-way merge
+├── reads/                  tree / blob / diff / notes / refs / log read APIs
+├── gc.rs                   alternates-aware reachability sweep (+ periodic actor)
+├── events.rs / webhooks.rs in-process EventBus + SSE; webhook registry + durable outbox
+├── secrets.rs              AES-256-GCM master key (env + file resolver)
+├── metrics.rs / request_id.rs / rate_limit.rs / ip_rate_limit.rs   observability + limits
+├── rest.rs + rest/         RestState + repos/tokens/webhooks/admin/health handlers
+└── bin/artifacts-gui/      feature-gated eframe/egui live viewer
+tests/   integration_smoke.rs (spawns the binary; clone/push/fork/merge/SSE/restart)
+         backup_restore_roundtrip.rs
+fuzz/    pkt_line + git_proto cargo-fuzz targets
+deploy/  Dockerfile + systemd unit + k8s manifests
+scripts/ bench_{fork,clone,push,concurrent}.sh + backup.sh / restore.sh
 ```
 
-Under `$DATA_DIR` at runtime:
-
-```
-data/
-├── tokens.db                  SQLite — minted tokens (hashed) + ownership (`repos`). Shared file, separate namespaces in schema_version.
-├── audit.db                   SQLite — persisted audit events (hash-chained, queryable via GET /v1/admin/audit)
-├── webhooks.db                SQLite — webhook subscriptions + AES-256-GCM-sealed secrets (created on first webhook add)
-├── webhook-key.bin            32-byte AES-256 master key (auto-generated, 0600). Pin via ARTIFACTS_WEBHOOK_KEY env in prod.
-└── repos/
-    ├── abc12...xy.git/        bare git repo (source)
-    │   ├── HEAD
-    │   ├── config
-    │   ├── refs/heads/main    ← SHA-1 ref
-    │   └── objects/…          ← loose + packed objects
-    └── def34...z7.git/        bare git repo (fork)
-        ├── HEAD
-        ├── config
-        ├── refs/heads/main    ← copy of source's ref at fork time
-        └── objects/
-            └── info/
-                └── alternates ← points at ../../abc12...xy.git/objects
-```
-
-## How a fork works
-
-A fork is seven file writes — no object copies, no git operations, no
-network. Concretely:
-
-1. Create `$DATA_DIR/repos/$FORK_ID.git/` and the three required
-   subdirectories (`objects/info`, `objects/pack`, `refs/heads`, `refs/tags`).
-2. Write `objects/info/alternates` containing the absolute path to the
-   source's `objects/` directory. **This single file is the whole trick.**
-   Any object reachable from the source is now reachable from the fork via
-   git's native `alternates` mechanism.
-3. Copy `HEAD` (a small text file: `ref: refs/heads/main`).
-4. Write a minimal `config` (`bare = true` + HTTP enable flags).
-5. Copy the source's `refs/` tree — tiny, since each ref is a text file
-   with a single SHA.
-6. Copy `packed-refs` if it exists.
-7. Mint a token scoped to the fork id.
-
-Empirically this is ~228 bytes on disk, regardless of how large the source
-repo is. Contrast with a full copy, which would be O(object data).
-
-This is how GitHub implements internal fork networks and has since ~2009.
-`git gc`, `git repack`, `git fsck` all understand alternates natively.
-`.git/objects/info/alternates` is built into git; we're not inventing new
-semantics here.
-
-## Security in one paragraph
-
-Authentication is token-based. Per-repo tokens are minted by the
-admin (via `Authorization: Bearer <admin>`) or by JWT users
-(`subject` recorded on the token row), presented by clients as HTTP
-Basic with username `x`, and stored as SHA-256 hashes in SQLite.
-Every Bearer compare is constant-time (`subtle::ConstantTimeEq`)
-to prevent byte-at-a-time timing recovery. Path-traversal has two
-lines of defense: `validate_repo_id` rejects slashes and dots at
-ingress, and `FsStorage::repo_path` re-checks every joined path's
-`Path::components()` so a future change to the validator can't
-silently produce a path that escapes the repos root. Every
-mutating endpoint (repo create / fork / delete, token mint /
-revoke / rotate) emits a structured `target: "audit"` tracing
-event with `actor`, `repo_id`, and action-specific fields — pipe
-that target to its own sink for live monitoring, and query
-`GET /v1/admin/audit` for a SQLite-backed history (the same
-events are persisted there). Per-subject
-token-bucket rate limiting + per-user repo-count quotas are
-enforced on every non-admin request; admin bypasses both for
-break-glass purposes. The process-wide admin token can be
-rotated in-place without a restart via
-`POST /v1/admin/token/rotate` — the previous token stops working
-on the next request. Per-repo tokens have their own
-`POST /v1/repos/:id/tokens/rotate` for the same purpose.
-
-**Graceful shutdown.** SIGTERM (k8s/systemd) and SIGINT (Ctrl-C)
-both trigger a graceful drain — the server stops accepting new
-connections and waits up to `--shutdown-timeout-secs` (default 30,
-env `ARTIFACTS_SHUTDOWN_TIMEOUT_SECS`) for in-flight requests to
-finish before exiting. Useful so a rolling deploy doesn't drop a
-git push mid-stream. Set the timeout to 0 for an immediate
-hard-exit (dev only).
-
-Before the drain begins, the readiness probe
-(`/v1/health/ready`) flips to 503 + `{draining: true}` and the
-process holds for `--shutdown-drain-delay-secs` (default 5, env
-`ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS`). That gives an orchestrator
-(k8s endpoint controller, etc.) time to notice the failing probe
-and pull the process out of its load-balancer pool *before* it
-stops accepting new connections. Without this hold-off, the
-orchestrator could route a fresh request onto a process that's
-about to refuse it at the TCP level. Set the delay to 0 to skip
-the hold-off (matches pre-feature behaviour; appropriate for
-non-orchestrated dev runs).
-
-TLS terminates in-process when both `--tls-cert <path>` and
-`--tls-key <path>` are set (PEM files, also via env
-`ARTIFACTS_TLS_CERT` / `ARTIFACTS_TLS_KEY`). Implementation is
-rustls 0.23 + `axum-server`'s `bind_rustls` path, with the `ring`
-crypto provider installed at startup. Non-loopback HTTP without
-TLS, an `https://` public URL (terminator-in-front), or
-`--allow-insecure` is refused at startup — the bind-safety check
-short-circuits the most common credential-leak misconfig.
-
-What's *still* missing:
-
-- **KMS-backed webhook secrets.** Webhook HMAC keys are encrypted
-  at rest with AES-256-GCM (per-row 96-bit nonce, fresh-random per
-  insert), keyed by an env-pinnable master key
-  (`ARTIFACTS_WEBHOOK_KEY`, base64-encoded 32 bytes; auto-generated
-  to `<data-dir>/webhook-key.bin` with 0600 perms on first run if
-  unset). The master key can be rotated in-process via
-  `POST /v1/admin/webhook-key/rotate` — the endpoint re-encrypts
-  every existing row under a fresh key in a single transaction.
-  This raises the bar from "DB exfil reveals every webhook secret
-  in plaintext" to "DB exfil reveals nothing without the key." A
-  real KMS-backed swap (sealing key referenced by KMS ID, KMS does
-  the unwrap on each delivery) keeps the same trait shape but
-  removes the on-disk-key fallback — that's the still-open
-  refinement, not the at-rest encryption itself.
-
-A prototype for agents you trust talking to a backend you trust
-over an internal / TLS-terminated link. Not a public service.
+Under `$DATA_DIR`: `tokens.db` (tokens + ownership, separate namespaces),
+`audit.db`, `webhooks.db`, `webhook-key.bin` (0600), and `repos/<id>.git/` bare
+repos (forks carry an `objects/info/alternates` pointer).
 
 ## Development
 
 ```sh
-# Build
-cargo build                 # debug
-cargo build --release       # optimized, used by benchmarks
+cargo build --release             # benchmarks use the release build
 
-# Run
-cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
+cargo test                        # 372 lib tests + 2 doctests + integration
+cargo test --all-features         # + 26 GUI unit tests
+cargo test --doc                  # runnable doc examples (e.g. src/ids.rs)
+./tests/smoke.sh                  # → cargo test --test integration_smoke
 
-# Test
-cargo test --lib            # 283 lib tests in isolation (no bin link)
-cargo test --all-targets    # + 26 gui unit tests + 2 Rust integration tests
-                            # (tests/integration_smoke.rs covers the 22
-                            # end-to-end scenarios the bash smoke used to;
-                            # tests/backup_restore_roundtrip.rs round-trips
-                            # backup.sh + restore.sh)
-./tests/smoke.sh            # thin shim → cargo test --test integration_smoke
+# Lints: enforced as a hard gate in CI.
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings   # pedantic + nursery + unsafe discipline
+cargo deny check                            # advisories / bans / licenses / sources
+cargo machete                               # unused-dependency guard
 
-# Bench
-./scripts/bench_fork.sh         # fork benchmark (FORKS / PARALLEL knobs)
-./scripts/bench_clone.sh        # sequential clones; CLONES=200 default
-./scripts/bench_push.sh         # sequential pushes
-./scripts/bench_concurrent.sh   # N=32 parallel clones + pushes; fan-in p99
+# Benchmarks
+./scripts/bench_fork.sh           # FORKS / PARALLEL knobs
+./scripts/bench_{clone,push,concurrent}.sh
 
-# Backup / restore (online)
-./scripts/backup.sh  <data-dir>   <backup-dir>
-./scripts/restore.sh <backup-dir> <data-dir>     # server must be stopped
+# Backup / restore (online; restore needs the server stopped)
+./scripts/backup.sh  <data-dir>  <backup-dir>
+./scripts/restore.sh <backup-dir> <data-dir>
 
-# Fuzz (nightly Rust + cargo-fuzz install required)
-cd fuzz
-cargo +nightly fuzz run pkt_line  --max-total-time=60
-cargo +nightly fuzz run git_proto --max-total-time=60
+# Fuzz (nightly + cargo-fuzz)
+cd fuzz && cargo +nightly fuzz run pkt_line --max-total-time=60
 ```
 
-Logging is via `tracing`. Tune with `RUST_LOG`:
-
-```sh
-RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
-```
-
-The Prometheus `/metrics` endpoint includes `r2d2`-pool gauges per
-SQLite store — `artifacts_sqlite_pool_size{store}` and
-`artifacts_sqlite_pool_in_use{store}` for `tokens` / `ownership` /
-`audit` / `webhooks`. Use these alongside the request-duration
-histogram to spot pool exhaustion under load.
+Lint policy lives in one place — the `[lints]` table in `Cargo.toml` — and
+applies to the library, both binaries, tests, and benches: `clippy::pedantic`
+and `clippy::nursery` (warn, with a documented allow-list for deliberate
+exceptions), `unreachable_pub`, `unsafe_op_in_unsafe_fn`, and the
+undocumented-unsafe-block guards. Formatting is pinned by `rustfmt.toml`. Logs
+are `tracing`; tune with `RUST_LOG` (e.g. `RUST_LOG=artifacts=debug`).
 
 ## Deployment
 
-A starter set of runtime artifacts lives under [`deploy/`](./deploy/):
-
-- **[`deploy/Dockerfile`](./deploy/Dockerfile)** — multi-stage build,
-  debian-slim runtime, `git` on PATH (the server shells out to
-  `upload-pack` / `receive-pack`), non-root UID 10001.
-- **[`deploy/systemd/artifacts.service`](./deploy/systemd/artifacts.service)** — hardened
-  unit (`NoNewPrivileges`, `ProtectSystem=strict`, `SystemCallFilter`,
-  `MemoryDenyWriteExecute`). Pairs with
-  [`deploy/systemd/artifacts.env`](./deploy/systemd/artifacts.env) for
-  secrets.
-- **[`deploy/k8s/`](./deploy/k8s/)** — single-replica Deployment + Service
-  + RWO PVC. Readiness and liveness probes are pinned to
-  `/v1/health/ready` and `/v1/health` respectively so the
-  drain-readiness flip works as designed.
-
-The `--data-dir` is the entire mutable surface — bare git repos under
-`repos/` plus three SQLite databases (`tokens.db`, `audit.db`,
-`webhooks.db`). On k8s it must be a `PersistentVolumeClaim`. The
-prototype is single-replica until M3b lands; the manifest's
-`strategy: Recreate` is what keeps a rollout from deadlocking two
-pods on the same RWO volume. See [`deploy/README.md`](./deploy/README.md)
-for the full operator notes.
+Runtime artifacts live under [`deploy/`](./deploy/) — multi-stage `Dockerfile`
+(debian-slim, `git` on PATH, non-root UID 10001), a hardened systemd unit
+(`NoNewPrivileges`, `ProtectSystem=strict`, `SystemCallFilter`,
+`MemoryDenyWriteExecute`) with a companion env file, and single-replica k8s
+manifests (Deployment + Service + RWO PVC, `strategy: Recreate` so a rollout
+can't deadlock two pods on one volume; probes pinned to `/v1/health/ready` and
+`/v1/health`). The `--data-dir` is the entire mutable surface and must be a
+PVC. Single-replica until M3b. See [`deploy/README.md`](./deploy/README.md).
 
 ## Roadmap
 
-| Milestone | Status | Scope | Replaces |
-| --------- | ------ | ----- | -------- |
-| **M0**  | ✅ done | single-node prototype, smart-HTTP bridge, alternates-based forks | — |
-| **M3a** | ✅ done | `RefStore` trait extracted; `FsRefStore` shells out to `update-ref` for CAS | direct ref writes |
-| **M5**  | ✅ done | `POST /v1/repos/:id/commits` — REST-side commits with CAS, delete + write, 409 body on conflict | no serverless-friendly commit surface |
-| **M2a** | ✅ done | `Storage` trait extracted; `FsStorage` is the sole impl. Handlers are now backend-neutral. | direct struct calls |
-| **M4a** | ✅ done | `TokenStore` trait + SQLite-backed persistent store with TTL, revocation, hash-at-rest; `POST /v1/tokens/revoke` endpoint | in-memory token map |
-| **M1a** | ✅ done | `git http-backend` CGI removed — direct `git upload-pack`/`git receive-pack` shell-outs. Clone p99 −27%, max −63%. | CGI wrapper + extra fork |
-| **M1b-1** | ✅ done | Native v2 `info/refs` advertisement — discovery endpoint no longer spawns a subprocess when the client uses protocol v2 (almost all modern clients). | upload-pack `--advertise-refs` fork |
-| **M1b-2a** | ✅ done | Native v2 `command=ls-refs` POST — refs read directly off disk (packed-refs + loose) by `RefStore::list`/`read_head`. No upload-pack subprocess on the discovery half. | upload-pack ls-refs fork |
-| **M1b-2b** | ✅ done | Native v2 `command=fetch` POST — protocol layer + sideband-1 framing in-process; pack generation via `git pack-objects --stdout`. | upload-pack fetch fork |
-| **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
-| **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
-| **M1b-3-gix** | 🟡 opt-in | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Available behind `ARTIFACTS_NATIVE_INDEX_PACK=1`; the bench (see Push latency above) showed `gix-pack` is ~4× slower than `git unpack-objects` on typical small pushes, so the default is the subprocess until the crossover improves upstream. The dispatch + helper are wired so a future chunked-KV `Storage` impl (which can't shell out) gets a working native path on day one. | n/a (default subprocess) |
-| **M2b**     | ✅ done | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait (`read_loose` + `write_loose` + `list_loose` + `delete_loose` + `exists` + `ingest_pack` + `read_object`) + atomic-write `FsObjectStore` + `MemObjectStore` + `SqliteObjectStore` + shared conformance suite. **Production routing**: `gc` enumerates/deletes through the trait; `create_commit`'s parent-exists goes through `ObjectStore::exists`; native receive-pack (when `ARTIFACTS_NATIVE_INDEX_PACK=1`) writes through `ObjectStore::ingest_pack`; blob-read fetches bytes through `ObjectStore::read_object`. `SqliteObjectStore::ingest_pack` resolves pack bytes via a hand-rolled parser + delta engine (`src/native_pack/parse.rs`) — Direct, REF_DELTA, and OFS_DELTA all resolve against the KV directly, no filesystem touch. | bare repos on disk |
-| **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
-| **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
-| **M4b-key-rotation** | ✅ done | In-process admin-token rotation (`POST /v1/admin/token/rotate`). `Config::admin_token` is a runtime `RwLock<String>`; rotation atomically swaps the cell, the previous token stops authorizing on the next request, and the event lands on the `audit` tracing target. | env-var-on-restart only |
-| **M6 — webhooks** | ✅ done | Outbound HTTP webhook delivery with HMAC-SHA256 signing. In-memory `MemRegistry`; SQLite-backed registry + delivery retries are the remaining slice. | — |
-| **M6 — metrics**  | ✅ done | Prometheus `/metrics` with per-route counters + latency histograms + rate-limit / quota counters. | — |
-| **M6 — other**    | 🟡 | LFS, replication, PITR — genuinely multi-week each. | — |
+| Milestone | Status | Scope |
+| --- | --- | --- |
+| M0 | ✅ | Single-node prototype; smart-HTTP bridge; alternates forks. |
+| M1a–M1b | ✅ | Protocol nativization: CGI removed, then native v2 `info/refs`/`ls-refs`/`fetch` (gix-pack) + `receive-pack` (CAS, sideband, deletes). |
+| M1b-3-gix | 🟡 opt-in | Native pack indexer (`gix-pack`); default stays `git unpack-objects` (~4× faster on small pushes). |
+| M2a / M2b | ✅ | `Storage` trait; then `ObjectStore` trait + Fs/Mem/SQLite impls + conformance + hand-rolled pack/delta resolver. |
+| M3a | ✅ | `RefStore` trait + `FsRefStore` CAS. |
+| M3b | 🟡 | Distributed `RefStore` — `MemRefStore` + concurrent-CAS suite done; consensus log remains. |
+| M4a / M4b | ✅ | `TokenStore` (SQLite, TTL, revoke, hash-at-rest); owner-scoped self-revoke + bulk rotate; in-process admin/JWT-key rotation. |
+| M5 | ✅ | REST commits (CAS, write/delete, 409 body) via gix. |
+| M6 | ✅ | Webhooks (HMAC, durable SQLite outbox, retries, sealed secrets); Prometheus metrics; audit log + hash-chain; OTLP. |
+| M6-other | 🟡 | LFS, replication, PITR. |
 
-Each milestone is designed to land without breaking the API surface at the
-edge. A caller written against M0 should keep working against M6 with no
-code change — same `remote` URL shape, same REST bodies.
+Each milestone lands without breaking the edge API — a caller written against
+M0 keeps working: same `remote` URL shape, same REST bodies.
 
 ## Design decisions worth arguing about
 
-**Q: The `Storage` / `RefStore` / `TokenStore` traits each have one impl.
-How "abstract" are they, really?**
+**The traits each have a real impl — how abstract are they?** `TokenStore`,
+`ObjectStore`, and `RefStore` earn their keep (the SQLite-vs-Mem split drives
+tests; `ObjectStore` has three real impls behind one conformance suite).
+`Storage` is thinner — object/ref I/O still resolves through `repos_dir()` — so
+it's a clean *boundary*, not yet a drop-in backend. Honest framing: the traits
+are how M3b/M6 land without churning the edge, not a claim that a second backend
+is plug-and-play today.
 
-A: Honestly — for `Storage` and `RefStore`, less than earlier versions
-of this README implied. `TokenStore` has genuine trait value (the
-SQLite vs in-memory split matters for tests and for a future
-account-service backend). For `Storage` and `RefStore`, the four
-trait methods (create / fork / delete / exists) and the two trait
-methods (read / cas_update) *are* clean boundaries — but the expensive
-work (pack generation, object writes, ref-file updates) still goes
-through `cfg.repos_dir().join("…git")` and/or shells out to `git`.
-A non-FS impl of those traits would have to also replace the smart-HTTP
-bridge and the commits plumbing, which means M1b-native is a hard
-prerequisite for M2b/M3b, not an independent axis. The traits are
-*a start*, not a drop-in boundary.
+**Why gitoxide for the protocol instead of `git http-backend`?** M0 used the CGI
+wrapper to get bit-exact compatibility for free; once the architecture held up,
+the protocol was nativized incrementally (gitoxide) — each step earned against a
+benchmark rather than rewritten up front. `git` remains only for the narrow jobs
+where its plumbing is still the fastest correct option (`unpack-objects`,
+`rev-list`).
 
-**Q: Why shell out to `git upload-pack` instead of writing the protocol
-natively?**
+**Why is REST-commit built with `gix` and not git plumbing?** It started as a
+chain of `hash-object`/`write-tree`/`commit-tree` subprocesses against a temp
+index — correct but slow. It now uses `gix::Repository::write_blob`/`edit_tree`/
+`write_object` in-process, same REST surface, no temp dirs.
 
-A: Because `git upload-pack` *is* the git project's reference
-implementation of the server side of the fetch protocol. Feeding the
-HTTP body to its stdin and streaming its stdout back gives us bit-exact
-protocol compatibility with every client — `git`, `libgit2`,
-`isomorphic-git`, `go-git`, `jgit`, v0/v1/v2 — for free. M0 used
-`git-http-backend` on top of this; M1a cut out that CGI wrapper; M1b
-goes native via gitoxide. We're swapping out the protocol layer
-incrementally as we earn the right to, not rewriting it up front.
+**Why default to `git unpack-objects` for push indexing?** A bench showed
+`gix-pack`'s `Bundle::write_to_directory` is ~4× slower than `git
+unpack-objects` on the small packs an interactive push generates (gix has fixed
+per-call setup cost). The native indexer stays wired behind
+`ARTIFACTS_NATIVE_INDEX_PACK=1` for a future no-filesystem backend.
 
-**Q: Why not use `gitoxide` or `libgit2` from day one?**
+**Why SQLite for tokens/ownership/audit/webhooks?** Smallest thing giving
+durability + WAL reader concurrency + column predicates (expiry/revocation are a
+`WHERE` clause, not a sweep) at zero operational cost. A HashMap evaporates on
+restart — broken UX for agent sessions that outlive a deploy. Multi-node moves
+this to a real issuer service (the trait is already carved out).
 
-A: Because doing it up front would have cost weeks and proved nothing
-that isn't already proved. The goal of M0 was "can we fork 10,000 repos
-in seconds, for bytes of disk?" — measurably, yes. Now that the
-architecture holds up, M1b (native protocol) has something real sitting
-underneath it.
-
-**Q: Why trust `alternates` for production-grade fork networks?**
-
-A: Because GitHub has run on exactly this mechanism for fifteen years, it's
-part of the git reference implementation (not a wrapper trick), and all the
-standard maintenance tools (`gc`, `repack`, `fsck`) understand it. The
-failure mode we have to design for is "source repo is deleted while forks
-still exist" — that's the alternates-aware GC we owe in M1/M2.
-
-**Q: Why a single admin token instead of per-account auth?**
-
-A: Because M0 is a single-node prototype. Multi-tenant auth is its own
-meaningful design problem — short-lived creds, per-session scopes, key
-rotation — and belongs in M4, not M0.
-
-**Q: `POST /v1/repos/:id/commits` exists — how does it build commits without
-a native git object writer?**
-
-A: It shells out to git plumbing (`hash-object`, `update-index`,
-`write-tree`, `commit-tree`, `update-ref`) against a per-request temp
-index file. Ugly and slow compared to gitoxide, but it inherits git's own
-semantics exactly — correct tree entry ordering, empty-tree convention,
-delta-over-large-trees — in ~150 lines instead of ~1500. When M1 lands,
-these subprocess calls become `gix::Repository::write_blob()` /
-`write_object()` with no change to the REST surface. This was the right
-tradeoff: deliver the agent-first story now, swap the implementation
-later.
-
-**Q: Tokens live in SQLite — why not a HashMap or Redis?**
-
-A: SQLite is the smallest thing that gives us durability + WAL concurrency
-+ column-level predicates (expiry and revocation are a `WHERE` clause, not
-a sweep) with zero operational cost. A HashMap evaporates on restart,
-which is genuinely broken UX for agent sessions that outlive a deploy.
-Redis would add a network hop and an external daemon for a prototype
-that's happy with file-backed durability. When multi-node arrives, this
-moves to a real issuer service — which is M4b and already has the trait
-carved out.
-
-**Q: Why SHA-256 the tokens in the db when the server is already behind
-HTTPS and admin auth?**
-
-A: Defense in depth. Anyone who exfiltrates `tokens.db` (backup tape, a
-dev laptop, an accidental git check-in) gets hashes, not tokens. The hash
-is two lines and zero runtime cost — free belt-and-suspenders. If we ever
-add a breach-notification path, "the DB leaked but no tokens were
-compromised" is a much better sentence than the alternative.
-
-**Q: The 10,000-fork bench shows p99 = 50 ms. Isn't that bad?**
-
-A: That number was measured against the M0 CGI path. Fork itself is
-~230 µs on disk — sub-millisecond. The tail was the `git-http-backend`
-process fork that some fork requests incidentally triggered (they
-shouldn't — forks are REST-only — but the historical bench had
-process-fork noise in its tail because of the way it was structured).
-M1a cleared out the CGI layer; M1b removes the last subprocess. We
-expect the fork-bench tail to flatten further against M1a, and to look
-like the storage hot path alone after M1b.
-
-**Q: Does it work with isomorphic-git, go-git, jgit?**
-
-A: It should — we don't implement the protocol ourselves; `git http-backend`
-does. Any client that interoperates with a stock git HTTP server should
-work. The smoke test exercises cli-`git`; extending it to other clients is
-on the to-do list.
+**Why hash the tokens when the server is behind TLS + admin auth?** Defense in
+depth — exfiltrating `tokens.db` yields hashes, not tokens, for two lines and
+zero runtime cost.
 
 ## License
 
-Apache-2.0 (same as most of the Rust ecosystem; change at will).
+[Apache-2.0](./LICENSE).
