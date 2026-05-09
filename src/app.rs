@@ -546,7 +546,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             p.exists().then_some(p)
         });
     let mut webhook_key_path: Option<std::path::PathBuf> = None;
-    let webhook_registry: Arc<dyn webhooks::WebhookRegistry> = match webhook_db_path {
+    // Build the subscription registry, and — only for the SQLite
+    // backend — a `DeliveryOutbox` handle pointing at the same instance.
+    // The in-memory `MemRegistry` has no outbox (it doesn't implement
+    // the trait); its events go out via the dispatcher's direct-dispatch
+    // fallback.
+    let webhook_registry: Arc<dyn webhooks::WebhookRegistry>;
+    let webhook_outbox: Option<Arc<dyn webhooks::DeliveryOutbox>>;
+    match webhook_db_path {
         Some(p) => {
             let key_path = data_dir.join("webhook-key.bin");
             let master_key = Arc::new(secrets::MasterKey::load_or_generate(&key_path)?);
@@ -554,53 +561,50 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 webhook_key_path = Some(key_path);
             }
             tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry (encrypted secrets)");
-            let sqlite_wh = webhooks::SqliteWebhookRegistry::open(&p, master_key)?;
+            let sqlite_wh = Arc::new(webhooks::SqliteWebhookRegistry::open(&p, master_key)?);
             sqlite_pools.push(("webhooks", sqlite_wh.pool().clone()));
-            Arc::new(sqlite_wh)
+            webhook_registry = sqlite_wh.clone();
+            webhook_outbox = Some(sqlite_wh);
         },
         None => {
             tracing::info!("webhooks: in-memory registry (subscriptions lost on restart)");
-            Arc::new(webhooks::MemRegistry::new())
+            webhook_registry = Arc::new(webhooks::MemRegistry::new());
+            webhook_outbox = None;
         },
-    };
-    // Spawn the webhook dispatcher *before* any handler can publish,
-    // so the broadcast subscriber registers before events start
-    // flying. Otherwise the first commit/fork on boot wouldn't reach
-    // any subscribers.
+    }
+    // Spawn the webhook dispatcher *before* any handler can publish, so
+    // the broadcast subscriber registers before events start flying. It
+    // enqueues into the outbox when present, else direct-dispatches.
     bg_handles.push(webhooks::spawn_dispatcher(
         webhook_registry.clone(),
+        webhook_outbox.clone(),
         event_bus.clone(),
         bg_cancel.child_token(),
     ));
-    // K3: durable-outbox delivery worker. Polls the
-    // webhook_deliveries table every 2 seconds and drives un-
-    // finalized rows toward a terminal outcome. For the in-memory
-    // MemRegistry the worker is a no-op (claim_pending returns
-    // empty) — direct dispatch via spawn_dispatcher's fallback is
-    // what fires in that case.
-    bg_handles.push(webhooks::spawn_delivery_worker(
-        webhook_registry.clone(),
-        Duration::from_secs(2),
-        bg_cancel.child_token(),
-    ));
+    // The durable-outbox delivery worker (K3) and finalized-row prune
+    // (L4) only exist when there IS an outbox — i.e. the SQLite backend.
+    // MemRegistry deployments rely on the dispatcher's direct dispatch.
+    if let Some(outbox) = &webhook_outbox {
+        bg_handles.push(webhooks::spawn_delivery_worker(
+            outbox.clone(),
+            Duration::from_secs(2),
+            bg_cancel.child_token(),
+        ));
+        if let Some(h) = webhooks::spawn_prune_task(
+            outbox.clone(),
+            PRUNE_INTERVAL,
+            Duration::from_secs(webhook_delivery_retention_days * 86400),
+            bg_cancel.child_token(),
+        ) {
+            bg_handles.push(h);
+        }
+    }
     webhooks::refresh_active_webhook_gauge(&*webhook_registry);
     bg_handles.push(webhooks::spawn_active_gauge_refresher(
         webhook_registry.clone(),
         GAUGE_REFRESH_INTERVAL,
         bg_cancel.child_token(),
     ));
-    // L4: prune finalized rows from webhook_deliveries on the same
-    // hourly cadence as the audit prune. Mirrors that shape:
-    // `webhook_delivery_retention_days = 0` opts out + the helper
-    // returns None.
-    if let Some(h) = webhooks::spawn_prune_task(
-        webhook_registry.clone(),
-        PRUNE_INTERVAL,
-        Duration::from_secs(webhook_delivery_retention_days * 86400),
-        bg_cancel.child_token(),
-    ) {
-        bg_handles.push(h);
-    }
 
     // One task that refreshes every store's pool gauges. Populated by
     // each `SqliteXxxStore::open` call above; an empty `sqlite_pools`

@@ -109,71 +109,6 @@ pub trait WebhookRegistry: Send + Sync {
     /// (logged) rather than propagating into the fire-and-forget path.
     fn matching(&self, repo_id: &crate::ids::RepoId, kind: &str) -> Vec<Subscription>;
 
-    /// K3: durable enqueue. INSERT one `webhook_deliveries` row per
-    /// matching subscription, capturing url + sealed secret at enqueue
-    /// time. Returns the count of rows inserted. `Ok(0)` means either
-    /// no matching subscriptions OR the registry doesn't support
-    /// durable delivery (default impl) — callers should fall back to
-    /// direct dispatch in that case.
-    fn enqueue_delivery(
-        &self,
-        _repo_id: &crate::ids::RepoId,
-        _kind: &str,
-        _payload: &[u8],
-    ) -> crate::error::Result<u64> {
-        Ok(0)
-    }
-
-    /// K3: pop up to `limit` un-finalized delivery rows whose
-    /// `next_attempt_at <= now`. The registry unseals the secret
-    /// before returning. Increments the row's `attempts` counter and
-    /// pushes `next_attempt_at` forward by a default backoff window
-    /// so a slow worker can't double-deliver the same row — the
-    /// worker will call `mark_delivery_finalized` or
-    /// `mark_delivery_retry` to record the actual outcome.
-    /// Default impl returns an empty Vec (MemRegistry shape).
-    fn claim_pending_deliveries(&self, _limit: u32) -> crate::error::Result<Vec<PendingDelivery>> {
-        Ok(Vec::new())
-    }
-
-    /// K3: schedule a row for another attempt. Updates `attempts`,
-    /// `last_status`, and `next_attempt_at`. The worker computes the
-    /// new `next_attempt_at` from its own backoff policy.
-    fn mark_delivery_retry(
-        &self,
-        _id: i64,
-        _attempts: u32,
-        _next_attempt_at: i64,
-        _last_status: &str,
-    ) -> crate::error::Result<()> {
-        Ok(())
-    }
-
-    /// K3: stamp a row as finalized — no further attempts. `outcome`
-    /// is one of {"success", "client_error", "exhausted"}; the
-    /// `last_status` is the last HTTP status code as a string (or a
-    /// transport-error tag) for audit.
-    fn mark_delivery_finalized(
-        &self,
-        _id: i64,
-        _outcome: &str,
-        _last_status: Option<&str>,
-    ) -> crate::error::Result<()> {
-        Ok(())
-    }
-
-    /// L4: delete finalized delivery rows older than `cutoff_ts`
-    /// (unix-seconds). Returns the number of rows removed. Mirrors
-    /// the audit-prune shape — finalized rows accumulate after K3
-    /// landed; without this they'd grow unbounded. Pending rows
-    /// (`finalized_at IS NULL`) are NEVER pruned, even if they're
-    /// older than cutoff — they're still in flight.
-    /// Default impl returns Ok(0) — MemRegistry has nothing
-    /// retainable.
-    fn prune_finalized(&self, _cutoff_ts: i64) -> crate::error::Result<u64> {
-        Ok(0)
-    }
-
     /// Replace the in-process master key, re-encrypting every existing
     /// secret under it. Returns the count of rows re-encrypted (0
     /// for backends that don't store encrypted secrets — `MemRegistry`,
@@ -194,6 +129,49 @@ pub trait WebhookRegistry: Send + Sync {
     fn count_active(&self) -> crate::error::Result<u64> {
         Ok(0)
     }
+}
+
+/// The durable webhook-delivery outbox (K3). Split out of
+/// `WebhookRegistry` so the in-memory `MemRegistry` no longer has to
+/// pretend to implement an outbox it lacks — only the SQLite-backed
+/// registry provides this. The dispatcher uses it when present and
+/// falls back to single-attempt direct dispatch otherwise.
+pub trait DeliveryOutbox: Send + Sync {
+    /// INSERT one `webhook_deliveries` row per matching subscription,
+    /// capturing url + sealed secret. Returns rows inserted.
+    fn enqueue_delivery(
+        &self,
+        repo_id: &crate::ids::RepoId,
+        kind: &str,
+        payload: &[u8],
+    ) -> crate::error::Result<u64>;
+
+    /// Claim up to `limit` un-finalized rows due now, pushing each
+    /// row's `next_attempt_at` forward under the write lock so a slow
+    /// worker can't double-deliver. Unseals secrets before returning.
+    fn claim_pending_deliveries(&self, limit: u32) -> crate::error::Result<Vec<PendingDelivery>>;
+
+    /// Schedule a row for another attempt (updates attempts /
+    /// last_status / next_attempt_at).
+    fn mark_delivery_retry(
+        &self,
+        id: i64,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_status: &str,
+    ) -> crate::error::Result<()>;
+
+    /// Stamp a row finalized — no further attempts.
+    fn mark_delivery_finalized(
+        &self,
+        id: i64,
+        outcome: &str,
+        last_status: Option<&str>,
+    ) -> crate::error::Result<()>;
+
+    /// Delete finalized rows older than `cutoff_ts`; pending rows are
+    /// never pruned. Returns rows removed.
+    fn prune_finalized(&self, cutoff_ts: i64) -> crate::error::Result<u64>;
 }
 
 /// SQLite-backed `WebhookRegistry`. Subscriptions persist across
@@ -467,6 +445,72 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         Ok(n.max(0) as u64)
     }
 
+    /// Re-encrypt every secret-bearing row under `new`, then atomically
+    /// install `new` as the current master key. Holds the connection
+    /// mutex for the full operation, so concurrent `add` and `list`
+    /// block until it completes — they then see the new key. The
+    /// transaction means a partial failure mid-rotation rolls back to
+    /// the old ciphertext under the old key, never a half-rotated DB.
+    ///
+    /// Legacy plaintext rows (secret_nonce IS NULL) are left untouched
+    /// so the migration story stays consistent — a row stored before
+    /// the M6-deliver-secrets encryption shipped doesn't suddenly get
+    /// encrypted under a key that may later be rotated again.
+    ///
+    /// Returns the count of rows actually re-encrypted (0 if no
+    /// encrypted rows exist; the swap still happens).
+    fn rotate_master_key(&self, new: Arc<crate::secrets::MasterKey>) -> crate::error::Result<u64> {
+        use rusqlite::params;
+        let mut conn = self.lock()?;
+        let old = self.current_key();
+        let tx = conn.transaction()?;
+        let mut count: u64 = 0;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, secret, secret_nonce FROM webhooks
+                 WHERE secret IS NOT NULL AND secret_nonce IS NOT NULL",
+            )?;
+            // Collect first so the statement borrow drops before the
+            // per-row UPDATE acquires the connection again via tx.
+            let rows: Vec<(String, String, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (id, ct_b64, nonce_blob) in rows {
+                let nonce: [u8; 12] = nonce_blob.as_slice().try_into().map_err(|_| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: nonce wrong length ({} bytes)",
+                        nonce_blob.len()
+                    ))
+                })?;
+                let ct = BASE64_STD.decode(ct_b64.as_bytes()).map_err(|e| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: ciphertext base64 decode: {e}"
+                    ))
+                })?;
+                let pt = crate::secrets::unseal(&old, &ct, &nonce).map_err(|e| {
+                    crate::error::Error::Other(anyhow::anyhow!(
+                        "webhook row {id}: unseal under old key: {e}"
+                    ))
+                })?;
+                let (new_ct, new_nonce) = crate::secrets::seal(&new, &pt)?;
+                tx.execute(
+                    "UPDATE webhooks SET secret = ?1, secret_nonce = ?2 WHERE id = ?3",
+                    params![BASE64_STD.encode(&new_ct), new_nonce.to_vec(), id],
+                )?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        // Swap the in-memory key while we still hold the conn mutex so
+        // concurrent `add` calls — which take the same mutex — wake up
+        // using the new key in lockstep with the on-disk re-encryption.
+        *self.master_key.write().unwrap_or_else(|p| p.into_inner()) = new;
+        Ok(count)
+    }
+}
+
+impl DeliveryOutbox for SqliteWebhookRegistry {
     fn enqueue_delivery(
         &self,
         repo_id: &crate::ids::RepoId,
@@ -705,70 +749,6 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         )?;
         Ok(n as u64)
     }
-
-    /// Re-encrypt every secret-bearing row under `new`, then atomically
-    /// install `new` as the current master key. Holds the connection
-    /// mutex for the full operation, so concurrent `add` and `list`
-    /// block until it completes — they then see the new key. The
-    /// transaction means a partial failure mid-rotation rolls back to
-    /// the old ciphertext under the old key, never a half-rotated DB.
-    ///
-    /// Legacy plaintext rows (secret_nonce IS NULL) are left untouched
-    /// so the migration story stays consistent — a row stored before
-    /// the M6-deliver-secrets encryption shipped doesn't suddenly get
-    /// encrypted under a key that may later be rotated again.
-    ///
-    /// Returns the count of rows actually re-encrypted (0 if no
-    /// encrypted rows exist; the swap still happens).
-    fn rotate_master_key(&self, new: Arc<crate::secrets::MasterKey>) -> crate::error::Result<u64> {
-        use rusqlite::params;
-        let mut conn = self.lock()?;
-        let old = self.current_key();
-        let tx = conn.transaction()?;
-        let mut count: u64 = 0;
-        {
-            let mut stmt = tx.prepare(
-                "SELECT id, secret, secret_nonce FROM webhooks
-                 WHERE secret IS NOT NULL AND secret_nonce IS NOT NULL",
-            )?;
-            // Collect first so the statement borrow drops before the
-            // per-row UPDATE acquires the connection again via tx.
-            let rows: Vec<(String, String, Vec<u8>)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            for (id, ct_b64, nonce_blob) in rows {
-                let nonce: [u8; 12] = nonce_blob.as_slice().try_into().map_err(|_| {
-                    crate::error::Error::Other(anyhow::anyhow!(
-                        "webhook row {id}: nonce wrong length ({} bytes)",
-                        nonce_blob.len()
-                    ))
-                })?;
-                let ct = BASE64_STD.decode(ct_b64.as_bytes()).map_err(|e| {
-                    crate::error::Error::Other(anyhow::anyhow!(
-                        "webhook row {id}: ciphertext base64 decode: {e}"
-                    ))
-                })?;
-                let pt = crate::secrets::unseal(&old, &ct, &nonce).map_err(|e| {
-                    crate::error::Error::Other(anyhow::anyhow!(
-                        "webhook row {id}: unseal under old key: {e}"
-                    ))
-                })?;
-                let (new_ct, new_nonce) = crate::secrets::seal(&new, &pt)?;
-                tx.execute(
-                    "UPDATE webhooks SET secret = ?1, secret_nonce = ?2 WHERE id = ?3",
-                    params![BASE64_STD.encode(&new_ct), new_nonce.to_vec(), id],
-                )?;
-                count += 1;
-            }
-        }
-        tx.commit()?;
-        // Swap the in-memory key while we still hold the conn mutex so
-        // concurrent `add` calls — which take the same mutex — wake up
-        // using the new key in lockstep with the on-disk re-encryption.
-        *self.master_key.write().unwrap_or_else(|p| p.into_inner()) = new;
-        Ok(count)
-    }
 }
 
 /// Unix-seconds clock. Shared by every site in this module that
@@ -982,6 +962,7 @@ fn record_dispatcher_lag(dropped: u64) {
 /// don't open the SQLite store still see webhook firings.
 pub fn spawn_dispatcher(
     registry: Arc<dyn WebhookRegistry>,
+    outbox: Option<Arc<dyn DeliveryOutbox>>,
     bus: crate::events::EventBus,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -990,7 +971,7 @@ pub fn spawn_dispatcher(
         loop {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Ok(ev) => dispatch_event(&*registry, &ev).await,
+                    Ok(ev) => dispatch_event(&*registry, outbox.as_deref(), &ev).await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         record_dispatcher_lag(n);
                     }
@@ -1031,7 +1012,7 @@ fn worker_backoff_secs(attempt: u32) -> i64 {
 /// 1-5s gives near-immediate first-attempt latency without
 /// significant idle work.
 pub fn spawn_delivery_worker(
-    registry: Arc<dyn WebhookRegistry>,
+    outbox: Arc<dyn DeliveryOutbox>,
     tick: std::time::Duration,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -1040,7 +1021,7 @@ pub fn spawn_delivery_worker(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let rows = match registry.claim_pending_deliveries(WORKER_BATCH_LIMIT) {
+                    let rows = match outbox.claim_pending_deliveries(WORKER_BATCH_LIMIT) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!(error = %e, "webhook worker: claim_pending failed");
@@ -1048,7 +1029,7 @@ pub fn spawn_delivery_worker(
                         }
                     };
                     for row in rows {
-                        let registry = registry.clone();
+                        let outbox = outbox.clone();
                         // ureq is sync — the per-delivery HTTP call goes onto
                         // the blocking pool so a slow target doesn't tie up
                         // tokio workers. The registry handle is `Arc`, cheap
@@ -1057,7 +1038,7 @@ pub fn spawn_delivery_worker(
                         // has its own 5s timeout and finalizes the row on
                         // its own; tracking would block shutdown for as long
                         // as the slowest target takes to respond.
-                        tokio::task::spawn_blocking(move || dispatch_row(&*registry, row));
+                        tokio::task::spawn_blocking(move || dispatch_row(&*outbox, row));
                     }
                 }
                 _ = cancel.cancelled() => return,
@@ -1074,7 +1055,7 @@ pub fn spawn_delivery_worker(
 /// run). Picks up the K4 CancellationToken pattern so server shutdown
 /// drains it cleanly.
 pub fn spawn_prune_task(
-    registry: Arc<dyn WebhookRegistry>,
+    outbox: Arc<dyn DeliveryOutbox>,
     tick: std::time::Duration,
     retention: std::time::Duration,
     cancel: tokio_util::sync::CancellationToken,
@@ -1091,7 +1072,7 @@ pub fn spawn_prune_task(
             tokio::select! {
                 _ = ticker.tick() => {
                     let cutoff = now_unix_secs().saturating_sub(retention.as_secs() as i64);
-                    match registry.prune_finalized(cutoff) {
+                    match outbox.prune_finalized(cutoff) {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(pruned = n, "webhook delivery prune"),
                         Err(e) => tracing::error!(error = %e, "webhook delivery prune failed"),
@@ -1103,7 +1084,7 @@ pub fn spawn_prune_task(
     }))
 }
 
-fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
+fn dispatch_row(outbox: &dyn DeliveryOutbox, row: PendingDelivery) {
     let signature = sign_body(row.secret.as_deref(), &row.payload);
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(WORKER_HTTP_TIMEOUT_SECS))
@@ -1123,7 +1104,7 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
             let status = resp.status();
             if (200..400).contains(&status) {
                 let _ =
-                    registry.mark_delivery_finalized(row.id, "success", Some(&status.to_string()));
+                    outbox.mark_delivery_finalized(row.id, "success", Some(&status.to_string()));
                 metrics::counter!(
                     "artifacts_webhook_deliveries_total",
                     "kind" => row.kind.clone(),
@@ -1135,15 +1116,11 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
             if (500..600).contains(&status) {
                 // Retryable.
                 if row.attempts >= WORKER_MAX_ATTEMPTS {
-                    finalize_exhausted(registry, &row, Some(&status.to_string()));
+                    finalize_exhausted(outbox, &row, Some(&status.to_string()));
                 } else {
                     let next = now_unix_secs() + worker_backoff_secs(row.attempts);
-                    let _ = registry.mark_delivery_retry(
-                        row.id,
-                        row.attempts,
-                        next,
-                        &status.to_string(),
-                    );
+                    let _ =
+                        outbox.mark_delivery_retry(row.id, row.attempts, next, &status.to_string());
                     tracing::warn!(
                         delivery_id = row.id, hook = %row.hook_id, url = %row.url,
                         status, attempt = row.attempts, next_secs = next - now_unix_secs(),
@@ -1152,7 +1129,7 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
                 }
             } else {
                 // 4xx — terminal client error.
-                let _ = registry.mark_delivery_finalized(
+                let _ = outbox.mark_delivery_finalized(
                     row.id,
                     "client_error",
                     Some(&status.to_string()),
@@ -1172,10 +1149,10 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
         Err(e) => {
             // Network / transport / timeout — all retryable.
             if row.attempts >= WORKER_MAX_ATTEMPTS {
-                finalize_exhausted(registry, &row, Some("network"));
+                finalize_exhausted(outbox, &row, Some("network"));
             } else {
                 let next = now_unix_secs() + worker_backoff_secs(row.attempts);
-                let _ = registry.mark_delivery_retry(row.id, row.attempts, next, "network");
+                let _ = outbox.mark_delivery_retry(row.id, row.attempts, next, "network");
                 tracing::warn!(
                     delivery_id = row.id, hook = %row.hook_id, url = %row.url,
                     attempt = row.attempts, error = %e,
@@ -1187,11 +1164,11 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
 }
 
 fn finalize_exhausted(
-    registry: &dyn WebhookRegistry,
+    outbox: &dyn DeliveryOutbox,
     row: &PendingDelivery,
     last_status: Option<&str>,
 ) {
-    let _ = registry.mark_delivery_finalized(row.id, "exhausted", last_status);
+    let _ = outbox.mark_delivery_finalized(row.id, "exhausted", last_status);
     metrics::counter!(
         "artifacts_webhook_deliveries_total",
         "kind" => row.kind.clone(),
@@ -1204,7 +1181,11 @@ fn finalize_exhausted(
     );
 }
 
-async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
+async fn dispatch_event(
+    registry: &dyn WebhookRegistry,
+    outbox: Option<&dyn DeliveryOutbox>,
+    ev: &Event,
+) {
     let (repo_id_str, kind) = repo_and_kind(ev);
     // Event repo-ids always come from a valid repo; a malformed one
     // can't be a real subscription target, so skip the event.
@@ -1222,12 +1203,17 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
             return;
         },
     };
-    // Try the durable outbox first. Ok(n) with n > 0 means rows are
-    // queued; the delivery worker picks them up on its next tick.
-    // Ok(0) means either no matching subs OR a registry that doesn't
-    // implement enqueue (MemRegistry default) — fall back to legacy
-    // direct dispatch so the in-memory test path still fires hooks.
-    match registry.enqueue_delivery(&repo_id, kind, &body) {
+    // Try the durable outbox first when one is present (SQLite-backed
+    // deployment). Ok(n) with n > 0 means rows are queued; the delivery
+    // worker picks them up on its next tick. Ok(0) means no matching
+    // subs — fall back to legacy direct dispatch so the in-memory test
+    // path still fires hooks. With no outbox at all (MemRegistry),
+    // direct dispatch is the only path.
+    let Some(outbox) = outbox else {
+        legacy_direct_dispatch(registry, ev, body);
+        return;
+    };
+    match outbox.enqueue_delivery(&repo_id, kind, &body) {
         Ok(n) if n > 0 => {},
         Ok(_) => legacy_direct_dispatch(registry, ev, body),
         Err(e) => {
@@ -1867,10 +1853,10 @@ mod tests {
         // worker doesn't depend on the old in-memory key state) and
         // spawn the worker on a fast tick so the test doesn't have to
         // wait the production 2s.
-        let registry: Arc<dyn WebhookRegistry> =
+        let outbox: Arc<dyn DeliveryOutbox> =
             Arc::new(SqliteWebhookRegistry::open(&path, test_master_key()).unwrap());
         spawn_delivery_worker(
-            registry.clone(),
+            outbox.clone(),
             std::time::Duration::from_millis(50),
             tokio_util::sync::CancellationToken::new(),
         );
@@ -2023,13 +2009,10 @@ mod tests {
         // tokio::select! arm on the cancel token isn't wired
         // correctly the test hangs and the timeout fires.
         let (_d, sqlite_r) = open_sqlite_registry();
-        let registry: Arc<dyn WebhookRegistry> = Arc::new(sqlite_r);
+        let outbox: Arc<dyn DeliveryOutbox> = Arc::new(sqlite_r);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_delivery_worker(
-            registry,
-            std::time::Duration::from_millis(50),
-            cancel.clone(),
-        );
+        let handle =
+            spawn_delivery_worker(outbox, std::time::Duration::from_millis(50), cancel.clone());
         // Let the worker actually start its loop and hit the select!
         // arm at least once before we cancel.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2055,7 +2038,7 @@ mod tests {
         let registry: Arc<dyn WebhookRegistry> = Arc::new(MemRegistry::new());
         let bus = crate::events::EventBus::new();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_dispatcher(registry, bus, cancel.clone());
+        let handle = spawn_dispatcher(registry, None, bus, cancel.clone());
         // Give the dispatcher a beat to subscribe and block on recv.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         cancel.cancel();
@@ -2158,10 +2141,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn prune_task_handle_resolves_on_cancel() {
-        let registry: Arc<dyn WebhookRegistry> = Arc::new(open_sqlite_registry().1);
+        let outbox: Arc<dyn DeliveryOutbox> = Arc::new(open_sqlite_registry().1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_prune_task(
-            registry,
+            outbox,
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(86400),
             cancel.clone(),
