@@ -25,7 +25,7 @@ fn oid(s: &str) -> Oid {
 /// "Read returns the bytes that were written." The fundamental
 /// contract — an ObjectStore that can't read back what it stored
 /// is broken regardless of backend.
-pub fn read_after_write_round_trips<S: ObjectStore>(store: &S, repo_id: &RepoId, oid: &Oid) {
+pub(crate) fn read_after_write_round_trips<S: ObjectStore>(store: &S, repo_id: &RepoId, oid: &Oid) {
     let bytes = store
         .read_loose(repo_id, oid)
         .expect("read_loose Result::Ok")
@@ -36,7 +36,7 @@ pub fn read_after_write_round_trips<S: ObjectStore>(store: &S, repo_id: &RepoId,
 /// Reading an oid that was never inserted yields `Ok(None)` —
 /// not an error, not empty bytes. Distinguishes "absent" from
 /// "present but empty".
-pub fn missing_oid_returns_none<S: ObjectStore>(store: &S, repo_id: &RepoId) {
+pub(crate) fn missing_oid_returns_none<S: ObjectStore>(store: &S, repo_id: &RepoId) {
     let absent = oid("0123456789abcdef0123456789abcdef01234567");
     assert!(
         store.read_loose(repo_id, &absent).unwrap().is_none(),
@@ -47,7 +47,7 @@ pub fn missing_oid_returns_none<S: ObjectStore>(store: &S, repo_id: &RepoId) {
 /// `write_loose` round-trips through `read_loose` with byte-exact
 /// fidelity. Both impls have to satisfy this — anything a chunked-KV
 /// or future backend can't preserve verbatim is broken.
-pub fn write_then_read_round_trips<S: ObjectStore>(store: &S) {
+pub(crate) fn write_then_read_round_trips<S: ObjectStore>(store: &S) {
     let r = rid("conf-repo");
     let o = oid("1111111111111111111111111111111111111111");
     let payload = b"contract-bytes-stand-in";
@@ -60,7 +60,7 @@ pub fn write_then_read_round_trips<S: ObjectStore>(store: &S) {
 /// a no-op. Loose objects are content-addressed, so the same oid
 /// implies the same bytes; both impls must honor this without
 /// erroring out.
-pub fn write_loose_idempotent_on_repeat<S: ObjectStore>(store: &S) {
+pub(crate) fn write_loose_idempotent_on_repeat<S: ObjectStore>(store: &S) {
     let r = rid("conf-repo");
     let o = oid("2222222222222222222222222222222222222222");
     let payload = b"first-write";
@@ -73,7 +73,7 @@ pub fn write_loose_idempotent_on_repeat<S: ObjectStore>(store: &S) {
 /// `list_loose` returns every written object with a populated
 /// LooseInfo (oid + size + non-zero created_secs). Order is
 /// unspecified, so the test sorts before comparing.
-pub fn list_loose_enumerates_writes<S: ObjectStore>(store: &S) {
+pub(crate) fn list_loose_enumerates_writes<S: ObjectStore>(store: &S) {
     let r = rid("conf-repo");
     let oids = [
         "1111111111111111111111111111111111111111",
@@ -100,7 +100,7 @@ pub fn list_loose_enumerates_writes<S: ObjectStore>(store: &S) {
 /// not an error. This matches the FS shape where `objects/` may
 /// not exist yet and the chunked-KV shape where the repo's row
 /// set is empty.
-pub fn list_loose_empty_returns_empty_vec<S: ObjectStore>(store: &S) {
+pub(crate) fn list_loose_empty_returns_empty_vec<S: ObjectStore>(store: &S) {
     let listed = store.list_loose(&rid("nope")).unwrap();
     assert!(listed.is_empty(), "expected empty Vec, got {listed:?}");
 }
@@ -108,7 +108,7 @@ pub fn list_loose_empty_returns_empty_vec<S: ObjectStore>(store: &S) {
 /// `delete_loose` on a present oid returns `Ok(true)` then
 /// `Ok(false)` on a second call (idempotent removal). After
 /// delete, `read_loose` returns None. Both impls must satisfy.
-pub fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
+pub(crate) fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
     let r = rid("conf-repo");
     let o = oid("4444444444444444444444444444444444444444");
     store.write_loose(&r, &o, b"to-delete").unwrap();
@@ -127,7 +127,11 @@ pub fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
 /// `exists` agrees with `read_loose` for both present and absent
 /// oids. The trait promises this — a backend whose existence
 /// check disagrees with its body fetch is broken.
-pub fn exists_agrees_with_read<S: ObjectStore>(store: &S, repo_id: &RepoId, present_oid: &Oid) {
+pub(crate) fn exists_agrees_with_read<S: ObjectStore>(
+    store: &S,
+    repo_id: &RepoId,
+    present_oid: &Oid,
+) {
     assert!(
         store.exists(repo_id, present_oid).unwrap(),
         "exists must return true for a known-present oid",

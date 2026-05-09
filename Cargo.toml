@@ -10,10 +10,16 @@ license = "Apache-2.0"
 # binaries, tests, and benches. Run as `cargo clippy --all-targets --
 # -D warnings`, so every `warn` below is effectively a hard gate.
 [lints.rust]
-unused = "deny"
+# `unused` is a group, so it takes priority -1 to let the specific
+# lints below (and any future ones) override it.
+unused = { level = "deny", priority = -1 }
 # Forward guard: any future `unsafe fn` must wrap its own unsafe ops in
 # an explicit `unsafe {}` block rather than inheriting the fn's unsafety.
 unsafe_op_in_unsafe_fn = "deny"
+# Flag `pub` items that aren't actually reachable from outside the crate
+# so the public surface stays intentional — internal helpers become
+# `pub(crate)` rather than masquerading as API.
+unreachable_pub = "warn"
 
 [lints.clippy]
 # Adopt the pedantic group wholesale (priority -1 so the targeted
