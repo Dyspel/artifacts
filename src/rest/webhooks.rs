@@ -59,7 +59,7 @@ pub async fn create_webhook(
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
     let hook_id = state.observ.webhooks.add(crate::webhooks::Subscription {
         id: String::new(),
-        repo_id: id,
+        repo_id: id_typed,
         url: body.url,
         secret: body.secret,
         events: body.events,
@@ -85,7 +85,7 @@ pub async fn list_webhooks(
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
-    Ok(Json(state.observ.webhooks.list(&id)?))
+    Ok(Json(state.observ.webhooks.list(&id_typed)?))
 }
 
 /// DELETE /v1/repos/:id/webhooks/:hook_id
@@ -106,7 +106,7 @@ pub async fn delete_webhook(
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
-    let removed = state.observ.webhooks.remove(&id, &hook_id)?;
+    let removed = state.observ.webhooks.remove(&id_typed, &hook_id)?;
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
