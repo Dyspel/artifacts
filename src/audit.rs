@@ -69,7 +69,13 @@ pub fn hash_row(prev_hash: &[u8], evt: &AuditEvent) -> Vec<u8> {
     h.update([0]);
     h.update(evt.actor.as_bytes());
     h.update([0]);
-    h.update(evt.repo_id.as_deref().unwrap_or("").as_bytes());
+    h.update(
+        evt.repo_id
+            .as_ref()
+            .map(crate::ids::RepoId::as_str)
+            .unwrap_or("")
+            .as_bytes(),
+    );
     h.update([0]);
     h.update(evt.fields_json.as_bytes());
     h.update([0]);
@@ -95,7 +101,7 @@ pub struct AuditEvent {
     /// Target repo id when the event is repo-scoped. `None` for the
     /// admin-token rotation event (and other future global-scope events).
     #[serde(rename = "repoId", skip_serializing_if = "Option::is_none")]
-    pub repo_id: Option<String>,
+    pub repo_id: Option<crate::ids::RepoId>,
     /// Everything else, as a JSON object string. Caller serializes via
     /// `serde_json::Value` then `to_string()`. Empty `{}` is fine.
     #[serde(rename = "fields", skip_serializing_if = "String::is_empty")]
@@ -266,7 +272,7 @@ impl AuditStore for SqliteAuditStore {
                 evt.ts,
                 evt.event,
                 evt.actor,
-                evt.repo_id,
+                evt.repo_id.as_ref().map(crate::ids::RepoId::as_str),
                 evt.fields_json,
                 evt.request_id,
                 prev_hash,
@@ -319,7 +325,9 @@ impl AuditStore for SqliteAuditStore {
                 ts: row.get(1)?,
                 event: row.get(2)?,
                 actor: row.get(3)?,
-                repo_id: row.get(4)?,
+                repo_id: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| crate::ids::RepoId::try_from(s).ok()),
                 fields_json: row.get(5)?,
                 request_id: row.get(6)?,
             })
@@ -373,7 +381,9 @@ impl AuditStore for SqliteAuditStore {
                 ts: row.get(1)?,
                 event: row.get(2)?,
                 actor: row.get(3)?,
-                repo_id: row.get(4)?,
+                repo_id: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| crate::ids::RepoId::try_from(s).ok()),
                 fields_json: row.get(5)?,
                 request_id: row.get(6)?,
             };
@@ -502,7 +512,7 @@ pub async fn record(
     store: &dyn AuditStore,
     event: &str,
     actor: &str,
-    repo_id: Option<&str>,
+    repo_id: Option<&crate::ids::RepoId>,
     fields: serde_json::Value,
     request_id: Option<String>,
 ) {
@@ -510,7 +520,7 @@ pub async fn record(
         target: "audit",
         event,
         actor,
-        repo_id,
+        repo_id = repo_id.map(crate::ids::RepoId::as_str),
         fields = %fields,
     );
     record_silent(store, event, actor, repo_id, fields, request_id).await;
@@ -525,7 +535,7 @@ async fn record_silent(
     store: &dyn AuditStore,
     event: &str,
     actor: &str,
-    repo_id: Option<&str>,
+    repo_id: Option<&crate::ids::RepoId>,
     fields: serde_json::Value,
     request_id: Option<String>,
 ) {
@@ -546,7 +556,7 @@ async fn record_silent(
         ts: now_unix_secs(),
         event: event.to_string(),
         actor: actor.to_string(),
-        repo_id: repo_id.map(String::from),
+        repo_id: repo_id.cloned(),
         fields_json: fields.to_string(),
         request_id,
     };
@@ -579,7 +589,7 @@ mod tests {
             ts: now_unix_secs(),
             event: event.to_string(),
             actor: actor.to_string(),
-            repo_id: repo_id.map(String::from),
+            repo_id: repo_id.map(|s| crate::ids::RepoId::try_from(s).unwrap()),
             fields_json: "{}".to_string(),
             request_id: None,
         }
@@ -595,10 +605,10 @@ mod tests {
     #[tokio::test]
     async fn record_then_list_round_trips() {
         let (_d, s) = store();
-        s.record(evt("repo.create", "admin", Some("r1")))
+        s.record(evt("repo.create", "admin", Some("repo-1")))
             .await
             .unwrap();
-        s.record(evt("token.mint", "u-42", Some("r1")))
+        s.record(evt("token.mint", "u-42", Some("repo-1")))
             .await
             .unwrap();
         let rows = s.list(AuditQuery::default()).await.unwrap();
@@ -613,13 +623,13 @@ mod tests {
     #[tokio::test]
     async fn list_filters_by_event_actor_repo() {
         let (_d, s) = store();
-        s.record(evt("repo.create", "admin", Some("r1")))
+        s.record(evt("repo.create", "admin", Some("repo-1")))
             .await
             .unwrap();
-        s.record(evt("repo.create", "u-1", Some("r2")))
+        s.record(evt("repo.create", "u-1", Some("repo-2")))
             .await
             .unwrap();
-        s.record(evt("token.mint", "u-1", Some("r2")))
+        s.record(evt("token.mint", "u-1", Some("repo-2")))
             .await
             .unwrap();
 
@@ -645,13 +655,15 @@ mod tests {
 
         let by_repo = s
             .list(AuditQuery {
-                repo_id: Some("r2".into()),
+                repo_id: Some("repo-2".into()),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(by_repo.len(), 2);
-        assert!(by_repo.iter().all(|r| r.repo_id.as_deref() == Some("r2")));
+        assert!(by_repo
+            .iter()
+            .all(|r| r.repo_id.as_ref().map(crate::ids::RepoId::as_str) == Some("repo-2")));
     }
 
     #[tokio::test]
@@ -773,7 +785,7 @@ mod tests {
         let path = dir.path().join("audit.db");
         {
             let s = SqliteAuditStore::open(&path).unwrap();
-            s.record(evt("repo.create", "admin", Some("r1")))
+            s.record(evt("repo.create", "admin", Some("repo-1")))
                 .await
                 .unwrap();
         }
@@ -826,11 +838,12 @@ mod tests {
         // wires up. Failure swallowing is the same code path; we
         // assert it doesn't panic and updates nothing observable.
         let s = NoopAuditStore;
+        let rid = crate::ids::RepoId::try_from("repo-1").unwrap();
         record_silent(
             &s,
             "repo.create",
             "admin",
-            Some("r1"),
+            Some(&rid),
             serde_json::json!({"k": "v"}),
             None,
         )

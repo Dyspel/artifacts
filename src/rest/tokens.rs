@@ -76,7 +76,7 @@ pub async fn mint_token(
         &*state.observ.audit,
         "token.mint",
         principal.audit_label(),
-        Some(&id),
+        Some(&id_typed),
         serde_json::json!({
             "scope": format!("{:?}", body.scope),
             "ttl_seconds": body.ttl_seconds,
@@ -132,14 +132,14 @@ pub async fn revoke_token(
     // ownership check. Admins skip the ownership check but we
     // still want the audit field populated; for a stale-or-fake
     // token there's nothing to bind to so log "unknown".
-    let target_repo: Option<String> = state
+    let target_repo: Option<crate::ids::RepoId> = state
         .authn
         .tokens
         .lookup(&body.token)
         .await
         .ok()
         .flatten()
-        .map(|rec| rec.repo_id.as_str().to_owned());
+        .map(|rec| rec.repo_id);
 
     if !matches!(principal, crate::auth::Principal::Admin) {
         // Look up the token's bound repo and require ownership. Any
@@ -148,9 +148,9 @@ pub async fn revoke_token(
         // alternative leaks "this token doesn't exist" to anyone with
         // a JWT — slight oracle for token-fishing.
         let repo_id = target_repo
-            .as_deref()
+            .as_ref()
             .ok_or(Error::Forbidden("not your token"))?;
-        enforce_owner(&*state.data.ownership, &principal, repo_id).await?;
+        enforce_owner(&*state.data.ownership, &principal, repo_id.as_str()).await?;
     }
 
     let revoked = state.authn.tokens.revoke(&body.token).await?;
@@ -158,7 +158,7 @@ pub async fn revoke_token(
         &*state.observ.audit,
         "token.revoke",
         principal.audit_label(),
-        target_repo.as_deref(),
+        target_repo.as_ref(),
         serde_json::json!({ "revoked": revoked }),
         None,
     )
@@ -279,7 +279,7 @@ pub async fn rotate_tokens(
         &*state.observ.audit,
         "token.rotate",
         principal.audit_label(),
-        Some(&id),
+        Some(&id_typed),
         serde_json::json!({
             "revoked": revoked,
             "scope": format!("{:?}", scope),

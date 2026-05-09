@@ -84,7 +84,7 @@ pub async fn create_repo(
         &*state.observ.audit,
         "repo.create",
         principal.audit_label(),
-        Some(&id_str),
+        Some(&id_typed),
         serde_json::json!({}),
         None,
     )
@@ -174,7 +174,7 @@ pub async fn fork_repo(
         &*state.observ.audit,
         "repo.fork",
         principal.audit_label(),
-        Some(&fork_id_str),
+        Some(&fork_id_typed),
         serde_json::json!({ "source_id": source_id, "read_only": read_only }),
         None,
     )
@@ -221,6 +221,7 @@ pub async fn delete_repo(
     )?;
     state.authn.rate_limit.check(&principal, Class::Default)?;
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
 
     let force = q.force.unwrap_or(false);
     let cascade = q.cascade.unwrap_or(false);
@@ -250,7 +251,7 @@ pub async fn delete_repo(
             &*state.observ.audit,
             "repo.delete",
             principal.audit_label(),
-            Some(&id),
+            Some(&id_typed),
             serde_json::json!({
                 "mode": "cascade",
                 "count": deleted.len(),
@@ -280,7 +281,6 @@ pub async fn delete_repo(
         }
     }
 
-    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
     state.data.storage.delete(&id_typed)?;
     state.data.ownership.delete(&id_typed).await?;
     state.data.alternates_cache.invalidate(&id);
@@ -289,7 +289,7 @@ pub async fn delete_repo(
         &*state.observ.audit,
         "repo.delete",
         principal.audit_label(),
-        Some(&id),
+        Some(&id_typed),
         serde_json::json!({ "mode": mode }),
         None,
     )
