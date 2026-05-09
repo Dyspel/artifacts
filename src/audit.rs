@@ -43,7 +43,6 @@ use async_trait::async_trait;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -228,17 +227,7 @@ const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
     },
 ];
 
-impl SqliteAuditStore {
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = crate::db_migrate::open_pool_with_migrations(path, "audit", &MIGRATIONS)?;
-        Ok(Self { conn })
-    }
-
-    /// Expose the pool so periodic tasks can publish pool gauges.
-    pub(crate) fn pool(&self) -> &DbPool {
-        &self.conn
-    }
-}
+crate::db_migrate::sqlite_store_boilerplate!(SqliteAuditStore, "audit", MIGRATIONS);
 
 /// Result of a successful `verify_chain` run.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -251,7 +240,7 @@ pub struct ChainVerifyOk {
 #[async_trait]
 impl AuditStore for SqliteAuditStore {
     async fn record(&self, evt: AuditEvent) -> Result<()> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         // Read the most-recent chained row's hash under the same
         // lock so a concurrent recorder can't insert between the
         // SELECT and the INSERT. The first row of a fresh chain
@@ -288,7 +277,7 @@ impl AuditStore for SqliteAuditStore {
     }
 
     async fn list(&self, q: AuditQuery) -> Result<Vec<AuditEvent>> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         let limit = q.limit.unwrap_or(100).min(1000) as i64;
 
         // Build the WHERE clause + bound parameters in lockstep so the
@@ -343,20 +332,20 @@ impl AuditStore for SqliteAuditStore {
     }
 
     async fn count(&self) -> Result<u64> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
         Ok(n.max(0) as u64)
     }
 
     async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         let affected =
             conn.execute("DELETE FROM audit_events WHERE ts < ?1", params![cutoff_ts])?;
         Ok(affected as u64)
     }
 
     async fn probe_write(&self) -> Result<()> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _probe (k INTEGER PRIMARY KEY);
              INSERT OR REPLACE INTO _probe (k) VALUES (1);
@@ -366,7 +355,7 @@ impl AuditStore for SqliteAuditStore {
     }
 
     async fn verify_chain(&self) -> Result<ChainVerifyOk> {
-        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        let conn = self.pooled()?;
         let mut stmt = conn.prepare(
             "SELECT id, ts, event, actor, repo_id, fields_json, request_id,
                     prev_hash, row_hash

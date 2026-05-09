@@ -175,6 +175,59 @@ pub fn open_pool_with_migrations(
         .map_err(|e| Error::Other(anyhow::anyhow!("build sqlite pool: {e}")))
 }
 
+/// Generate the boilerplate every single-pool SQLite store shares:
+/// the migration-running `open()` constructor, a `pool()` accessor for
+/// the periodic gauge refreshers, and a metrics-labelled `pooled()`
+/// connection checkout. The store `struct` (with its own doc comment)
+/// is still declared by hand; this only fills in the three methods that
+/// are character-for-character identical across stores apart from the
+/// label string. The label lived inline at ~26 call sites before this —
+/// now it's named exactly once, at the invocation.
+///
+/// Requires the type to have a single `conn: DbPool` field. Stores with
+/// extra state (e.g. `SqliteWebhookRegistry`, which also holds a master
+/// key) keep their hand-written versions.
+///
+/// Invoke at module scope after the struct:
+/// `sqlite_store_boilerplate!(SqliteTokenStore, "tokens", MIGRATIONS);`
+macro_rules! sqlite_store_boilerplate {
+    ($store:ty, $label:literal, $migrations:path) => {
+        impl $store {
+            /// Open (or create) the backing SQLite database at `path`
+            /// and apply all pending migrations.
+            ///
+            /// # Errors
+            /// Returns an error if the database can't be opened, a
+            /// migration fails, or the pool can't be built.
+            pub fn open(path: &::std::path::Path) -> $crate::error::Result<Self> {
+                Ok(Self {
+                    conn: $crate::db_migrate::open_pool_with_migrations(
+                        path,
+                        $label,
+                        &$migrations,
+                    )?,
+                })
+            }
+
+            /// The connection pool, exposed for the periodic
+            /// active-rows gauge refreshers.
+            pub(crate) fn pool(&self) -> &$crate::db_migrate::DbPool {
+                &self.conn
+            }
+
+            /// Check out a pooled connection, recording the wait under
+            /// this store's metrics label. `Err` on pool exhaustion.
+            fn pooled(
+                &self,
+            ) -> $crate::error::Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>
+            {
+                $crate::metrics::get_pooled(&self.conn, $label)
+            }
+        }
+    };
+}
+pub(crate) use sqlite_store_boilerplate;
+
 /// Helper for migrations that add a column to an existing table.
 /// `PRAGMA table_info(<table>)` is consulted up front; the ALTER only
 /// fires if `column` is missing. Cleaner than running the ALTER and

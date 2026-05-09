@@ -33,7 +33,6 @@ use rand::Rng;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -222,17 +221,9 @@ const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
     },
 ];
 
+crate::db_migrate::sqlite_store_boilerplate!(SqliteTokenStore, "tokens", MIGRATIONS);
+
 impl SqliteTokenStore {
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = crate::db_migrate::open_pool_with_migrations(path, "tokens", &MIGRATIONS)?;
-        Ok(Self { conn })
-    }
-
-    /// Expose the pool so periodic tasks can publish pool gauges.
-    pub(crate) fn pool(&self) -> &DbPool {
-        &self.conn
-    }
-
     /// Delete rows that are guaranteed to never authorize a request again:
     /// revoked tokens, and tokens whose expiry has passed by more than a
     /// grace window. Returns the number of rows removed.
@@ -248,7 +239,7 @@ impl SqliteTokenStore {
     pub async fn prune(&self, expiry_grace: Duration) -> Result<u64> {
         let now = now_secs() as i64;
         let expiry_cutoff = now.saturating_sub(expiry_grace.as_secs() as i64);
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         // `<=` not `<` mirrors lookup semantics: a row with
         // `expires_at == now` is already unusable (lookup uses
         // `expires_at > now`), so it's logically expired and prunable.
@@ -353,7 +344,7 @@ impl TokenStore for SqliteTokenStore {
         let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         conn.execute(
             "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at, subject)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -372,7 +363,7 @@ impl TokenStore for SqliteTokenStore {
     async fn lookup(&self, token: &Token) -> Result<Option<TokenRecord>> {
         let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         // Side note on the `WHERE token_hash = ?1` compare: SQLite's
         // btree comparator is not byte-wise constant-time, but the
         // value it compares is `sha256_hex(token)`. A timing oracle
@@ -421,7 +412,7 @@ impl TokenStore for SqliteTokenStore {
     async fn revoke(&self, token: &Token) -> Result<bool> {
         let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         let affected = conn.execute(
             "UPDATE tokens SET revoked_at = ?1
              WHERE token_hash = ?2 AND revoked_at IS NULL",
@@ -431,7 +422,7 @@ impl TokenStore for SqliteTokenStore {
     }
 
     async fn probe_write(&self) -> Result<()> {
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _probe (k INTEGER PRIMARY KEY);
              INSERT OR REPLACE INTO _probe (k) VALUES (1);
@@ -442,7 +433,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn revoke_all_for_repo(&self, repo_id: &RepoId) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         // We only flip rows that are still authorizing — already-expired
         // tokens are dead anyway, so leaving their `revoked_at` NULL keeps
         // the audit trail honest ("this token expired" vs "this token was
@@ -459,7 +450,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn count_active(&self) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         // Mirrors the lookup predicate exactly — a row is active iff it
         // would currently resolve to a TokenRecord. Pruning is what
         // keeps this aggregate cheap; an unbounded `tokens` table with
@@ -482,7 +473,7 @@ impl TokenStore for SqliteTokenStore {
         subject_filter: Option<&Subject>,
     ) -> Result<Vec<TokenSummary>> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        let conn = self.pooled()?;
         let mut stmt = conn.prepare_cached(
             "SELECT token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject
              FROM tokens
