@@ -348,7 +348,7 @@ pub async fn list_repos(
                     .await?,
                 state.data.ownership.count_by_owner(&subject_typed).await?,
             )
-        }
+        },
     };
 
     if offset == 0 && total > limit as u64 {

@@ -135,7 +135,7 @@ pub(crate) fn lock_state(state: &Mutex<AppState>) -> MutexGuard<'_, AppState> {
                  continuing with recovered state"
             );
             poisoned.into_inner()
-        }
+        },
     }
 }
 
@@ -145,7 +145,7 @@ pub(crate) fn lock_selection(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option
         Err(poisoned) => {
             tracing::error!("selection mutex was poisoned; recovering");
             poisoned.into_inner()
-        }
+        },
     }
 }
 
@@ -179,14 +179,14 @@ pub(crate) fn spawn_poller(
                     }
                 }
                 drop(s);
-            }
+            },
             Err(e) => {
                 let mut s = lock_state(&state);
                 s.last_error = Some(format!("{e:#}"));
                 // Keep going to the detail fetch anyway — list and
                 // detail have independent failure modes.
                 drop(s);
-            }
+            },
         }
 
         // Second leg: if a repo is selected, keep its detail fresh.
@@ -202,10 +202,10 @@ pub(crate) fn spawn_poller(
                     if detail.id == id {
                         s.detail = Some(detail);
                     }
-                }
+                },
                 Err(e) => {
                     lock_state(&state).last_error = Some(format!("detail {id}: {e:#}"));
-                }
+                },
             }
         } else {
             // No selection → drop any stale detail so the Detail tab

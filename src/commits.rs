@@ -197,7 +197,7 @@ pub async fn create_commit(
                         return Err(Error::BadRequest(format!(
                             "change for {path}: only one of content/contentBase64"
                         )));
-                    }
+                    },
                     (None, None) => Vec::new(),
                     (Some(s), None) => s.into_bytes(),
                     (None, Some(b64)) => B64.decode(b64).map_err(|e| {
@@ -217,10 +217,10 @@ pub async fn create_commit(
                     _ => unreachable!("mode validated above"),
                 };
                 prepared_changes.push(PreparedChange::Write { path, bytes, kind });
-            }
+            },
             Change::Delete { path } => {
                 prepared_changes.push(PreparedChange::Delete { path });
-            }
+            },
         }
     }
 
@@ -274,7 +274,7 @@ pub async fn create_commit(
         )
         .await?
     {
-        CasOutcome::Updated => {}
+        CasOutcome::Updated => {},
         CasOutcome::Conflict { current } => {
             tracing::info!(
                 repo = %repo_id, branch = %body.branch,
@@ -286,7 +286,7 @@ pub async fn create_commit(
                 expected: body.parent,
                 current,
             });
-        }
+        },
     }
 
     // Post-CAS, pre-response: fan-out to subscribers. Message is truncated
@@ -366,7 +366,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
                 .tree_id()
                 .map_err(|e| Error::GixError(format!("parent {sha} tree_id: {e}")))?
                 .detach()
-        }
+        },
         None => gix::ObjectId::empty_tree(gix::hash::Kind::Sha1),
     };
 
@@ -384,12 +384,12 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
                 editor
                     .upsert(path.as_str(), *kind, blob_id)
                     .map_err(|e| Error::GixError(format!("tree upsert {path}: {e}")))?;
-            }
+            },
             PreparedChange::Delete { path } => {
                 editor
                     .remove(path.as_str())
                     .map_err(|e| Error::GixError(format!("tree remove {path}: {e}")))?;
-            }
+            },
         }
     }
 
@@ -420,7 +420,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
             let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes())
                 .map_err(|e| Error::GixError(format!("parent {sha}: {e}")))?;
             smallvec::smallvec![oid]
-        }
+        },
         None => smallvec::SmallVec::new(),
     };
 

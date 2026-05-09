@@ -157,7 +157,7 @@ impl eframe::App for App {
                     {
                         self.select_repo(clicked);
                     }
-                }
+                },
                 View::Forks => {
                     if let Some(clicked) = forks::render_forks(
                         ui,
@@ -169,7 +169,7 @@ impl eframe::App for App {
                     ) {
                         self.select_repo(clicked);
                     }
-                }
+                },
                 View::Detail => detail::render_detail(ui, &snapshot, self.selected_repo.as_deref()),
             }
         });

@@ -1,0 +1,14 @@
+# Pinned formatting policy so `cargo fmt` is reproducible across
+# contributors and CI rather than tracking whatever the local toolchain
+# defaults to. All options below are stable.
+edition = "2021"
+# Collapse `Foo { x: x }` to `Foo { x }`.
+use_field_init_shorthand = true
+# Prefer the `?` operator over the legacy `try!` macro.
+use_try_shorthand = true
+# Trailing comma after a block-bodied match arm, for clean diffs when
+# arms are added/removed.
+match_block_trailing_comma = true
+# Deterministic import ordering (explicit; this is the default, pinned so
+# it can't drift if the default ever changes).
+reorder_imports = true

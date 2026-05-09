@@ -180,14 +180,14 @@ pub async fn sse_stream(
             // serde_json::to_string is infallible on our types; unwrap is fine.
             let payload = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
             Some(Ok(SseEvent::default().data(payload)))
-        }
+        },
         // Lag: serialize how many we dropped so the subscriber can log
         // or force-reload. Dropping the error entirely would silently
         // corrupt the UI's view of the stream.
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
             let payload = serde_json::json!({ "kind": "lag", "dropped": n });
             Some(Ok(SseEvent::default().data(payload.to_string())))
-        }
+        },
     });
     // KeepAlive sends a `:keepalive` comment every 15s so intermediaries
     // (nginx default idle timeout is 60s) don't close long-lived idle

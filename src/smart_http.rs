@@ -115,10 +115,10 @@ pub async fn git_handler(
             // is on, in which case we shell out for parity with
             // the v0/v1 path.
             info_refs(&repo_path, service, request.headers(), state.disable_native).await
-        }
+        },
         ("POST", "git-upload-pack") => {
             pack_handler(&repo_path, "upload-pack", request, native_ctx).await
-        }
+        },
         ("POST", "git-receive-pack") => {
             // Soft per-repo byte quota. Cheap dir walk before we
             // burn the request body's bandwidth + the pack-index
@@ -133,7 +133,7 @@ pub async fn git_handler(
             // (push) or read (fetch). The function then decides per-request
             // whether the body shape is one we natively handle.
             pack_handler(&repo_path, "receive-pack", request, native_ctx).await
-        }
+        },
         _ => Err(Error::BadRequest(format!(
             "unsupported git endpoint: {method} /{rest}"
         ))),
@@ -344,7 +344,7 @@ async fn pack_handler(
                     );
                     return native_receive_pack_response(repo_path, repo_id, refs, objects, req)
                         .await;
-                }
+                },
                 Some(req) => {
                     tracing::debug!(
                         repo = %repo_id,
@@ -354,14 +354,14 @@ async fn pack_handler(
                         updates = req.updates.len(),
                         "receive-pack native dispatch declined; falling through"
                     );
-                }
+                },
                 None => {
                     tracing::debug!(
                         repo = %repo_id,
                         body_first_64 = ?String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(64)]),
                         "receive-pack body did not parse; falling through"
                     );
-                }
+                },
             }
         }
     }
@@ -506,7 +506,7 @@ async fn native_receive_pack_response(
                 unpack_objects_via_subprocess(repo_path, &req.pack)
                     .await
                     .map_err(|e| format!("{e}"))
-            }
+            },
         }
     } else {
         unpack_objects_via_subprocess(repo_path, &req.pack)
@@ -658,7 +658,7 @@ async fn apply_ref_update(
             // when the local ref doesn't match what the server already has.
             let _ = current;
             Err("non-fast-forward".to_string())
-        }
+        },
         Err(e) => Err(format!("error {e}")),
     }
 }

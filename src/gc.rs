@@ -244,15 +244,15 @@ pub fn run(
                 deleted += 1;
                 deleted_bytes += info.size;
                 tracing::debug!(oid = %info.oid, bytes = info.size, "gc: removed");
-            }
+            },
             // Already gone — concurrent gc, or a race. Treat as a
             // no-op rather than counting toward `deleted`.
-            Ok(false) => {}
+            Ok(false) => {},
             Err(e) => {
                 // Soft-fail per object — a permission error or
                 // racy unlink shouldn't abort the whole pass.
                 tracing::warn!(oid = %info.oid, error = %e, "gc: remove failed");
-            }
+            },
         }
     }
     tracing::info!(
@@ -355,7 +355,7 @@ fn run_sweep(
                 "gc sweep: read_dir failed"
             );
             return;
-        }
+        },
     };
     let mut total_deleted = 0u64;
     let mut total_bytes = 0u64;
@@ -383,7 +383,7 @@ fn run_sweep(
             Ok(r) => {
                 total_deleted += r.deleted;
                 total_bytes += r.deleted_bytes;
-            }
+            },
             Err(e) => {
                 // Per-repo errors are soft — a broken repo in one
                 // corner shouldn't abort the whole sweep.
@@ -391,7 +391,7 @@ fn run_sweep(
                     repo = %repo_id, error = %e,
                     "gc sweep: per-repo run failed; skipping"
                 );
-            }
+            },
         }
     }
     if total_deleted > 0 || total_bytes > 0 {

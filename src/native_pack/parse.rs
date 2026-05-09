@@ -193,7 +193,7 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
                 base_oid.copy_from_slice(&pack[cursor..cursor + 20]);
                 cursor += 20;
                 ParsedKind::RefDelta { base_oid }
-            }
+            },
             OBJ_OFS_DELTA => {
                 let (base_offset_delta, consumed) = parse_ofs_delta_offset(&pack[cursor..])
                     .map_err(|e| {
@@ -203,12 +203,12 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
                     })?;
                 cursor += consumed;
                 ParsedKind::OfsDelta { base_offset_delta }
-            }
+            },
             other => {
                 return Err(Error::PackParse(format!(
                     "entry {i}: unknown object type {other}"
                 )));
-            }
+            },
         };
 
         // The deflated body must inflate to exactly `declared_size`
@@ -346,7 +346,7 @@ fn decompress_zlib(bytes: &[u8], max_out: usize) -> Result<(Vec<u8>, usize)> {
                         "zlib stalled (no progress on Ok/BufError)".to_string(),
                     ));
                 }
-            }
+            },
             Status::StreamEnd => break,
         }
     }
@@ -422,12 +422,12 @@ pub(crate) fn store_non_delta_entries<S: ObjectStore + ?Sized>(
                 let loose = loose_format_bytes(kind, &entry.data)?;
                 store.write_loose(repo_id, &oid, &loose)?;
                 count += 1;
-            }
+            },
             ParsedKind::RefDelta { .. } | ParsedKind::OfsDelta { .. } => {
                 return Err(Error::PackParse(format!(
                     "entry {i}: delta entries not yet supported (D2/D3)"
                 )));
-            }
+            },
         }
     }
     Ok(count)
@@ -614,7 +614,7 @@ fn read_loose_inflated<S: ObjectStore + ?Sized>(
             return Err(Error::PackParse(format!(
                 "loose {oid}: unknown kind {other:?}"
             )));
-        }
+        },
     };
     let payload = inflated[nul + 1..].to_vec();
     Ok(Some((kind, payload)))
@@ -687,7 +687,7 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
                 ParsedKind::RefDelta { base_oid } => {
                     let base_hex = hex_oid(base_oid);
                     read_loose_inflated(store, repo_id, &base_hex)?
-                }
+                },
                 ParsedKind::OfsDelta { base_offset_delta } => {
                     let delta = usize::try_from(*base_offset_delta).map_err(|_| {
                         Error::PackParse(format!("entry {i}: OFS_DELTA offset doesn't fit usize"))
@@ -704,7 +704,7 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
                         ))
                     })?;
                     resolved.get(&base_idx).cloned()
-                }
+                },
             };
             let Some((base_kind, base_payload)) = outcome else {
                 still_pending.push(i);
@@ -1109,7 +1109,7 @@ mod tests {
                 ParsedKind::Direct(ObjectKind::Commit) => have_commit = true,
                 ParsedKind::Direct(ObjectKind::Tree) => have_tree = true,
                 ParsedKind::Direct(ObjectKind::Blob) => have_blob = true,
-                _ => {}
+                _ => {},
             }
         }
         assert!(have_commit && have_tree && have_blob);

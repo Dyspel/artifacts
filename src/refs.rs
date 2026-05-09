@@ -183,7 +183,7 @@ impl RefStore for FsRefStore {
                     "rev-parse stdout was not a valid Oid"
                 );
                 Ok(None)
-            }
+            },
         }
     }
 
@@ -719,10 +719,10 @@ mod tests {
             {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_ref(), Some(&oid2),);
-                }
+                },
                 other @ CasOutcome::Updated => {
                     panic!("expected Updated-free conflict, got {other:?}")
-                }
+                },
             }
         }
 
@@ -792,10 +792,10 @@ mod tests {
             match s.cas_delete(&repo, &rname, Some(&oid_old)).await.unwrap() {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_ref(), Some(&oid_new));
-                }
+                },
                 other @ CasOutcome::Updated => {
                     panic!("expected Updated-free conflict, got {other:?}")
-                }
+                },
             }
             // Ref is still present — delete didn't happen.
             assert!(s.read(&repo, &rname).await.unwrap().is_some());
@@ -914,7 +914,7 @@ mod tests {
             HeadState::Symbolic { target, oid } => {
                 assert_eq!(target.as_str(), "refs/test/x");
                 assert_eq!(oid.as_str(), s.as_str());
-            }
+            },
             other => panic!("expected Symbolic, got {other:?}"),
         }
     }
@@ -1002,7 +1002,7 @@ mod tests {
         {
             CasOutcome::Conflict { current } => {
                 assert_eq!(current.as_ref(), Some(&s2));
-            }
+            },
             other @ CasOutcome::Updated => panic!("wanted conflict, got {other:?}"),
         }
     }

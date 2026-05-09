@@ -140,7 +140,7 @@ pub async fn merge_branches(
                 "source branch does not exist: {}",
                 body.source_branch
             )));
-        }
+        },
     };
     validate_sha(&source_sha)?;
 
@@ -209,14 +209,14 @@ pub async fn merge_branches(
                     source_commit: source_sha,
                     target_branch: body.target_branch,
                 }));
-            }
+            },
             CasOutcome::Conflict { current } => {
                 return Err(Error::RefConflict {
                     branch: body.target_branch,
                     expected: target_sha_typed,
                     current,
                 });
-            }
+            },
         }
     }
 
@@ -248,7 +248,7 @@ pub async fn merge_branches(
                 source_branch: body.source_branch,
                 conflict_paths: paths,
             });
-        }
+        },
     };
 
     // 7. Build the merge commit. Two parents: target first (the branch we're
@@ -305,7 +305,7 @@ pub async fn merge_branches(
         )
         .await?
     {
-        CasOutcome::Updated => {}
+        CasOutcome::Updated => {},
         CasOutcome::Conflict { current } => {
             tracing::info!(
                 repo = %repo_id, branch = %body.target_branch,
@@ -317,7 +317,7 @@ pub async fn merge_branches(
                 expected: Some(target_sha_typed),
                 current,
             });
-        }
+        },
     }
 
     // Three-way merge commit — emit under the target branch so the event

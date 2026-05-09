@@ -307,7 +307,7 @@ pub async fn admin_rotate_jwt_key(
                     "jwt key file rewrite failed; persist `key` from response manually",
                 );
                 false
-            }
+            },
         }
     } else {
         false

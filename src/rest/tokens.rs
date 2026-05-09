@@ -217,7 +217,7 @@ pub async fn list_tokens(
         crate::auth::Principal::Admin => None,
         crate::auth::Principal::User { subject } => {
             Some(crate::ids::Subject::try_from(subject.as_str())?)
-        }
+        },
     };
     let rows = state
         .authn

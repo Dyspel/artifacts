@@ -410,7 +410,7 @@ impl TokenStore for SqliteTokenStore {
                     "tokens.lookup: row repo_id malformed; treating as absent"
                 );
                 return Ok(None);
-            }
+            },
         };
         Ok(Some(TokenRecord {
             repo_id,
@@ -521,7 +521,7 @@ impl TokenStore for SqliteTokenStore {
                         "tokens.list_for_repo: row repo_id malformed; skipping"
                     );
                     continue;
-                }
+                },
             };
             let subject = match subject_raw.as_deref() {
                 Some(s) => match Subject::try_from(s) {
@@ -532,7 +532,7 @@ impl TokenStore for SqliteTokenStore {
                             "tokens.list_for_repo: row subject malformed; surfacing as admin-minted"
                         );
                         None
-                    }
+                    },
                 },
                 None => None,
             };

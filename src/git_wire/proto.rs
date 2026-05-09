@@ -138,7 +138,7 @@ pub fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
             PktLine::Delim => {
                 saw_delim = true;
                 break;
-            }
+            },
             PktLine::Flush => {
                 // No args section at all — still a valid ls-refs.
                 return Some(LsRefsArgs {
@@ -146,13 +146,13 @@ pub fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
                     symrefs: false,
                     prefixes: Vec::new(),
                 });
-            }
+            },
             PktLine::Data(d) => {
                 let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
                 if !is_known_capability(s) {
                     return None;
                 }
-            }
+            },
             PktLine::RespEnd => return None,
         }
     }
@@ -172,7 +172,7 @@ pub fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
                     symrefs,
                     prefixes,
                 });
-            }
+            },
             PktLine::Data(d) => {
                 let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
                 if s == "peel" {
@@ -189,7 +189,7 @@ pub fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
                     // Unknown argument — fall through to subprocess.
                     return None;
                 }
-            }
+            },
             PktLine::Delim | PktLine::RespEnd => return None,
         }
     }
@@ -227,17 +227,17 @@ pub fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
             PktLine::Delim => {
                 saw_delim = true;
                 break;
-            }
+            },
             PktLine::Flush => {
                 // No args at all is malformed for fetch — reject.
                 return None;
-            }
+            },
             PktLine::Data(d) => {
                 let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
                 if !is_known_capability(s) {
                     return None;
                 }
-            }
+            },
             PktLine::RespEnd => return None,
         }
     }
@@ -278,7 +278,7 @@ pub fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
                     // through to upload-pack.
                     req.has_unsupported = true;
                 }
-            }
+            },
             PktLine::Delim | PktLine::RespEnd => return None,
         }
     }
@@ -315,7 +315,7 @@ pub fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
             PktLine::Flush => {
                 buf = rest;
                 break;
-            }
+            },
             PktLine::Data(d) => {
                 let s = std::str::from_utf8(d).ok()?.trim_end_matches('\n');
                 // First line carries capabilities after a NUL byte.
@@ -342,7 +342,7 @@ pub fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
                     if let Some(caps) = caps {
                         for c in caps.split(' ') {
                             match c {
-                                "" => {}
+                                "" => {},
                                 "report-status" | "report-status-v2" => {
                                     // We emit the v1 report shape
                                     // (`ok <ref>` / `ng <ref> <reason>`).
@@ -350,26 +350,26 @@ pub fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
                                     // which we never produce, so the v1
                                     // shape is also a valid v2 report.
                                     req.has_report_status = true;
-                                }
+                                },
                                 "side-band-64k" => req.has_sideband_64k = true,
-                                "ofs-delta" | "delete-refs" | "no-thin" | "quiet" => {}
+                                "ofs-delta" | "delete-refs" | "no-thin" | "quiet" => {},
                                 "atomic" | "push-options" | "push-cert" => {
                                     req.has_unsupported = true;
-                                }
+                                },
                                 other
                                     if other.starts_with("agent=")
                                         || other.starts_with("session-id=")
                                         || other.starts_with("object-format=") =>
                                 {
                                     // Informational, ignore.
-                                }
+                                },
                                 _ => {
                                     // Unknown caps trip the safety
                                     // net: better to fall through to
                                     // receive-pack than serve a
                                     // wrong response.
                                     req.has_unsupported = true;
-                                }
+                                },
                             }
                         }
                     } else {
@@ -381,7 +381,7 @@ pub fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
                     first = false;
                 }
                 buf = rest;
-            }
+            },
             PktLine::Delim | PktLine::RespEnd => return None,
         }
     }

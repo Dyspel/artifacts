@@ -388,7 +388,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
                 Err(e) => {
                     tracing::warn!(error = %e, "webhook secret seal failed; storing NULL");
                     (None, None)
-                }
+                },
             },
             None => (None, None),
         };
@@ -449,7 +449,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             Err(e) => {
                 tracing::warn!(error = %e, repo_id, "webhook matching: list failed; treating as no matches");
                 Vec::new()
-            }
+            },
         }
     }
 
@@ -523,7 +523,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
                              dropping secret for this delivery"
                         );
                         None
-                    }
+                    },
                 },
                 None => None,
             };
@@ -622,7 +622,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
                                 "claim_pending: secret unseal failed; sending unsigned"
                             );
                             None
-                        }
+                        },
                     },
                     Err(_) => {
                         tracing::warn!(
@@ -630,7 +630,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
                             "claim_pending: nonce wrong length; sending unsigned"
                         );
                         None
-                    }
+                    },
                 },
                 _ => None,
             };
@@ -813,7 +813,7 @@ fn row_to_sub(
                         secret: None,
                         events,
                     });
-                }
+                },
             };
             let ct = match BASE64_STD.decode(ct_b64.as_bytes()) {
                 Ok(b) => b,
@@ -826,7 +826,7 @@ fn row_to_sub(
                         secret: None,
                         events,
                     });
-                }
+                },
             };
             match crate::secrets::unseal(key, &ct, &nonce) {
                 Ok(pt) => match String::from_utf8(pt) {
@@ -834,14 +834,14 @@ fn row_to_sub(
                     Err(_) => {
                         tracing::warn!(hook_id = %id, "webhook secret not valid UTF-8 after unseal");
                         None
-                    }
+                    },
                 },
                 Err(e) => {
                     tracing::warn!(hook_id = %id, error = %e, "webhook secret unseal failed");
                     None
-                }
+                },
             }
-        }
+        },
     };
 
     Ok(Subscription {
@@ -1155,7 +1155,7 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
                 )
                 .increment(1);
             }
-        }
+        },
         Err(e) => {
             // Network / transport / timeout — all retryable.
             if row.attempts >= WORKER_MAX_ATTEMPTS {
@@ -1169,7 +1169,7 @@ fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
                     "webhook delivery failed; will retry"
                 );
             }
-        }
+        },
     }
 }
 
@@ -1198,7 +1198,7 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
         Err(e) => {
             tracing::error!(error = %e, "webhook serialize failed");
             return;
-        }
+        },
     };
     // Try the durable outbox first. Ok(n) with n > 0 means rows are
     // queued; the delivery worker picks them up on its next tick.
@@ -1206,12 +1206,12 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
     // implement enqueue (MemRegistry default) — fall back to legacy
     // direct dispatch so the in-memory test path still fires hooks.
     match registry.enqueue_delivery(repo_id, kind, &body) {
-        Ok(n) if n > 0 => {}
+        Ok(n) if n > 0 => {},
         Ok(_) => legacy_direct_dispatch(registry, ev, body),
         Err(e) => {
             tracing::error!(error = %e, "webhook enqueue failed; falling back to direct dispatch");
             legacy_direct_dispatch(registry, ev, body);
-        }
+        },
     }
 }
 
@@ -1265,7 +1265,7 @@ fn legacy_direct_dispatch(registry: &dyn WebhookRegistry, ev: &Event, body: Vec<
                             "legacy direct-dispatch: non-2xx (single attempt)"
                         );
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(
                         hook = %sub.id, url = %sub.url, error = %e,
@@ -1277,7 +1277,7 @@ fn legacy_direct_dispatch(registry: &dyn WebhookRegistry, ev: &Event, body: Vec<
                         "outcome" => "exhausted",
                     )
                     .increment(1);
-                }
+                },
             }
         });
     }
@@ -2229,7 +2229,7 @@ mod tests {
         match found {
             Some((_, _, _, DebugValue::Counter(v))) => {
                 assert_eq!(v, 7, "drop counter must record the dropped-event count");
-            }
+            },
             other => panic!("drop counter was not recorded: {other:?}"),
         }
     }

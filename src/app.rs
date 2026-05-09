@@ -557,11 +557,11 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             let sqlite_wh = webhooks::SqliteWebhookRegistry::open(&p, master_key)?;
             sqlite_pools.push(("webhooks", sqlite_wh.pool().clone()));
             Arc::new(sqlite_wh)
-        }
+        },
         None => {
             tracing::info!("webhooks: in-memory registry (subscriptions lost on restart)");
             Arc::new(webhooks::MemRegistry::new())
-        }
+        },
     };
     // Spawn the webhook dispatcher *before* any handler can publish,
     // so the broadcast subscriber registers before events start
@@ -1156,7 +1156,7 @@ fn init_tracing(otlp_endpoint: Option<&str>) -> anyhow::Result<()> {
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
             registry.with(otel_layer).init();
             tracing::info!(endpoint = %endpoint, "OTLP tracing enabled");
-        }
+        },
     }
     Ok(())
 }

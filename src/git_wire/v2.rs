@@ -61,7 +61,7 @@ pub(crate) async fn native_v2_fetch_response(
                 // 500.
                 tracing::warn!(error = %e, "native_pack failed; falling back to pack-objects");
                 generate_pack_via_pack_objects(repo_path, &req.wants, &req.haves).await?
-            }
+            },
         }
     };
 
@@ -196,14 +196,14 @@ pub(crate) async fn native_ls_refs_response(
                         name: "HEAD".into(),
                         extra: args.symrefs.then(|| format!(" symref-target:{target}")),
                     });
-                }
+                },
                 HeadState::Detached { oid } => {
                     rows.push(LsRefsRow {
                         oid: oid.into_inner(),
                         name: "HEAD".into(),
                         extra: None,
                     });
-                }
+                },
                 HeadState::Unborn { target } => {
                     // Spec: unborn HEAD reports as
                     //   `unborn HEAD symref-target:<target>`.
@@ -218,7 +218,7 @@ pub(crate) async fn native_ls_refs_response(
                             extra: Some(format!(" symref-target:{target}")),
                         });
                     }
-                }
+                },
             }
         }
 

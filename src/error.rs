@@ -180,7 +180,7 @@ impl IntoResponse for Error {
             Error::InvalidRepoId(_) => (StatusCode::BAD_REQUEST, "invalid_repo_id"),
             Error::Unauthorized | Error::UnauthorizedBasic => {
                 (StatusCode::UNAUTHORIZED, "unauthorized")
-            }
+            },
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Error::QuotaExceeded { subject, limit } => {
@@ -198,7 +198,7 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-            }
+            },
             Error::RepoByteQuotaExceeded {
                 repo_id,
                 bytes_used,
@@ -219,7 +219,7 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::PAYLOAD_TOO_LARGE, body).into_response();
-            }
+            },
             Error::RateLimited { retry_after_secs } => {
                 // 429 + Retry-After. Distinct `code` from `quota_exceeded`
                 // so clients retry (rate-limited is transient) vs. surface
@@ -237,7 +237,7 @@ impl IntoResponse for Error {
                     resp.headers_mut().insert(header::RETRY_AFTER, v);
                 }
                 return resp;
-            }
+            },
             Error::RefConflict {
                 branch,
                 expected,
@@ -255,7 +255,7 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
-            }
+            },
             Error::ForkDependency { repo_id, forks } => {
                 // 409 with the dependent fork ids so callers can decide
                 // whether to delete those first or re-issue with
@@ -274,7 +274,7 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
-            }
+            },
             Error::MergeConflict {
                 target_branch,
                 source_branch,
@@ -299,14 +299,14 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
-            }
+            },
             Error::PackParse(_) => {
                 // 400 — the pack body the client sent didn't parse.
                 // Distinct code so dashboards can chart bad-push rates
                 // separately from genuine 5xxs.
                 tracing::warn!(error = %self, "pack parse failure");
                 (StatusCode::BAD_REQUEST, "pack_parse")
-            }
+            },
             Error::Db(_) if self.is_retryable_db() => {
                 // Transient: the database was busy/locked under concurrent
                 // writers. A 503 + Retry-After tells the client to back
@@ -323,11 +323,11 @@ impl IntoResponse for Error {
                 resp.headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
                 return resp;
-            }
+            },
             Error::Io(_) | Error::Other(_) | Error::GixError(_) | Error::Db(_) => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-            }
+            },
         };
         // 5xx responses MUST NOT echo the underlying Display chain to
         // the wire. The chain leaks file paths (Io), anyhow `.context()`

@@ -1392,7 +1392,7 @@ fn step18_sse_events(server: &TestServer, st: &mut State) {
                     seen_fork = true;
                 }
                 transcript.push(line);
-            }
+            },
             Err(_) => break,
         }
     }

@@ -708,8 +708,8 @@ mod tests {
                                 // ref's current value really did equal the
                                 // expected (or None meant "must be absent").
                                 applied.push(new_idx);
-                            }
-                            CasOutcome::Conflict { .. } => {}
+                            },
+                            CasOutcome::Conflict { .. } => {},
                         }
                     }
                     // The post-state must equal the last accepted `new`
@@ -718,10 +718,10 @@ mod tests {
                     match applied.last() {
                         Some(&idx) => {
                             assert_eq!(final_val, Some(oids[idx as usize].clone()));
-                        }
+                        },
                         None => {
                             assert!(final_val.is_none());
-                        }
+                        },
                     }
                 });
                 Ok(())

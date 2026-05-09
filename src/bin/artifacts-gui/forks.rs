@@ -65,7 +65,7 @@ impl ForkLayoutCache {
             match &r.source_id {
                 Some(parent) if self.ids.contains(parent.as_str()) => {
                     children.entry(parent.clone()).or_default().push(r);
-                }
+                },
                 Some(_) | None => roots.push(r),
             }
         }
@@ -316,12 +316,12 @@ pub(crate) fn layout_subtree(
             let x = *next_x;
             *next_x += 1.0;
             x
-        }
+        },
         Some(kids) if kids.is_empty() => {
             let x = *next_x;
             *next_x += 1.0;
             x
-        }
+        },
         Some(kids) => {
             let first = layout_subtree(kids[0], children, depth + 1, next_x, positions);
             let mut last = first;
@@ -329,7 +329,7 @@ pub(crate) fn layout_subtree(
                 last = layout_subtree(kid, children, depth + 1, next_x, positions);
             }
             (first + last) / 2.0
-        }
+        },
     };
     positions.insert(root.id.clone(), (x, depth as f64));
     x

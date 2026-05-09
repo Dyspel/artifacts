@@ -104,7 +104,7 @@ pub fn verify(
         Some(aud) => {
             validation.set_audience(&[aud]);
             required.push("aud");
-        }
+        },
         None => validation.validate_aud = false,
     }
     // Issuer: same shape. set_issuer populates the allow-set; we add

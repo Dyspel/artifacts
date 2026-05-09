@@ -18,12 +18,12 @@ pub(crate) fn render_detail(ui: &mut egui::Ui, s: &StateSnapshot, selected: Opti
                 .color(egui::Color32::GRAY)
                 .italics(),
             );
-        }
+        },
         (Some(id), None) => {
             ui.heading("Detail");
             ui.add_space(8.0);
             ui.label(format!("Loading detail for {id}…"));
-        }
+        },
         (Some(_id), Some(d)) => render_detail_body(ui, d),
     }
 }
@@ -56,10 +56,10 @@ fn render_detail_body(ui: &mut egui::Ui, d: &RepoDetail) {
                 match &d.source_id {
                     Some(src) => {
                         ui.monospace(src);
-                    }
+                    },
                     None => {
                         ui.label("— (root)");
-                    }
+                    },
                 }
                 ui.end_row();
 

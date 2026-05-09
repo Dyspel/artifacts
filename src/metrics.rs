@@ -241,7 +241,7 @@ pub(crate) fn path_label_for(matched: Option<&str>, raw_uri: &str) -> String {
         None => {
             tracing::debug!(uri = raw_uri, "request hit an unmatched route");
             "<unmatched>".to_string()
-        }
+        },
     }
 }
 

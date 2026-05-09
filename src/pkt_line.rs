@@ -78,7 +78,7 @@ pub fn read(buf: &[u8]) -> Result<(PktLine<'_>, &[u8]), PktError> {
                 return Err(PktError::ShortPayload);
             }
             Ok((PktLine::Data(&buf[4..n]), &buf[n..]))
-        }
+        },
     }
 }
 
@@ -105,11 +105,11 @@ impl<'a> Iterator for PktIter<'a> {
             Ok((line, tail)) => {
                 self.buf = tail;
                 Some(Ok(line))
-            }
+            },
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
-            }
+            },
         }
     }
 }

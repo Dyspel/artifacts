@@ -209,7 +209,7 @@ fn row_to_repo_row(id: String, owner: Option<String>, created_at: i64) -> Option
         Err(e) => {
             tracing::warn!(id = %id, error = %e, "ownership: skipping row with malformed id");
             return None;
-        }
+        },
     };
     let owner_typed = match owner.as_deref() {
         Some(s) => match Subject::try_from(s) {
@@ -220,7 +220,7 @@ fn row_to_repo_row(id: String, owner: Option<String>, created_at: i64) -> Option
                     "ownership: row has malformed owner; surfacing as admin-owned"
                 );
                 None
-            }
+            },
         },
         None => None,
     };
@@ -261,7 +261,7 @@ impl OwnershipStore for SqliteOwnershipStore {
                         "ownership: stored owner_subject malformed; treating as admin-owned"
                     );
                     None
-                }
+                },
             },
             None => None,
         };

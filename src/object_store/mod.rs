@@ -320,14 +320,14 @@ impl ObjectStore for FsObjectStore {
                     let _ = dir.sync_all();
                 }
                 Ok(())
-            }
+            },
             Err(e) => {
                 // Clean up the tmp on failure so we don't leave
                 // garbage. Best-effort; if cleanup fails too, the
                 // original error is the one that matters.
                 let _ = std::fs::remove_file(&tmp);
                 Err(Error::from(e))
-            }
+            },
         }
     }
 
@@ -379,7 +379,7 @@ impl ObjectStore for FsObjectStore {
                             "fs list_loose: skipping malformed loose path"
                         );
                         continue;
-                    }
+                    },
                 };
                 let meta = match f.metadata() {
                     Ok(m) => m,
@@ -788,7 +788,7 @@ impl ObjectStore for SqliteObjectStore {
                         "sqlite list_loose: skipping row with malformed oid"
                     );
                     continue;
-                }
+                },
             };
             out.push(LooseInfo {
                 oid,

@@ -165,7 +165,7 @@ fn path_is_safe_descendant(root: &Path, joined: &Path) -> std::result::Result<()
     };
     for comp in rel.components() {
         match comp {
-            std::path::Component::Normal(_) => {}
+            std::path::Component::Normal(_) => {},
             std::path::Component::ParentDir => return Err("ParentDir component"),
             std::path::Component::RootDir => return Err("RootDir component"),
             std::path::Component::Prefix(_) => return Err("Prefix component"),
@@ -371,7 +371,7 @@ fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
                 // emitting a warning to stderr and continuing.
                 tracing::warn!(error = %e, "skipping unreadable ref during fork snapshot");
                 continue;
-            }
+            },
         };
         if let gix::refs::TargetRef::Object(oid) = reference.target() {
             entries.push((
