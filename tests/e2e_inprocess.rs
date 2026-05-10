@@ -412,6 +412,101 @@ fn e2e_inprocess_full_surface() {
         "expected fast-forward merge"
     );
 
+    // Three-way clean merge: advance main with d.txt, branch `side` off
+    // the pre-d tip with c.txt, merge side → main (a real merge commit).
+    git_must(&merge_work, &["checkout", "-q", "main"]);
+    git_must(&merge_work, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let base_tip = String::from_utf8(git(&merge_work, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(merge_work.join("d.txt"), "d\n").unwrap();
+    git_must(&merge_work, &["add", "d.txt"]);
+    git_must(&merge_work, &["commit", "-q", "-m", "main adds d"]);
+    git_must(&merge_work, &["push", "-q", "origin", "main"]);
+    git_must(&merge_work, &["checkout", "-q", "-B", "side", &base_tip]);
+    std::fs::write(merge_work.join("c.txt"), "c\n").unwrap();
+    git_must(&merge_work, &["add", "c.txt"]);
+    git_must(&merge_work, &["commit", "-q", "-m", "side adds c"]);
+    git_must(&merge_work, &["push", "-q", "origin", "side"]);
+    let three_way = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+        &json!({"sourceBranch":"side","targetBranch":"main","message":"merge side"}),
+    );
+    assert_status(&three_way, 200, "three-way merge");
+    assert_eq!(
+        parse(&three_way.1)
+            .get("fastForward")
+            .and_then(Value::as_bool),
+        Some(false),
+        "three-way merge is not a fast-forward"
+    );
+
+    // Conflict: two branches edit the same file off the current main;
+    // merging the second after the first lands must 409 merge_conflict.
+    git_must(&merge_work, &["checkout", "-q", "main"]);
+    git_must(&merge_work, &["pull", "-q", "--ff-only", "origin", "main"]);
+    let conflict_base = String::from_utf8(git(&merge_work, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    // main edits feature.txt one way…
+    std::fs::write(merge_work.join("feature.txt"), "main-side\n").unwrap();
+    git_must(&merge_work, &["add", "feature.txt"]);
+    git_must(
+        &merge_work,
+        &["commit", "-q", "-m", "main edits feature.txt"],
+    );
+    git_must(&merge_work, &["push", "-q", "origin", "main"]);
+    // …a branch off the old base edits the same file the other way.
+    git_must(
+        &merge_work,
+        &["checkout", "-q", "-B", "clash", &conflict_base],
+    );
+    std::fs::write(merge_work.join("feature.txt"), "clash-side\n").unwrap();
+    git_must(&merge_work, &["add", "feature.txt"]);
+    git_must(
+        &merge_work,
+        &["commit", "-q", "-m", "clash edits feature.txt"],
+    );
+    git_must(&merge_work, &["push", "-q", "origin", "clash"]);
+    let conflict = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+        &json!({"sourceBranch":"clash","targetBranch":"main"}),
+    );
+    assert_status(&conflict, 409, "merge conflict");
+    assert_eq!(
+        parse(&conflict.1)
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str),
+        Some("merge_conflict")
+    );
+
+    // Same-branch merge is a 400 (nothing to do).
+    let same = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+        &json!({"sourceBranch":"main","targetBranch":"main"}),
+    );
+    assert_status(&same, 400, "merge same branch");
+
+    // --- notes endpoint ----------------------------------------------
+    // Attach a git note to main's tip and read it back through REST.
+    let main_tip = String::from_utf8(git(&merge_work, &["rev-parse", "origin/main"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    git_must(&merge_work, &["fetch", "-q", "origin", "main"]);
+    git_must(
+        &merge_work,
+        &["notes", "add", "-f", "-m", "a note", &main_tip],
+    );
+    git_must(&merge_work, &["push", "-q", "origin", "refs/notes/commits"]);
+    let note = send(auth(ureq::get(&format!(
+        "{base}/v1/repos/{repo_id}/notes?commit={main_tip}"
+    ))));
+    assert_status(&note, 200, "get note");
+
     // --- fork --------------------------------------------------------
     let fork = send_json(
         auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/forks"))),
