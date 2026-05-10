@@ -321,13 +321,10 @@ mod tests {
         child.stdin.as_mut().unwrap().write_all(pack)?;
         let out = child.wait_with_output()?;
         if !out.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "index-pack rejected: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "index-pack rejected: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
         }
         Ok(())
     }

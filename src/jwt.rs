@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_userId_over_sub() {
+    fn prefers_user_id_over_sub() {
         let tok = sign(
             "sec",
             json!({ "userId": "primary", "sub": "fallback", "exp": future_ts() }),

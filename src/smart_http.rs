@@ -1496,7 +1496,7 @@ mod tests {
     /// response body has the right pkt-line shape.
     #[tokio::test]
     async fn native_ls_refs_response_emits_v2_listing() {
-        use crate::refs::{FsRefStore, RefStore};
+        use crate::refs::FsRefStore;
         use crate::storage::{new_repo_id, FsStorage, Storage};
 
         let tmp = std::env::temp_dir().join(format!("nat-ls-{}", new_repo_id()));
@@ -1827,7 +1827,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_ls_refs_response_unborn_head() {
-        use crate::refs::{FsRefStore, RefStore};
+        use crate::refs::FsRefStore;
         use crate::storage::{new_repo_id, FsStorage, Storage};
 
         let tmp = std::env::temp_dir().join(format!("nat-unborn-{}", new_repo_id()));

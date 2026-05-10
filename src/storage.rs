@@ -418,10 +418,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::join_absolute_paths)]
     fn path_is_safe_descendant_rejects_absolute_id() {
         // An id like `/etc/passwd` would have joined produce just
         // `/etc/passwd.git` (Path::join replaces with absolute).
-        // strip_prefix(root) fails — we surface that.
+        // strip_prefix(root) fails — we surface that. The clippy
+        // allow above is precisely *because* this test exercises that
+        // replacement behaviour.
         let root = std::path::PathBuf::from("/data/repos");
         let joined = root.join("/etc/passwd.git");
         let err = path_is_safe_descendant(&root, &joined).unwrap_err();
