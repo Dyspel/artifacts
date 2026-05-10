@@ -221,3 +221,62 @@ pub async fn sse_stream(
     // connect.
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, EventBus, EventKind};
+
+    #[test]
+    fn event_kind_as_str_and_serde_round_trip() {
+        for (k, s) in [
+            (EventKind::Commit, "commit"),
+            (EventKind::Fork, "fork"),
+            (EventKind::Status, "status"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            // Wire form is the bare lowercase variant name.
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{s}\""));
+            let back: EventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, k);
+        }
+        // A misspelled kind fails to deserialize (the whole point of N3).
+        assert!(serde_json::from_str::<EventKind>("\"comit\"").is_err());
+    }
+
+    #[test]
+    fn event_constructors_build_the_right_variants() {
+        let c = Event::commit("r1", "abc", "refs/heads/main", "msg");
+        assert!(matches!(c, Event::Commit { .. }));
+        let f = Event::fork("parent", "child");
+        match f {
+            Event::Fork {
+                parent_repo_id,
+                child_repo_id,
+                ..
+            } => {
+                assert_eq!(parent_repo_id, "parent");
+                assert_eq!(child_repo_id, "child");
+            },
+            _ => panic!("expected Fork"),
+        }
+        let s = Event::status("r1", "active", "idle");
+        assert!(matches!(s, Event::Status { .. }));
+    }
+
+    #[tokio::test]
+    async fn bus_default_publish_reaches_a_subscriber() {
+        // Default delegates to new(); a subscriber taken before publish
+        // sees the event, and the serialized form carries the `kind` tag.
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+        bus.publish(Event::fork("p", "c"));
+        let ev = rx.recv().await.unwrap();
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"kind\":\"fork\""), "got {json}");
+
+        // Publishing with no live subscriber is a no-op, not an error.
+        drop(rx);
+        bus.publish(Event::status("r", "a", "b"));
+    }
+}

@@ -205,6 +205,66 @@ mod tests {
     }
 
     #[test]
+    fn jwt_accessors_rotate_and_repos_dir() {
+        let c = Config::new(
+            PathBuf::from("/tmp/x"),
+            "http://x".to_string(),
+            "admin".to_string(),
+            Some("s3cret".to_string()),
+            Some("aud-1".to_string()),
+            Some("iss-1".to_string()),
+            16,
+            1024,
+            0,
+            true,
+        );
+        assert_eq!(c.jwt_secret().as_deref(), Some("s3cret"));
+        assert_eq!(c.jwt_expected_aud(), Some("aud-1"));
+        assert_eq!(c.jwt_expected_iss(), Some("iss-1"));
+        assert_eq!(c.repos_dir(), PathBuf::from("/tmp/x/repos"));
+
+        c.rotate_jwt_secret(Some("rotated".to_string()));
+        assert_eq!(c.jwt_secret().as_deref(), Some("rotated"));
+        c.rotate_jwt_secret(None);
+        assert!(c.jwt_secret().is_none());
+    }
+
+    #[test]
+    fn admin_token_reads_and_rotates_through_a_poisoned_lock() {
+        use std::sync::Arc;
+        let c = Arc::new(cfg("alpha"));
+        // Poison the admin-token lock: a panic while holding the write
+        // guard marks the RwLock poisoned. The accessor's
+        // `unwrap_or_else(|p| p.into_inner())` must still return the
+        // value rather than propagate the poison.
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.admin_token.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert_eq!(c.admin_token(), "alpha", "read recovers from poison");
+        c.rotate_admin_token("beta".to_string());
+        assert_eq!(c.admin_token(), "beta", "write recovers from poison");
+    }
+
+    #[test]
+    fn jwt_secret_reads_and_rotates_through_a_poisoned_lock() {
+        use std::sync::Arc;
+        let c = Arc::new(cfg("alpha"));
+        c.rotate_jwt_secret(Some("s".to_string()));
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.jwt_secret.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert_eq!(c.jwt_secret().as_deref(), Some("s"));
+        c.rotate_jwt_secret(Some("t".to_string()));
+        assert_eq!(c.jwt_secret().as_deref(), Some("t"));
+    }
+
+    #[test]
     fn concurrent_reads_dont_block_each_other() {
         // Sanity-check that the chosen lock type doesn't surprise us
         // under concurrent reads. Spawn N readers that each snapshot

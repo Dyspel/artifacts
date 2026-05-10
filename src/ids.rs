@@ -475,12 +475,44 @@ mod tests {
             "refs//heads",
             "refs/heads/..foo",
             "refs/heads/foo\nbar",
+            "refs/heads/foo.lock", // a component ending in .lock is reserved
         ] {
             assert!(
                 RefName::try_from(s).is_err(),
                 "expected {s:?} to be rejected"
             );
         }
+    }
+
+    /// Exercise the accessor / conversion surface of all five newtypes
+    /// — `as_ref`, `into_inner`, and `From<Newtype> for String` — so
+    /// the drop-in ergonomics that the migration depends on are pinned.
+    #[test]
+    fn accessors_and_conversions_round_trip() {
+        let repo = RepoId::try_from("my-repo_01").unwrap();
+        assert_eq!(AsRef::<str>::as_ref(&repo), "my-repo_01");
+        assert_eq!(repo.clone().into_inner(), "my-repo_01");
+        assert_eq!(String::from(repo), "my-repo_01");
+
+        let oid = Oid::try_from("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(
+            AsRef::<str>::as_ref(&oid),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+
+        let rn = RefName::try_from("refs/heads/main").unwrap();
+        assert_eq!(AsRef::<str>::as_ref(&rn), "refs/heads/main");
+        assert!(rn.starts_with("refs/heads/"));
+        assert_eq!(String::from(rn), "refs/heads/main");
+
+        let tok = Token::try_from("abc123").unwrap();
+        assert_eq!(AsRef::<str>::as_ref(&tok), "abc123");
+        assert_eq!(tok.into_inner(), "abc123");
+
+        let sub = Subject::try_from("alice").unwrap();
+        assert_eq!(AsRef::<str>::as_ref(&sub), "alice");
+        assert_eq!(format!("{sub}"), "alice");
+        assert_eq!(String::from(sub), "alice");
     }
 
     #[test]

@@ -901,7 +901,91 @@ fn count_forks_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_diff, parse_log_records, DiffStatus};
+    use super::{
+        dir_size, is_valid_notes_ref, parse_diff, parse_log_records, validate_path,
+        validate_ref_or_sha, DiffStatus,
+    };
+
+    #[test]
+    fn validate_ref_or_sha_accepts_plain_refs_and_shas() {
+        for ok in [
+            "HEAD",
+            "refs/heads/main",
+            "refs/notes/commits",
+            "0123456789abcdef0123456789abcdef01234567",
+            "v1.2.3",
+        ] {
+            assert!(validate_ref_or_sha(ok).is_ok(), "{ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_ref_or_sha_rejects_empty_oversized_and_dangerous_chars() {
+        assert!(validate_ref_or_sha("").is_err(), "empty");
+        assert!(
+            validate_ref_or_sha(&"a".repeat(513)).is_err(),
+            "over 512 chars"
+        );
+        // Every blocked character (plus whitespace) must be rejected.
+        for bad in [
+            "has space",
+            "tab\there",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a~b",
+            "a^b",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(
+                validate_ref_or_sha(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_path_accepts_repo_relative_and_rejects_traversal() {
+        assert!(validate_path("src/lib.rs").is_ok());
+        assert!(validate_path("a/b/c.txt").is_ok());
+
+        assert!(validate_path("").is_err(), "empty");
+        assert!(validate_path(&"a".repeat(4097)).is_err(), "over 4096");
+        assert!(validate_path("/etc/passwd").is_err(), "leading slash");
+        assert!(validate_path("../secret").is_err(), "dot-dot traversal");
+        assert!(validate_path("a/../b").is_err(), "embedded dot-dot");
+        assert!(validate_path("a\0b").is_err(), "nul byte");
+    }
+
+    #[test]
+    fn is_valid_notes_ref_scopes_to_refs_notes() {
+        assert!(is_valid_notes_ref("refs/notes/commits"));
+        assert!(is_valid_notes_ref("refs/notes/my/deep/note"));
+
+        assert!(!is_valid_notes_ref("refs/heads/main"), "wrong namespace");
+        assert!(!is_valid_notes_ref("refs/notes/"), "no leaf");
+        assert!(!is_valid_notes_ref("refs/notes/a//b"), "doubled slash");
+        assert!(!is_valid_notes_ref("refs/notes/x/"), "trailing slash");
+        assert!(!is_valid_notes_ref("refs/notes/a b"), "space");
+        assert!(!is_valid_notes_ref("refs/notes/a:b"), "colon");
+        assert!(!is_valid_notes_ref("refs/notes/a*b"), "glob");
+    }
+
+    #[test]
+    fn dir_size_sums_files_recursively_and_errors_on_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"12345").unwrap(); // 5 bytes
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), b"678").unwrap(); // 3 bytes
+        assert_eq!(dir_size(root).unwrap(), 8);
+
+        // Best-effort walk: a missing root surfaces as an io error.
+        assert!(dir_size(&root.join("nope")).is_err());
+    }
 
     #[test]
     fn parse_log_records_extracts_fields_and_skips_malformed() {

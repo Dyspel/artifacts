@@ -593,4 +593,79 @@ mod tests {
             "bad request: missing field: branch"
         );
     }
+
+    #[tokio::test]
+    async fn simple_4xx_variants_map_to_their_status_and_code() {
+        let v = body_json(Error::RepoNotFound("r1".to_string()).into_response()).await;
+        assert_eq!(v["status"], 404);
+        assert_eq!(v["body"]["error"]["code"], "repo_not_found");
+
+        let v = body_json(Error::RepoExists("r1".to_string()).into_response()).await;
+        assert_eq!(v["status"], 409);
+        assert_eq!(v["body"]["error"]["code"], "repo_exists");
+
+        let v = body_json(Error::InvalidRepoId("BAD".to_string()).into_response()).await;
+        assert_eq!(v["status"], 400);
+        assert_eq!(v["body"]["error"]["code"], "invalid_repo_id");
+
+        let v = body_json(Error::Forbidden("read-only fork").into_response()).await;
+        assert_eq!(v["status"], 403);
+        assert_eq!(v["body"]["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn repo_byte_quota_emits_413_with_structured_body() {
+        let resp = Error::RepoByteQuotaExceeded {
+            repo_id: "r1".to_string(),
+            bytes_used: 100,
+            limit: 50,
+        }
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 413);
+        assert_eq!(v["body"]["error"]["code"], "repo_byte_quota_exceeded");
+        assert_eq!(v["body"]["error"]["repoId"], "r1");
+        assert_eq!(v["body"]["error"]["bytesUsed"], 100);
+        assert_eq!(v["body"]["error"]["limit"], 50);
+    }
+
+    #[tokio::test]
+    async fn merge_conflict_emits_409_with_conflict_paths() {
+        let resp = Error::MergeConflict {
+            target_branch: "main".to_string(),
+            source_branch: "feature".to_string(),
+            conflict_paths: vec!["a.rs".to_string(), "b.rs".to_string()],
+        }
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 409);
+        assert_eq!(v["body"]["error"]["code"], "merge_conflict");
+        assert_eq!(v["body"]["error"]["sourceBranch"], "feature");
+        assert_eq!(v["body"]["error"]["targetBranch"], "main");
+        assert_eq!(v["body"]["error"]["conflicts"], json!(["a.rs", "b.rs"]));
+    }
+
+    #[test]
+    fn foreign_error_types_convert_into_other() {
+        // Each `From<…>` funnels a foreign error into `Error::Other`
+        // (→ redacted 500). Pin that the conversions compile and route
+        // to the right variant.
+        let utf8 = String::from_utf8(vec![0xff, 0xfe]).unwrap_err();
+        assert!(matches!(Error::from(utf8), Error::Other(_)));
+
+        let je = serde_json::from_str::<i32>("not json").unwrap_err();
+        assert!(matches!(Error::from(je), Error::Other(_)));
+
+        use base64::Engine as _;
+        let be = base64::engine::general_purpose::STANDARD
+            .decode("@@@@")
+            .unwrap_err();
+        assert!(matches!(Error::from(be), Error::Other(_)));
+
+        // aes_gcm::Error is a unit struct with no Display detail; the
+        // From impl adds a context line so logs aren't blank.
+        let ae: Error = aes_gcm::Error.into();
+        assert!(matches!(ae, Error::Other(_)));
+        assert!(ae.to_string().contains("aes-gcm"));
+    }
 }

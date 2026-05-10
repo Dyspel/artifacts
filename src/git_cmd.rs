@@ -252,3 +252,136 @@ pub(crate) async fn rev_list_check_connected(
     let status = child.wait().await?;
     Ok((status.code().unwrap_or(-1), stderr))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        pack_handler_advertise, pack_handler_serve, pack_objects_revs, rev_list_check_connected,
+        rev_list_objects_all, run_git, unpack_objects,
+    };
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    /// Collect a built command's args as lossy strings for assertions.
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn has_env(cmd: &std::process::Command, key: &str, val: &str) -> bool {
+        cmd.get_envs()
+            .any(|(k, v)| k == OsStr::new(key) && v == Some(OsStr::new(val)))
+    }
+
+    fn bare_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "--quiet", "--bare"])
+            .arg(tmp.path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init --bare");
+        tmp
+    }
+
+    #[tokio::test]
+    async fn run_git_pipes_stdin_and_env_then_returns_stdout() {
+        let repo = bare_repo();
+        // hash-object -w --stdin reads the blob body from stdin and writes
+        // it; exercises the env loop + the Some(stdin) write path.
+        let (rc, stdout, _stderr) = run_git(
+            repo.path(),
+            &["hash-object", "-w", "--stdin"],
+            &[("GIT_AUTHOR_NAME", "t")],
+            Some(b"hello\n"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rc, 0);
+        let oid = String::from_utf8(stdout).unwrap();
+        assert_eq!(oid.trim().len(), 40, "blob oid is 40 hex chars");
+    }
+
+    #[tokio::test]
+    async fn run_git_reports_nonzero_exit_with_stderr() {
+        let repo = bare_repo();
+        // rev-parse on a missing ref exits non-zero and writes stderr;
+        // exercises the null-stdin branch + the stderr read path.
+        let (rc, _stdout, stderr) = run_git(
+            repo.path(),
+            &["rev-parse", "--verify", "refs/heads/nope"],
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_ne!(rc, 0);
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn pack_handler_advertise_builds_stateless_advertise_argv() {
+        let dir = Path::new("/tmp/x.git");
+        let with = pack_handler_advertise(dir, "upload-pack", Some("version=2"));
+        let std = with.as_std();
+        let a = args_of(std);
+        assert_eq!(a[0], "upload-pack");
+        assert!(a.contains(&"--stateless-rpc".to_string()));
+        assert!(a.contains(&"--advertise-refs".to_string()));
+        assert!(has_env(std, "GIT_PROTOCOL", "version=2"));
+
+        // No git_protocol → no GIT_PROTOCOL env set.
+        let without = pack_handler_advertise(dir, "receive-pack", None);
+        assert!(!without
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == OsStr::new("GIT_PROTOCOL")));
+    }
+
+    #[test]
+    fn pack_handler_serve_and_pack_objects_and_unpack_build_expected_argv() {
+        let dir = Path::new("/tmp/x.git");
+
+        let serve = pack_handler_serve(dir, "receive-pack", Some("version=2"));
+        let a = args_of(serve.as_std());
+        assert_eq!(a[0], "receive-pack");
+        assert!(a.contains(&"--stateless-rpc".to_string()));
+        assert!(!a.contains(&"--advertise-refs".to_string()));
+        assert!(has_env(serve.as_std(), "GIT_PROTOCOL", "version=2"));
+
+        let po = pack_objects_revs(dir);
+        let a = args_of(po.as_std());
+        assert!(a.contains(&"pack-objects".to_string()));
+        assert!(a.contains(&"--stdout".to_string()));
+        assert!(a.contains(&"--delta-base-offset".to_string()));
+
+        let up = unpack_objects(dir);
+        let a = args_of(up.as_std());
+        assert!(a.contains(&"unpack-objects".to_string()));
+        assert!(a.contains(&"core.fsync=loose-object".to_string()));
+
+        let rl = rev_list_objects_all(dir);
+        let a = args_of(&rl);
+        assert!(a.contains(&"rev-list".to_string()));
+        assert!(a.contains(&"--all".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rev_list_check_connected_fails_on_missing_object() {
+        let repo = bare_repo();
+        // A tip that doesn't exist makes the connectivity walk exit
+        // non-zero with a "missing" complaint on stderr.
+        let bogus = "0".repeat(40);
+        let (rc, stderr) = rev_list_check_connected(repo.path(), &[bogus])
+            .await
+            .unwrap();
+        assert_ne!(rc, 0);
+        assert!(!stderr.is_empty());
+
+        // Empty tip set: nothing to check, walk succeeds.
+        let (rc, _stderr) = rev_list_check_connected(repo.path(), &[]).await.unwrap();
+        assert_eq!(rc, 0);
+    }
+}
