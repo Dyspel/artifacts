@@ -269,11 +269,16 @@ mod tests {
     #[tokio::test]
     async fn refill_restores_capacity_over_time() {
         let rl = RateLimiter {
-            // A small, fast-refilling bucket for deterministic testing.
+            // Slow refill (4/sec → one token per 250ms) so the three
+            // rapid drain checks can't refill a token between calls even
+            // under heavy load (coverage instrumentation inflates
+            // per-call latency). The bucket clock is a real `Instant`,
+            // so a large token-period vs. inter-call-gap ratio is the
+            // robust knob, not virtual time.
             budgets: [
                 Budget {
                     capacity: 2,
-                    refill_per_sec: 50.0,
+                    refill_per_sec: 4.0,
                 }, // Create
                 DEFAULT_TOKEN,
                 DEFAULT_COMMIT,
@@ -284,8 +289,8 @@ mod tests {
         rl.check(&alice(), Class::Create).unwrap();
         rl.check(&alice(), Class::Create).unwrap();
         assert!(rl.check(&alice(), Class::Create).is_err());
-        // Give the refill a chance; 50 tokens/sec means 1 token in 20ms.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // One token refills in 250ms; wait 400ms for margin.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         rl.check(&alice(), Class::Create).unwrap();
     }
 

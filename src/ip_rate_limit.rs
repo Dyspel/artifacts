@@ -173,11 +173,17 @@ mod tests {
 
     #[tokio::test]
     async fn refill_returns_tokens() {
-        // Test-local limiter with fast refill for determinism.
+        // Refill is deliberately slow (4/sec → one token per 250ms) so
+        // the three rapid drain checks below can't accidentally refill a
+        // token between calls even when the test runs under heavy load
+        // (e.g. coverage instrumentation, which inflates per-call
+        // latency). The bucket clock is a real `Instant`, so the only
+        // robust knob is making the token period dwarf the inter-call
+        // gap rather than relying on virtual time.
         let rl = IpRateLimiter {
             budget: Budget {
                 capacity: 2,
-                refill_per_sec: 50.0,
+                refill_per_sec: 4.0,
             },
             buckets: DashMap::new(),
         };
@@ -185,8 +191,9 @@ mod tests {
         rl.check(ip).unwrap();
         rl.check(ip).unwrap();
         assert!(rl.check(ip).is_err());
-        // 50/sec → one token in 20ms. Wait 50ms for safety.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // One token refills in 250ms; wait 400ms so a token is available
+        // with margin regardless of scheduling jitter.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         rl.check(ip).unwrap();
     }
 
