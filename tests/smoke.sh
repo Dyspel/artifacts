@@ -918,7 +918,7 @@ jwt_audit_code=$(curl -sS -o /dev/null -w '%{http_code}' \
     || { echo "FAIL: JWT user GET /v1/admin/audit expected 403, got $jwt_audit_code"; exit 1; }
 echo "    audit log → $audit_count rows, all 5 expected kinds present, ?event= filter honored, JWT-user→403"
 
-# Pagination: ?limit=2&offset=1 must skip the very newest row and
+# Pagination: ?limit=2&offset=2 must skip the two newest rows and
 # return the next two. Symmetric with /v1/admin/repos pagination.
 page0="${WORK_DIR}/audit_page0.json"
 page1="${WORK_DIR}/audit_page1.json"
@@ -927,11 +927,12 @@ curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit?limit=2&offset=2" -o "$page1"
 page0_ids=$(python3 -c 'import json,sys; print(",".join(str(r["id"]) for r in json.load(sys.stdin)))' < "$page0")
 page1_ids=$(python3 -c 'import json,sys; print(",".join(str(r["id"]) for r in json.load(sys.stdin)))' < "$page1")
 # IDs are monotonic-on-insert; offset=2 must yield strictly older
-# IDs than the first page. Disjoint set guarantees no overlap.
-disjoint=$(python3 -c "p0=set('$page0_ids'.split(',')); p1=set('$page1_ids'.split(',')); print(p0.isdisjoint(p1))")
-[[ "$disjoint" == "True" ]] \
-    || { echo "FAIL: audit pages overlapped — page0=$page0_ids page1=$page1_ids"; exit 1; }
-echo "    audit ?offset= → page0=$page0_ids, page1=$page1_ids (disjoint)"
+# rows than the first page. Pinning max(page1) < min(page0) catches
+# both overlap and a bug where offset returns newer rows.
+older=$(python3 -c "p0=[int(x) for x in '$page0_ids'.split(',') if x]; p1=[int(x) for x in '$page1_ids'.split(',') if x]; print(bool(p0 and p1 and max(p1) < min(p0)))")
+[[ "$older" == "True" ]] \
+    || { echo "FAIL: audit page1 not strictly older than page0 — page0=$page0_ids page1=$page1_ids"; exit 1; }
+echo "    audit ?offset= → page0=$page0_ids, page1=$page1_ids (page1 strictly older)"
 
 # /v1/admin/audit/stats returns the same total via the cheap count.
 stats=$(curl -fsS "${auth[@]}" "$BASE_URL/v1/admin/audit/stats")
