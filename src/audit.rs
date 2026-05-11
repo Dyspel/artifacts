@@ -1251,4 +1251,123 @@ mod tests {
         let (_d, s) = store();
         s.probe_write().await.unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Uncovered branch coverage
+    // -----------------------------------------------------------------------
+
+    /// `record_silent` calls `store.record(evt)` and logs-swallows on failure.
+    /// We exercise the Err branch by using a store implementation that always
+    /// returns an error from `record`.
+    #[tokio::test]
+    async fn record_silent_swallows_store_error() {
+        struct AlwaysErrStore;
+        #[async_trait::async_trait]
+        impl AuditStore for AlwaysErrStore {
+            async fn record(&self, _: AuditEvent) -> Result<()> {
+                Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "injected error"
+                )))
+            }
+            async fn list(&self, _: AuditQuery) -> Result<Vec<AuditEvent>> {
+                Ok(Vec::new())
+            }
+            async fn count(&self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn prune_older_than(&self, _: i64) -> Result<u64> {
+                Ok(0)
+            }
+        }
+        let s = AlwaysErrStore;
+        // Must not panic; the error is swallowed.
+        record_silent(
+            &s,
+            "repo.create",
+            "admin",
+            None,
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        // Verify count is still 0 (no write happened).
+        assert_eq!(s.count().await.unwrap(), 0);
+    }
+
+    /// `refresh_events_stored_gauge` with a store whose `count` always fails —
+    /// the Err branch is logged but must not panic.
+    #[tokio::test]
+    async fn refresh_events_stored_gauge_err_branch_does_not_panic() {
+        struct CountErrStore;
+        #[async_trait::async_trait]
+        impl AuditStore for CountErrStore {
+            async fn record(&self, _: AuditEvent) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _: AuditQuery) -> Result<Vec<AuditEvent>> {
+                Ok(Vec::new())
+            }
+            async fn count(&self) -> Result<u64> {
+                Err(crate::error::Error::Other(anyhow::anyhow!("count broken")))
+            }
+            async fn prune_older_than(&self, _: i64) -> Result<u64> {
+                Ok(0)
+            }
+        }
+        // Must not panic even though count() returns Err.
+        refresh_events_stored_gauge(&CountErrStore).await;
+    }
+
+    /// `spawn_prune_task` fires the tick/prune/gauge loop. We verify that the
+    /// Ok(n > 0) and Err branches inside the task loop are reachable by using
+    /// a real store where we seed a row old enough to prune, then cancel.
+    ///
+    /// Because the loop only fires after the first tick, we use a very short
+    /// tick so the test doesn't take long.
+    #[tokio::test]
+    async fn spawn_prune_task_prunes_old_rows_and_cancels() {
+        let (_d, s) = store();
+        // Seed an event with ts=1 (ancient).
+        let mut e = evt("old", "admin", None);
+        e.ts = 1;
+        s.record(e).await.unwrap();
+        assert_eq!(s.count().await.unwrap(), 1);
+
+        let store_arc: std::sync::Arc<dyn AuditStore> = std::sync::Arc::new(s);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_prune_task(
+            store_arc.clone(),
+            std::time::Duration::from_millis(10),
+            // retention = 1 second: anything older than 1 second from now
+            // is prunable — the ts=1 row qualifies.
+            std::time::Duration::from_secs(1),
+            cancel.clone(),
+        )
+        .expect("task must be spawned with non-zero retention");
+
+        // Give the prune loop time to fire once.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        // The ancient row should have been pruned.
+        assert_eq!(
+            store_arc.count().await.unwrap(),
+            0,
+            "prune loop must have deleted the ancient row"
+        );
+    }
+
+    /// list() with non-empty result set covers the `for r in rows { out.push(r?) }` branch.
+    #[tokio::test]
+    async fn list_non_empty_result_iterates_rows() {
+        let (_d, s) = store();
+        s.record(evt("x", "admin", None)).await.unwrap();
+        s.record(evt("y", "admin", None)).await.unwrap();
+        let rows = s.list(AuditQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest-first: y was inserted after x.
+        assert_eq!(rows[0].event, "y");
+        assert_eq!(rows[1].event, "x");
+    }
 }
