@@ -918,6 +918,30 @@ fn e2e_inprocess_full_surface() {
         400,
         "tree invalid ref",
     );
+    // Syntactically-valid but nonexistent ref → git rejects → 400.
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/tree?ref=no-such-branch"
+        )))),
+        400,
+        "tree unknown ref",
+    );
+    // Diff of the first commit (no parent → diff against the empty tree).
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{rid}/diff?commit={c1_sha}"
+        )))),
+        200,
+        "diff of first commit",
+    );
+    // Notes with an explicit ref param (vs the defaulted ref above).
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/notes?ref=refs/notes/commits&commit={main_tip}"
+        )))),
+        200,
+        "notes explicit ref",
+    );
     // Admin get on a missing repo → 404.
     assert_status(
         &send(auth(ureq::get(&format!(
