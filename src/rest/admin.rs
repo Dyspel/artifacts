@@ -960,4 +960,440 @@ mod tests {
         // The two pages should have different ids.
         assert_ne!(body[0]["id"], body2[0]["id"]);
     }
+
+    // ── admin_get_repo: ownership row exists but git dir missing ─────────────
+
+    /// Cover line 109: the row exists in the ownership store but the git
+    /// directory is absent from disk (e.g. deleted out-of-band). The
+    /// handler must return 404 without panicking.
+    #[tokio::test]
+    async fn admin_get_repo_row_exists_but_git_dir_missing_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = app(tmp.path());
+        // Create a repo so the ownership row exists.
+        let (_, body) = send(&a, req("POST", "/v1/repos", Some(ADMIN), Some("{}"))).await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // Remove the git directory from disk without going through the API.
+        let repos_dir = tmp.path().join("repos");
+        let git_dir = repos_dir.join(format!("{id}.git"));
+        std::fs::remove_dir_all(&git_dir).unwrap();
+        // Now the ownership row exists but the on-disk repo does not.
+        let (status, _) = send(
+            &a,
+            req("GET", &format!("/v1/admin/repos/{id}"), Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── admin_rotate_jwt_key: file-backed path ────────────────────────────
+
+    /// Cover lines 293-311: when `jwt_key_path` is set, the handler writes
+    /// the new key to that file and returns `persisted: true`.
+    #[tokio::test]
+    async fn admin_rotate_jwt_key_file_backed_persists_and_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build a state with jwt_key_path pointing at a file we control.
+        let jwt_key_file = tmp.path().join("jwt-key.bin");
+        std::fs::write(&jwt_key_file, "initial-key").unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        let state = RestState {
+            cfg: std::sync::Arc::new(cfg),
+            data: DataState {
+                storage: std::sync::Arc::new(storage),
+                ownership: std::sync::Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: std::sync::Arc::new(crate::refs::MemRefStore::new()),
+                objects: std::sync::Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: std::sync::Arc::new(
+                    crate::alternates_cache::AlternatesCache::new(),
+                ),
+            },
+            authn: AuthnState {
+                tokens: std::sync::Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: std::sync::Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: std::sync::Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: std::sync::Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: Some(jwt_key_file.clone()),
+            },
+            runtime: RuntimeState {
+                draining: std::sync::Arc::new(AtomicBool::new(false)),
+            },
+        };
+        let a = Router::new()
+            .route(
+                "/v1/admin/jwt-key/rotate",
+                axum::routing::post(super::super::admin_rotate_jwt_key),
+            )
+            .with_state(state);
+        let req_val = req("POST", "/v1/admin/jwt-key/rotate", Some(ADMIN), None);
+        let (status, body) = send(&a, req_val).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key"].as_str().is_some());
+        // With a valid writable path, persisted must be true.
+        assert_eq!(
+            body["persisted"], true,
+            "file-backed rotation must return persisted=true"
+        );
+        // The file on disk must now contain the new key.
+        let on_disk = std::fs::read_to_string(&jwt_key_file).unwrap();
+        assert_eq!(on_disk, body["key"].as_str().unwrap());
+    }
+
+    /// Cover lines 305-311: when the jwt_key_path exists but points to a
+    /// non-writable location, the handler logs and returns `persisted: false`
+    /// (best-effort; doesn't fail the request).
+    #[tokio::test]
+    async fn admin_rotate_jwt_key_file_write_fails_returns_persisted_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point jwt_key_path at a path whose parent does not exist.
+        let bad_path = tmp.path().join("no-such-dir").join("jwt-key.bin");
+        let data_dir = tmp.path().to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        let state = RestState {
+            cfg: std::sync::Arc::new(cfg),
+            data: DataState {
+                storage: std::sync::Arc::new(storage),
+                ownership: std::sync::Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: std::sync::Arc::new(crate::refs::MemRefStore::new()),
+                objects: std::sync::Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: std::sync::Arc::new(
+                    crate::alternates_cache::AlternatesCache::new(),
+                ),
+            },
+            authn: AuthnState {
+                tokens: std::sync::Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: std::sync::Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: std::sync::Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: std::sync::Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: Some(bad_path),
+            },
+            runtime: RuntimeState {
+                draining: std::sync::Arc::new(AtomicBool::new(false)),
+            },
+        };
+        let a = Router::new()
+            .route(
+                "/v1/admin/jwt-key/rotate",
+                axum::routing::post(super::super::admin_rotate_jwt_key),
+            )
+            .with_state(state);
+        let req_val = req("POST", "/v1/admin/jwt-key/rotate", Some(ADMIN), None);
+        let (status, body) = send(&a, req_val).await;
+        assert_eq!(status, StatusCode::OK);
+        // File write fails → persisted=false, but the request itself succeeds.
+        assert_eq!(
+            body["persisted"], false,
+            "failed file write must return persisted=false, not an error response"
+        );
+        assert!(body["key"].as_str().is_some());
+    }
+
+    // ── admin_rotate_webhook_key: file write error path ──────────────────────
+
+    /// Cover lines 379-385: webhook_key_path is set but the write fails
+    /// (parent directory missing). Handler must log-warn and succeed, not
+    /// return an error to the caller.
+    #[tokio::test]
+    async fn admin_rotate_webhook_key_file_write_fails_still_returns_200() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("no-such-dir").join("wh-key.bin");
+        let data_dir = tmp.path().to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        let state = RestState {
+            cfg: std::sync::Arc::new(cfg),
+            data: DataState {
+                storage: std::sync::Arc::new(storage),
+                ownership: std::sync::Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: std::sync::Arc::new(crate::refs::MemRefStore::new()),
+                objects: std::sync::Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: std::sync::Arc::new(
+                    crate::alternates_cache::AlternatesCache::new(),
+                ),
+            },
+            authn: AuthnState {
+                tokens: std::sync::Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: std::sync::Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: std::sync::Arc::new(crate::audit::NoopAuditStore),
+                events: crate::events::EventBus::new(),
+                webhooks: std::sync::Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: Some(bad_path),
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: std::sync::Arc::new(AtomicBool::new(false)),
+            },
+        };
+        let a = Router::new()
+            .route(
+                "/v1/admin/webhook-key/rotate",
+                axum::routing::post(super::super::admin_rotate_webhook_key),
+            )
+            .with_state(state);
+        let req_val = req("POST", "/v1/admin/webhook-key/rotate", Some(ADMIN), None);
+        let (status, body) = send(&a, req_val).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["key"].as_str().is_some());
+    }
+
+    // ── audit endpoints with real SqliteAuditStore (non-empty rows) ──────────
+
+    /// Build a RestState whose `observ.audit` is a real `SqliteAuditStore`
+    /// seeded with events so the list/stats/verify-chain endpoints exercise
+    /// the non-empty response-shaping paths (lines 293-330, 379-380 hint
+    /// at the list path in audit; the real gap is the list branch that
+    /// iterates over returned rows).
+    fn build_state_with_sqlite_audit(dir: &std::path::Path) -> RestState {
+        let data_dir = dir.to_path_buf();
+        let storage = crate::storage::FsStorage::new(data_dir.join("repos")).unwrap();
+        let cfg = crate::config::Config::new(
+            data_dir.clone(),
+            "http://localhost".to_string(),
+            ADMIN.to_string(),
+            Some(JWT_SECRET.to_string()),
+            None,
+            None,
+            100,
+            1 << 20,
+            1 << 30,
+            false,
+        );
+        RestState {
+            cfg: std::sync::Arc::new(cfg),
+            data: DataState {
+                storage: std::sync::Arc::new(storage),
+                ownership: std::sync::Arc::new(
+                    crate::ownership::SqliteOwnershipStore::open(&data_dir.join("own.db")).unwrap(),
+                ),
+                refs: std::sync::Arc::new(crate::refs::MemRefStore::new()),
+                objects: std::sync::Arc::new(crate::object_store::MemObjectStore::new()),
+                alternates_cache: std::sync::Arc::new(
+                    crate::alternates_cache::AlternatesCache::new(),
+                ),
+            },
+            authn: AuthnState {
+                tokens: std::sync::Arc::new(
+                    crate::tokens::SqliteTokenStore::open(&data_dir.join("tok.db")).unwrap(),
+                ),
+                rate_limit: std::sync::Arc::new(crate::rate_limit::RateLimiter::with_defaults()),
+            },
+            observ: ObservState {
+                audit: std::sync::Arc::new(
+                    crate::audit::SqliteAuditStore::open(&data_dir.join("audit.db")).unwrap(),
+                ),
+                events: crate::events::EventBus::new(),
+                webhooks: std::sync::Arc::new(crate::webhooks::MemRegistry::new()),
+                webhook_outbox: None,
+                webhook_key_path: None,
+                jwt_key_path: None,
+            },
+            runtime: RuntimeState {
+                draining: std::sync::Arc::new(AtomicBool::new(false)),
+            },
+        }
+    }
+
+    fn audit_app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .route("/v1/admin/audit", get(admin_list_audit))
+            .route("/v1/admin/audit/stats", get(admin_audit_stats))
+            .route(
+                "/v1/admin/audit/verify-chain",
+                get(admin_verify_audit_chain),
+            )
+            .with_state(build_state_with_sqlite_audit(dir))
+    }
+
+    /// Seed the store with events, then assert the list endpoint returns them.
+    #[tokio::test]
+    async fn admin_list_audit_with_real_store_returns_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed the store directly before building the app so the rows are there.
+        {
+            let store = crate::audit::SqliteAuditStore::open(&tmp.path().join("audit.db")).unwrap();
+            crate::audit::record(
+                &store,
+                "repo.create",
+                "admin",
+                None,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+            crate::audit::record(
+                &store,
+                "token.mint",
+                "alice",
+                None,
+                serde_json::json!({}),
+                Some("req-1".into()),
+            )
+            .await;
+        }
+        let a = audit_app(tmp.path());
+        let (status, body) = send(&a, req("GET", "/v1/admin/audit", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("expected array");
+        assert_eq!(arr.len(), 2, "both inserted events must appear");
+    }
+
+    /// stats endpoint with a real store: count must equal inserted rows.
+    #[tokio::test]
+    async fn admin_audit_stats_with_real_store_returns_correct_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = crate::audit::SqliteAuditStore::open(&tmp.path().join("audit.db")).unwrap();
+            for i in 0..5u32 {
+                crate::audit::record(
+                    &store,
+                    &format!("e{i}"),
+                    "admin",
+                    None,
+                    serde_json::json!({}),
+                    None,
+                )
+                .await;
+            }
+        }
+        let a = audit_app(tmp.path());
+        let (status, body) = send(&a, req("GET", "/v1/admin/audit/stats", Some(ADMIN), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], serde_json::json!(5u64));
+    }
+
+    /// verify-chain with a real store and real chained rows.
+    #[tokio::test]
+    async fn admin_verify_chain_with_real_store_returns_nonzero_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = crate::audit::SqliteAuditStore::open(&tmp.path().join("audit.db")).unwrap();
+            for i in 0..3u32 {
+                crate::audit::record(
+                    &store,
+                    &format!("e{i}"),
+                    "admin",
+                    None,
+                    serde_json::json!({}),
+                    None,
+                )
+                .await;
+            }
+        }
+        let a = audit_app(tmp.path());
+        let (status, body) = send(
+            &a,
+            req("GET", "/v1/admin/audit/verify-chain", Some(ADMIN), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["verified"],
+            serde_json::json!(3u64),
+            "verify-chain must count all 3 chained rows"
+        );
+    }
+
+    /// list endpoint with filters exercised against a real store.
+    #[tokio::test]
+    async fn admin_list_audit_real_store_with_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = crate::audit::SqliteAuditStore::open(&tmp.path().join("audit.db")).unwrap();
+            crate::audit::record(
+                &store,
+                "repo.create",
+                "admin",
+                None,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+            crate::audit::record(
+                &store,
+                "token.mint",
+                "alice",
+                None,
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        }
+        let a = audit_app(tmp.path());
+        // Filter by event=repo.create: only one row.
+        let (status, body) = send(
+            &a,
+            req(
+                "GET",
+                "/v1/admin/audit?event=repo.create&actor=admin",
+                Some(ADMIN),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["event"], "repo.create");
+    }
 }

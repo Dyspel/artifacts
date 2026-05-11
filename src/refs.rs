@@ -1290,4 +1290,81 @@ mod tests {
             .iter()
             .any(|e| e.name.as_str() == "refs/test/after-peel"));
     }
+
+    // ── MemRefStore poison-recovery (line 347) ────────────────────────────
+
+    /// The Mutex poison-recovery path in `MemRefStore::lock` is exercised by
+    /// poisoning the lock from a spawned thread and then calling `read`.
+    /// The `unwrap_or_else(|p| p.into_inner())` must recover gracefully
+    /// rather than panicking.
+    #[tokio::test]
+    async fn mem_ref_store_lock_recovers_from_mutex_poison() {
+        let s = std::sync::Arc::new(MemRefStore::new());
+        let s2 = s.clone();
+        // Poison the lock: grab a write lock and panic inside the thread.
+        let _ = std::thread::spawn(move || {
+            let _guard = s2.inner.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join(); // join returns Err (thread panicked); ignore it.
+
+        // After poisoning, calling read() must still work.
+        let result = s.read(&rid("rtst"), &rn("refs/heads/main")).await;
+        assert!(
+            result.is_ok(),
+            "MemRefStore::lock must recover from mutex poison, got: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "empty store after poison recovery must return None"
+        );
+    }
+
+    // ── FsRefStore::read: empty stdout branch (line 172) ─────────────────
+
+    /// Cover the `if s.is_empty() { return Ok(None) }` branch in FsRefStore::read.
+    /// rev-parse outputs an empty string when the ref exists but the OID is
+    /// somehow empty — this is a degenerate path. We simulate it by creating a
+    /// loose ref file with only whitespace content so rev-parse returns nothing
+    /// useful, but the ref "exists" in the filesystem sense. The easiest way to
+    /// trigger an empty stdout is to ask rev-parse for a ref that genuinely
+    /// doesn't exist — but that goes through `rc != 0` (line 167). Instead we
+    /// can test through `enumerate_refs` on an empty-content loose ref.
+    ///
+    /// Note: `rev-parse --verify` on a non-existent ref exits non-zero (rc≠0),
+    /// so the empty-string branch is theoretically unreachable in practice
+    /// (git always either prints a valid sha or exits non-zero). This is a
+    /// documented residual.
+    #[tokio::test]
+    async fn fs_read_returns_none_for_unknown_ref() {
+        // This test exercises the rc != 0 branch (line 167); the empty-string
+        // branch at line 172 is unreachable in normal git operation (rev-parse
+        // either prints a 40-char sha or exits non-zero).
+        let (_tmp, repo, refs) = setup_repo();
+        let result = refs
+            .read(&repo, &rn("refs/heads/totally-absent"))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── MemRefStore::cas_delete: expected=Some but ref absent ─────────────
+
+    /// Cover the `(Some(_), None) => false` arm in MemRefStore::cas_delete
+    /// (line 432).
+    #[tokio::test]
+    async fn mem_cas_delete_absent_ref_with_expected_returns_conflict() {
+        let s = MemRefStore::new();
+        let repo = rid("rtst");
+        let rname = rn("refs/heads/ghost");
+        let oid = to_oid(&"0".repeat(40));
+        // Ref doesn't exist; expected=Some(oid) → match arms: (Some(_), None) → false.
+        let out = s.cas_delete(&repo, &rname, Some(&oid)).await.unwrap();
+        match out {
+            CasOutcome::Conflict { current } => {
+                assert!(current.is_none(), "absent ref must report current=None");
+            },
+            CasOutcome::Updated => panic!("expected Conflict for absent ref"),
+        }
+    }
 }
