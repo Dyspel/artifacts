@@ -450,4 +450,157 @@ mod tests {
             "missing unborn HEAD line in response: {s:?}"
         );
     }
+
+    /// Detached HEAD: HEAD file contains a raw SHA instead of a ref symlink.
+    /// The response must advertise the OID directly with no symref-target.
+    #[tokio::test]
+    async fn native_ls_refs_response_detached_head() {
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
+        let oid = "abcdef1234567890abcdef1234567890abcdef12";
+        // Write HEAD as a detached commit SHA (no "ref: " prefix).
+        std::fs::write(repo.git_dir.join("HEAD"), format!("{oid}\n")).unwrap();
+
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: true,
+            prefixes: vec!["HEAD".into()],
+        };
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        // Detached HEAD: `<oid> HEAD\n`, no symref-target.
+        let head_line = format!("{oid} HEAD\n");
+        let head_pkt = format!("{:04x}{}", head_line.len() + 4, head_line);
+        assert!(
+            s.contains(&head_pkt),
+            "missing detached HEAD line in response: {s:?}"
+        );
+        assert!(
+            !s.contains("symref-target"),
+            "detached HEAD must not have symref-target: {s:?}"
+        );
+        assert!(s.ends_with("0000"), "missing trailing flush-pkt: {s:?}");
+    }
+
+    /// Empty prefix list: ls-refs with no prefixes must return only the flush-pkt.
+    #[tokio::test]
+    async fn native_ls_refs_response_empty_prefixes_returns_flush_only() {
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
+        let args = LsRefsArgs {
+            peel: false,
+            symrefs: false,
+            prefixes: Vec::new(),
+        };
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
+        // Empty prefix list → no ref rows → only flush-pkt.
+        assert_eq!(&body[..], b"0000");
+    }
+
+    /// Test the `generate_pack_via_pack_objects` fallback by calling it
+    /// directly on a real repo with an actual commit.
+    #[tokio::test]
+    async fn generate_pack_via_pack_objects_produces_pack_header() {
+        use std::process::Command as StdCmd;
+
+        let repo = crate::test_support::TestRepo::new();
+        let git_dir = &repo.git_dir;
+
+        // Minimal plumbing to create a commit.
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["config", "user.email", "t@t"])
+            .status()
+            .unwrap();
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["config", "user.name", "t"])
+            .status()
+            .unwrap();
+        let blob_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                c.stdin.as_mut().unwrap().write_all(b"hello\n").unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let blob = String::from_utf8(blob_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mktree_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["mktree"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                let line = format!("100644 blob {blob}\thello.txt\n");
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(line.as_bytes())
+                    .unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let tree = String::from_utf8(mktree_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let commit_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["commit-tree", "-m", "initial", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Call the fallback directly with no haves (full clone).
+        let pack = generate_pack_via_pack_objects(git_dir, &[commit], &[])
+            .await
+            .unwrap();
+        // Every valid packfile starts with the PACK magic and version 2.
+        assert!(
+            pack.starts_with(b"PACK\x00\x00\x00\x02"),
+            "expected PACK header, got {:?}",
+            &pack[..pack.len().min(8)]
+        );
+    }
+
+    /// Verify that `generate_pack_via_pack_objects` returns an error when
+    /// given an OID that doesn't exist in the repo (pack-objects fails).
+    #[tokio::test]
+    async fn generate_pack_via_pack_objects_fails_on_missing_oid() {
+        let repo = crate::test_support::TestRepo::new();
+        let nonexistent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let result = generate_pack_via_pack_objects(&repo.git_dir, &[nonexistent], &[]).await;
+        assert!(result.is_err(), "expected error for missing OID, got ok");
+    }
 }
