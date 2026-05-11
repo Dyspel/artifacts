@@ -1008,4 +1008,162 @@ mod tests {
             other @ CasOutcome::Updated => panic!("wanted conflict, got {other:?}"),
         }
     }
+
+    // ── Trait-default method coverage ─────────────────────────────────
+
+    /// A minimal store that implements only the two required methods.
+    /// All three default methods (`cas_delete`, `list`, `read_head`)
+    /// should return `Err(Error::Other(...))` with a descriptive message.
+    struct MinimalStore;
+
+    #[async_trait]
+    impl RefStore for MinimalStore {
+        async fn read(&self, _repo_id: &RepoId, _ref_name: &RefName) -> Result<Option<Oid>> {
+            Ok(None)
+        }
+
+        async fn cas_update(
+            &self,
+            _repo_id: &RepoId,
+            _ref_name: &RefName,
+            _expected: Option<&Oid>,
+            _new_sha: &Oid,
+        ) -> Result<CasOutcome> {
+            Ok(CasOutcome::Updated)
+        }
+    }
+
+    #[tokio::test]
+    async fn trait_default_cas_delete_returns_err() {
+        let s = MinimalStore;
+        let err = s
+            .cas_delete(&rid("repo-a"), &rn("refs/heads/x"), None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cas_delete") || msg.contains("not implemented"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trait_default_list_returns_err() {
+        let s = MinimalStore;
+        let err = s.list(&rid("repo-a"), &[]).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("list") || msg.contains("not implemented"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trait_default_read_head_returns_err() {
+        let s = MinimalStore;
+        let err = s.read_head(&rid("repo-a")).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_head") || msg.contains("not implemented"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    // ── FsRefStore::cas_delete paths ──────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_cas_delete_with_matching_expected_removes_ref() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let s = to_oid(&write_blob(&git_dir, b"target-for-delete"));
+        let rname = rn("refs/test/del");
+        refs.cas_update(&repo, &rname, None, &s).await.unwrap();
+        // Expected matches → Updated, ref gone.
+        let out = refs.cas_delete(&repo, &rname, Some(&s)).await.unwrap();
+        assert_eq!(out, CasOutcome::Updated);
+        assert!(refs.read(&repo, &rname).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fs_cas_delete_with_stale_expected_reports_conflict() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let s1 = to_oid(&write_blob(&git_dir, b"v1"));
+        let s2 = to_oid(&write_blob(&git_dir, b"v2"));
+        let rname = rn("refs/test/del-stale");
+        refs.cas_update(&repo, &rname, None, &s1).await.unwrap();
+        refs.cas_update(&repo, &rname, Some(&s1), &s2)
+            .await
+            .unwrap();
+        // Try to delete with the old SHA → conflict.
+        match refs.cas_delete(&repo, &rname, Some(&s1)).await.unwrap() {
+            CasOutcome::Conflict { .. } => {},
+            CasOutcome::Updated => panic!("should have conflicted on stale expected"),
+        }
+        // Ref still present.
+        assert!(refs.read(&repo, &rname).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn fs_cas_delete_unconditional_removes_ref() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let s = to_oid(&write_blob(&git_dir, b"uc-target"));
+        let rname = rn("refs/test/del-uc");
+        refs.cas_update(&repo, &rname, None, &s).await.unwrap();
+        // expected=None → unconditional delete.
+        let out = refs.cas_delete(&repo, &rname, None).await.unwrap();
+        assert_eq!(out, CasOutcome::Updated);
+        assert!(refs.read(&repo, &rname).await.unwrap().is_none());
+    }
+
+    // ── head_state edge cases ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_head_detached_when_head_is_raw_oid() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let s = to_oid(&write_blob(&git_dir, b"detached-target"));
+        // Write the OID directly into HEAD to simulate a detached HEAD state.
+        std::fs::write(git_dir.join("HEAD"), format!("{}\n", s.as_str())).unwrap();
+        let st = refs.read_head(&repo).await.unwrap();
+        match st {
+            HeadState::Detached { oid } => assert_eq!(oid.as_str(), s.as_str()),
+            other => panic!("expected Detached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_head_error_on_unrecognized_format() {
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        // Write a HEAD that is neither a symref nor a 40-hex OID.
+        std::fs::write(git_dir.join("HEAD"), "not-valid-head\n").unwrap();
+        let err = refs.read_head(&repo).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognized") || msg.contains("HEAD"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_head_symbolic_falls_back_to_packed_refs() {
+        // HEAD points at refs/test/packed but there is no loose file —
+        // only a packed-refs entry. The fallback should resolve it.
+        let (_tmp, repo, refs) = setup_repo();
+        let git_dir = refs.repo_path(&repo);
+        let sha = write_blob(&git_dir, b"packed-head-target");
+        let packed_text = format!("# pack-refs with: peeled\n{sha} refs/test/packed\n");
+        std::fs::write(git_dir.join("packed-refs"), packed_text).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/test/packed\n").unwrap();
+        let st = refs.read_head(&repo).await.unwrap();
+        match st {
+            HeadState::Symbolic { target, oid } => {
+                assert_eq!(target.as_str(), "refs/test/packed");
+                assert_eq!(oid.as_str(), sha.as_str());
+            },
+            other => panic!("expected Symbolic from packed fallback, got {other:?}"),
+        }
+    }
 }

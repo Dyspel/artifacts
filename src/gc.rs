@@ -809,6 +809,189 @@ mod tests {
         );
     }
 
+    // ── run: already-gone object (Ok(false)) ─────────────────────────
+
+    /// If an object was removed between the list_loose scan and the
+    /// delete_loose call (concurrent GC, manual removal), delete_loose
+    /// returns Ok(false). The run() loop must treat that as a no-op
+    /// rather than counting it as a deletion or erroring out.
+    #[test]
+    fn run_handles_already_gone_object_gracefully() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let (tmp, storage, repo_id) = seed_repo();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+
+        // Write a dangling blob.
+        let mut p = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        p.stdin.as_mut().unwrap().write_all(b"ephemeral").unwrap();
+        let dangler = String::from_utf8(p.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Manually remove the loose file before running gc. The run()
+        // path lists loose objects first, then tries to delete them;
+        // if delete_loose returns Ok(false) it should be a no-op.
+        let loose = loose_path(&git_dir, &dangler);
+        std::fs::remove_file(&loose).unwrap();
+
+        let cache = AlternatesCache::new();
+        let objects = fs_objects(&repos_dir);
+        // Should succeed with deleted == 0 (already gone, not double-deleted).
+        let result = run(&repos_dir, &repo_id, &cache, 0, &objects).unwrap();
+        assert_eq!(result.deleted, 0, "already-gone object must not be counted");
+        assert_eq!(result.skipped_too_young, 0);
+    }
+
+    // ── run_sweep: nonexistent dir is a no-op ─────────────────────────
+
+    #[test]
+    fn run_sweep_on_nonexistent_dir_is_noop() {
+        // If the repos_dir doesn't exist run_sweep must not panic or
+        // propagate an error — it logs a warning and returns.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let cache = AlternatesCache::new();
+        let objects = crate::object_store::FsObjectStore::new(&missing);
+        // Should not panic — warning is emitted to tracing, which
+        // isn't captured in unit tests.
+        run_sweep(&missing, &cache, &objects, 0);
+    }
+
+    // ── run_sweep: per-repo error is soft (doesn't abort the sweep) ───
+
+    /// A repo directory that has a `.git` name but lacks any git
+    /// infrastructure will make rev_list_objects fail. run_sweep
+    /// must log and continue rather than stopping the sweep for the
+    /// remaining repos.
+    #[test]
+    fn run_sweep_skips_repo_whose_run_fails() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        let storage = crate::storage::FsStorage::new(&repos).unwrap();
+
+        // Good repo — has a real commit so run() succeeds.
+        let good_id = crate::storage::new_repo_id();
+        storage
+            .create(&crate::ids::RepoId::try_from(good_id.as_str()).unwrap())
+            .unwrap();
+        let good_git_dir = repos.join(format!("{good_id}.git"));
+        let mut bp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&good_git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        bp.stdin.as_mut().unwrap().write_all(b"data").unwrap();
+        let blob = String::from_utf8(bp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut tp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&good_git_dir)
+            .arg("mktree")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(tp.stdin.as_mut().unwrap(), "100644 blob {blob}\tf.txt").unwrap();
+        let tree = String::from_utf8(tp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let commit = Command::new("git")
+            .arg("--git-dir")
+            .arg(&good_git_dir)
+            .args(["commit-tree", &tree, "-m", "sweep-test"])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit.stdout).unwrap().trim().to_string();
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&good_git_dir)
+            .args(["update-ref", "refs/heads/main", &commit])
+            .status()
+            .unwrap();
+
+        // Broken "repo" — just an empty dir with a .git suffix.
+        let broken_name = "broken-repo";
+        std::fs::create_dir_all(repos.join(format!("{broken_name}.git"))).unwrap();
+
+        let cache = AlternatesCache::new();
+        let objects = fs_objects(&repos);
+        // run_sweep must not panic even though the broken repo fails.
+        run_sweep(&repos, &cache, &objects, 0);
+        // The good repo's commit objects are still present.
+        let good_list = objects
+            .list_loose(&crate::ids::RepoId::try_from(good_id.as_str()).unwrap())
+            .unwrap();
+        assert!(
+            !good_list.is_empty(),
+            "good repo's objects should still be present after sweep"
+        );
+    }
+
+    // ── preview: fork perspective via alternates cache ────────────────
+
+    #[test]
+    fn preview_from_fork_perspective_includes_source_in_network() {
+        // Fork a seeded repo. When we run preview() from the fork's
+        // perspective the source must appear in the network, and the
+        // source's objects (reachable from the fork's inherited refs)
+        // must count as reachable.
+        let (tmp, storage, source_id) = seed_repo();
+        let repos_dir = storage_repos_dir(&tmp, &storage);
+        let fork_id = crate::storage::new_repo_id();
+        storage
+            .fork(
+                &crate::ids::RepoId::try_from(source_id.as_str()).unwrap(),
+                &crate::ids::RepoId::try_from(fork_id.as_str()).unwrap(),
+            )
+            .unwrap();
+
+        let cache = AlternatesCache::new();
+        let objects = fs_objects(&repos_dir);
+        let p = preview(&repos_dir, &fork_id, &cache, &objects).unwrap();
+
+        // Both source and fork are in the network.
+        assert!(
+            p.network.contains(&source_id),
+            "source must be in fork's network: {:?}",
+            p.network
+        );
+        assert!(
+            p.network.contains(&fork_id),
+            "fork itself must be in its network: {:?}",
+            p.network
+        );
+        // No unreachable objects because the fork inherits all refs.
+        assert_eq!(
+            p.unreachable_loose, 0,
+            "fork should have no unreachable loose objects"
+        );
+    }
+
     #[test]
     fn run_skips_too_young_objects_so_anti_race_guard_works() {
         // Drop a dangling blob *now*, then run gc with a 1-hour
