@@ -606,4 +606,274 @@ mod tests {
         assert!(!valid_path("a\tb"), "tab");
         assert!(!valid_path("a\nb"), "newline");
     }
+
+    // ── validate_sha ──────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_sha_accepts_40_lowercase_hex() {
+        assert!(validate_sha("0000000000000000000000000000000000000000").is_ok());
+        assert!(validate_sha("abcdef0123456789abcdef0123456789abcdef01").is_ok());
+    }
+
+    #[test]
+    fn validate_sha_rejects_bad_inputs() {
+        assert!(validate_sha("").is_err(), "empty");
+        assert!(validate_sha("abc").is_err(), "too short");
+        // 41 chars
+        assert!(
+            validate_sha("0000000000000000000000000000000000000000a").is_err(),
+            "too long"
+        );
+        // non-hex char
+        assert!(
+            validate_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err(),
+            "non-hex"
+        );
+        // space inside
+        assert!(
+            validate_sha("deadbeef deadbeef deadbeef deadbeef dead").is_err(),
+            "space in sha"
+        );
+    }
+
+    // ── valid_branch_name: additional edge cases ──────────────────────────
+
+    #[test]
+    fn branch_name_allows_numbers_and_hyphens() {
+        assert!(valid_branch_name("my-branch-2"));
+        assert!(valid_branch_name("release/2024-01"));
+        assert!(valid_branch_name("1234"));
+    }
+
+    #[test]
+    fn branch_name_rejects_backslash_and_at_brace() {
+        assert!(!valid_branch_name("a\\b"), "backslash");
+        assert!(!valid_branch_name("a@{b}"), "@{{}} sequence");
+    }
+
+    // ── valid_path: additional edge cases ────────────────────────────────
+
+    #[test]
+    fn path_validation_accepts_deep_nested_paths() {
+        assert!(valid_path("a/b/c/d/e/f.txt"));
+        assert!(valid_path("src/main/java/com/example/App.java"));
+    }
+
+    #[test]
+    fn path_validation_rejects_dot_components() {
+        assert!(!valid_path("./a"), "leading dot-slash");
+        assert!(!valid_path("a/./b"), "embedded dot");
+    }
+
+    // ── build_and_write_commit: exercised directly ────────────────────────
+    //
+    // `build_and_write_commit` is sync and takes a `BuildCommitInput`, so
+    // we can drive it from a plain `#[test]` (no tokio needed). This covers
+    // the gix blob-write + tree-edit + commit-write path without needing the
+    // full axum handler (`create_commit` uses `State<RestState>` and requires
+    // a running server — that path is tested elsewhere in the integration
+    // suite).
+
+    /// Orphan commit (no parent) should succeed and produce a valid SHA.
+    #[test]
+    fn build_and_write_commit_orphan_commit_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        let (commit_sha, tree_sha) = build_and_write_commit(BuildCommitInput {
+            git_dir: git_dir.clone(),
+            parent: None,
+            changes: vec![PreparedChange::Write {
+                path: "hello.txt".to_string(),
+                bytes: b"hello world\n".to_vec(),
+                kind: gix::objs::tree::EntryKind::Blob,
+            }],
+            message: "initial commit".to_string(),
+            author_name: "Tester".to_string(),
+            author_email: "test@test.com".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(commit_sha.len(), 40);
+        assert_eq!(tree_sha.len(), 40);
+        assert!(commit_sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(tree_sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Verify git can read the commit back
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "-t", &commit_sha])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "commit");
+    }
+
+    /// Commit with a parent: tree should reflect both parent + new change.
+    #[test]
+    fn build_and_write_commit_with_parent_uses_parent_tree() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        // Seed parent commit via plumbing
+        let mut blob_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        blob_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"base\n")
+            .unwrap();
+        let blob = String::from_utf8(blob_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut tree_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tree_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob}\tbase.txt\n").as_bytes())
+            .unwrap();
+        let tree = String::from_utf8(tree_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let parent_out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "base", &tree])
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let parent_sha = String::from_utf8(parent_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let parent_oid = crate::ids::Oid::try_from(parent_sha.as_str()).unwrap();
+
+        let (commit_sha, _) = build_and_write_commit(BuildCommitInput {
+            git_dir: git_dir.clone(),
+            parent: Some(parent_oid),
+            changes: vec![PreparedChange::Write {
+                path: "added.txt".to_string(),
+                bytes: b"new file\n".to_vec(),
+                kind: gix::objs::tree::EntryKind::Blob,
+            }],
+            message: "add file".to_string(),
+            author_name: "Tester".to_string(),
+            author_email: "test@test.com".to_string(),
+        })
+        .unwrap();
+
+        // The new commit should list parent_sha as its parent
+        let parent_line = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "commit", &commit_sha])
+            .output()
+            .unwrap();
+        let commit_text = String::from_utf8(parent_line.stdout).unwrap();
+        assert!(
+            commit_text.contains(&format!("parent {parent_sha}")),
+            "commit should reference parent: {commit_text}"
+        );
+    }
+
+    /// Delete change: removing a file from the parent tree should not produce
+    /// an error even when the file doesn't exist (gix remove is idempotent).
+    #[test]
+    fn build_and_write_commit_delete_nonexistent_file_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        // No parent, no files — just delete a path that doesn't exist.
+        let result = build_and_write_commit(BuildCommitInput {
+            git_dir,
+            parent: None,
+            changes: vec![PreparedChange::Delete {
+                path: "nonexistent.txt".to_string(),
+            }],
+            message: "empty delete".to_string(),
+            author_name: "T".to_string(),
+            author_email: "t@t".to_string(),
+        });
+        // gix remove on a non-existent path in an empty tree is a no-op (ok).
+        assert!(result.is_ok(), "delete of non-existent file should succeed");
+    }
+
+    /// Executable mode blob: `100755` kind should round-trip correctly.
+    #[test]
+    fn build_and_write_commit_executable_blob_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        let (commit_sha, _) = build_and_write_commit(BuildCommitInput {
+            git_dir: git_dir.clone(),
+            parent: None,
+            changes: vec![PreparedChange::Write {
+                path: "run.sh".to_string(),
+                bytes: b"#!/bin/sh\necho hi\n".to_vec(),
+                kind: gix::objs::tree::EntryKind::BlobExecutable,
+            }],
+            message: "add script".to_string(),
+            author_name: "T".to_string(),
+            author_email: "t@t".to_string(),
+        })
+        .unwrap();
+
+        // Verify the file mode is 100755
+        let ls = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["ls-tree", &commit_sha])
+            .output()
+            .unwrap();
+        let output = String::from_utf8(ls.stdout).unwrap();
+        assert!(
+            output.contains("100755"),
+            "executable blob should have mode 100755: {output}"
+        );
+    }
 }

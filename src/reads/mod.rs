@@ -1037,4 +1037,366 @@ mod tests {
         assert!(matches!(renamed.status, DiffStatus::Renamed));
         assert_eq!(renamed.old_path.as_deref(), Some("old.rs"));
     }
+
+    // ── parse_diff edge-case coverage ────────────────────────────────────
+
+    /// Binary files produce `-` in numstat; `parse_diff` must treat them
+    /// as 0 additions / 0 deletions without panicking.
+    #[test]
+    fn parse_diff_handles_binary_dash_numstat() {
+        // git numstat shows "-\t-\t<path>" for binary files.
+        let numstat = "-\t-\tbinary.bin\n";
+        let patch = "";
+        let files = parse_diff(numstat, patch);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "binary.bin");
+        assert_eq!(files[0].additions, 0);
+        assert_eq!(files[0].deletions, 0);
+    }
+
+    /// A numstat line with fewer than 3 tab-separated fields is silently
+    /// skipped (defensive guard, not a panic path).
+    #[test]
+    fn parse_diff_skips_short_numstat_lines() {
+        let numstat = "3\tsrc/a.rs\n"; // only 2 fields — no deletions column
+        let files = parse_diff(numstat, "");
+        assert!(files.is_empty(), "short numstat lines are dropped");
+    }
+
+    /// `new file mode` in the patch should upgrade the file status to
+    /// `Added`; `deleted file mode` should flip it to `Deleted`.
+    #[test]
+    fn parse_diff_refines_status_from_patch_mode_lines() {
+        let numstat = "5\t0\tnewfile.rs\n0\t3\toldfile.rs\n";
+        let patch = "diff --git a/newfile.rs b/newfile.rs\n\
+                     new file mode 100644\n\
+                     diff --git a/oldfile.rs b/oldfile.rs\n\
+                     deleted file mode 100644\n";
+        let files = parse_diff(numstat, patch);
+        let new = files.iter().find(|f| f.path == "newfile.rs").unwrap();
+        assert!(matches!(new.status, DiffStatus::Added));
+        let del = files.iter().find(|f| f.path == "oldfile.rs").unwrap();
+        assert!(matches!(del.status, DiffStatus::Deleted));
+    }
+
+    /// Hunk with `+++ / ---` header lines: these must NOT be inserted
+    /// as `Add`/`Del` diff lines — only lines after the `@@` header count.
+    #[test]
+    fn parse_diff_excludes_triple_plus_minus_header_lines() {
+        let numstat = "1\t0\ta.txt\n";
+        // Use concat! to avoid Rust's line-continuation stripping leading whitespace.
+        let patch = concat!(
+            "diff --git a/a.txt b/a.txt\n",
+            "--- a/a.txt\n",
+            "+++ b/a.txt\n",
+            "@@ -1 +1,2 @@\n",
+            "+added line\n",
+            " context\n",
+        );
+        let files = parse_diff(numstat, patch);
+        assert_eq!(files.len(), 1);
+        let hunk = &files[0].hunks[0];
+        // Only the `+added line` and ` context` lines — not the `+++`/`---`.
+        assert_eq!(hunk.lines.len(), 2);
+        assert!(matches!(hunk.lines[0].kind, super::DiffLineKind::Add));
+        assert!(matches!(hunk.lines[1].kind, super::DiffLineKind::Ctx));
+    }
+
+    /// Multi-hunk patch: final open hunk should be flushed at end-of-input
+    /// even without another `diff --git` header to close it.
+    #[test]
+    fn parse_diff_flushes_last_hunk_at_end() {
+        let numstat = "2\t1\ta.txt\n";
+        let patch = "diff --git a/a.txt b/a.txt\n\
+                     @@ -1,1 +1,2 @@ first\n\
+                     -old\n\
+                     +new\n\
+                     +extra\n";
+        let files = parse_diff(numstat, patch);
+        assert_eq!(files[0].hunks.len(), 1);
+        let hunk = &files[0].hunks[0];
+        assert_eq!(hunk.lines.len(), 3);
+    }
+
+    /// `parse_log_records` with a no-parent (root) commit: parents field is
+    /// an empty string, not whitespace-delimited tokens, so `parents` should
+    /// be an empty vec.
+    #[test]
+    fn parse_log_records_root_commit_has_empty_parents() {
+        let mut input: Vec<u8> = Vec::new();
+        for f in [
+            "deadbeef00000000000000000000000000000000",
+            "", // no parents
+            "Root Author",
+            "root@x",
+            "Root Committer",
+            "root@x",
+            "1700000001",
+        ] {
+            input.extend_from_slice(f.as_bytes());
+            input.push(1);
+        }
+        input.extend_from_slice(b"\nroot commit message");
+        input.push(0);
+        let out = parse_log_records(&input).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].parents.is_empty(), "root commit has no parents");
+    }
+
+    /// Multi-parent (merge) commit: parents field has two SHAs separated by
+    /// a space; `parents` should contain both.
+    #[test]
+    fn parse_log_records_merge_commit_has_two_parents() {
+        let p1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let p2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut input: Vec<u8> = Vec::new();
+        for f in [
+            "cccccccccccccccccccccccccccccccccccccccc",
+            &format!("{p1} {p2}"),
+            "Merger",
+            "m@x",
+            "Merger",
+            "m@x",
+            "1700000002",
+        ] {
+            input.extend_from_slice(f.as_bytes());
+            input.push(1);
+        }
+        input.extend_from_slice(b"\nmerge commit");
+        input.push(0);
+        let out = parse_log_records(&input).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].parents, vec![p1.to_string(), p2.to_string()]);
+    }
+
+    // ── Async helpers exercised against real on-disk bare repos ──────────
+
+    /// Build a minimal bare git repo in `dir` using `git init --bare`,
+    /// then seed one commit via plumbing so all helpers have something real
+    /// to work with. Returns the commit SHA.
+    async fn init_bare_with_commit(dir: &std::path::Path) -> String {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        // git init --bare
+        let st = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git init --bare failed");
+
+        // Write a blob
+        let mut blob_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        blob_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello\n")
+            .unwrap();
+        let blob = String::from_utf8(blob_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // mktree
+        let mut tree_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tree_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob}\thello.txt\n").as_bytes())
+            .unwrap();
+        let tree = String::from_utf8(tree_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // commit-tree
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["commit-tree", "-m", "initial", &tree])
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        // update-ref HEAD
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["update-ref", "refs/heads/main", &commit])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(dir)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .status()
+            .unwrap();
+
+        commit
+    }
+
+    #[tokio::test]
+    async fn resolve_ref_sha_returns_some_for_existing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = init_bare_with_commit(&git_dir).await;
+
+        let got = super::resolve_ref_sha(&git_dir, "HEAD").await.unwrap();
+        assert_eq!(got, Some(commit));
+    }
+
+    #[tokio::test]
+    async fn resolve_ref_sha_returns_none_for_missing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        init_bare_with_commit(&git_dir).await;
+
+        let got = super::resolve_ref_sha(&git_dir, "refs/heads/nonexistent")
+            .await
+            .unwrap();
+        assert!(got.is_none(), "missing ref should return None");
+    }
+
+    #[tokio::test]
+    async fn list_refs_native_returns_entries_for_seeded_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = init_bare_with_commit(&git_dir).await;
+
+        let refs = super::list_refs_native(&git_dir).await.unwrap();
+        assert!(
+            refs.iter()
+                .any(|r| r.name == "refs/heads/main" && r.sha == commit),
+            "should contain refs/heads/main pointing at the commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_refs_native_returns_multiple_refs() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = init_bare_with_commit(&git_dir).await;
+
+        // Create a tag ref pointing at the same commit.
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["update-ref", "refs/tags/v1.0", &commit])
+            .status()
+            .unwrap();
+
+        let refs = super::list_refs_native(&git_dir).await.unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"refs/heads/main"));
+        assert!(names.contains(&"refs/tags/v1.0"));
+    }
+
+    #[tokio::test]
+    async fn count_commits_from_head_returns_correct_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        let commit = init_bare_with_commit(&git_dir).await;
+
+        // Add a second commit on top.
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut blob_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        blob_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"world\n")
+            .unwrap();
+        let blob2 = String::from_utf8(blob_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut tree_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tree_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob2}\tworld.txt\n").as_bytes())
+            .unwrap();
+        let tree2 = String::from_utf8(tree_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-p", &commit, "-m", "second", &tree2])
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit2 = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["update-ref", "refs/heads/main", &commit2])
+            .status()
+            .unwrap();
+
+        let count = super::count_commits_from_head(&git_dir).await.unwrap();
+        assert_eq!(count, 2, "expected 2 commits from HEAD");
+    }
+
+    #[tokio::test]
+    async fn count_commits_from_head_returns_zero_for_empty_repo() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("repo.git");
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&git_dir)
+            .status()
+            .unwrap();
+
+        // No HEAD, no commits — should return 0, not an error.
+        let count = super::count_commits_from_head(&git_dir).await.unwrap();
+        assert_eq!(count, 0);
+    }
 }
