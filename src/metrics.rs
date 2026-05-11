@@ -100,15 +100,9 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
 pub async fn track_metrics(req: Request, next: Next) -> Response {
     let start = Instant::now();
     let method = req.method().as_str().to_string();
-    // MatchedPath is the route pattern ("/v1/repos/:id"), not the
-    // concrete URI. Use the raw URI only as a fallback for unmatched
-    // paths so we don't pollute the label space with per-repo-id
-    // cardinality.
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
+    let matched = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
+    let raw_uri = req.uri().path();
+    let path = path_label_for(matched, raw_uri);
 
     let response = next.run(req).await;
     let status = response.status().as_u16().to_string();
@@ -131,6 +125,26 @@ pub async fn track_metrics(req: Request, next: Next) -> Response {
     response
 }
 
+/// Compute the `path` label for the request metrics. Returns the
+/// matched route template (`/v1/repos/:id`) when one exists; otherwise
+/// returns the constant `"<unmatched>"` rather than the raw URI.
+///
+/// Why constant-on-unmatched: an unauthenticated scanner hitting
+/// `/scan/<unique-id>` once per probe would otherwise produce one
+/// Prometheus series per random path and blow up the scrape size. The
+/// raw URI is still useful for debugging — `track_metrics` emits it as
+/// a structured log field when the fallback fires, so 404 patterns
+/// remain visible in logs without polluting the metric label space.
+pub(crate) fn path_label_for(matched: Option<&str>, raw_uri: &str) -> String {
+    match matched {
+        Some(m) => m.to_string(),
+        None => {
+            tracing::debug!(uri = raw_uri, "request hit an unmatched route");
+            "<unmatched>".to_string()
+        }
+    }
+}
+
 /// Render the Prometheus exposition. Returns `text/plain; version=0.0.4`
 /// which every scraper accepts.
 pub fn render(handle: &PrometheusHandle) -> Response<Body> {
@@ -141,4 +155,30 @@ pub fn render(handle: &PrometheusHandle) -> Response<Body> {
         HeaderValue::from_static("text/plain; version=0.0.4"),
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_label_uses_matched_route_template() {
+        // Matched routes pass through verbatim — this is the case for
+        // every legit endpoint, including parameterized ones where the
+        // template (`/v1/repos/:id`) is what we want as the label.
+        let label = path_label_for(Some("/v1/repos/:id"), "/v1/repos/abc123");
+        assert_eq!(label, "/v1/repos/:id");
+    }
+
+    #[test]
+    fn path_label_collapses_unmatched_to_constant() {
+        // Unmatched paths must collapse to a single label so a 404
+        // scanner hitting random suffixes can't explode the metric
+        // label space.
+        let a = path_label_for(None, "/scan/random-1");
+        let b = path_label_for(None, "/scan/random-2");
+        assert_eq!(a, "<unmatched>");
+        assert_eq!(b, "<unmatched>");
+        assert_eq!(a, b, "every unmatched path must share one label");
+    }
 }
