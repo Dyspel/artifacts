@@ -674,14 +674,32 @@ echo "$alice_ids" | grep -qv "$bob_repo" \
     || { echo "FAIL: alice's list leaked bob's repo $bob_repo"; exit 1; }
 echo "    alice → GET /v1/repos → her repos only, bob's absent"
 
-# Admin sees all repos including ones alice doesn't own.
+# Admin sees all repos including ones alice doesn't own. Hit it with -i
+# so we can pin the X-Total-Count response header at the same time —
+# /v1/repos is paginated and the header is the only way callers know
+# whether they need another page.
 admin_repos_list="${WORK_DIR}/admin_repos_list.json"
-curl -fsS "${auth[@]}" "$BASE_URL/v1/repos" -o "$admin_repos_list"
+admin_repos_hdr="${WORK_DIR}/admin_repos_list.hdr"
+curl -fsS -D "$admin_repos_hdr" "${auth[@]}" "$BASE_URL/v1/repos" -o "$admin_repos_list"
 admin_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$admin_repos_list")
 alice_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$alice_list")
 [[ "$admin_count" -gt "$alice_count" ]] \
     || { echo "FAIL: admin count ($admin_count) should exceed alice's ($alice_count)"; exit 1; }
-echo "    admin → GET /v1/repos → $admin_count repos (alice sees $alice_count)"
+admin_total_hdr=$(grep -i '^x-total-count:' "$admin_repos_hdr" | tr -d '\r' | awk '{print $2}')
+[[ "$admin_total_hdr" == "$admin_count" ]] \
+    || { echo "FAIL: GET /v1/repos X-Total-Count=$admin_total_hdr but body had $admin_count rows"; exit 1; }
+echo "    admin → GET /v1/repos → $admin_count repos (X-Total-Count=$admin_total_hdr; alice sees $alice_count)"
+
+# Pagination: ?limit=1 returns one row but X-Total-Count still reports
+# the full total, so callers know to fetch more pages.
+admin_repos_p1="${WORK_DIR}/admin_repos_p1.json"
+admin_repos_p1_hdr="${WORK_DIR}/admin_repos_p1.hdr"
+curl -fsS -D "$admin_repos_p1_hdr" "${auth[@]}" "$BASE_URL/v1/repos?limit=1" -o "$admin_repos_p1"
+p1_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$admin_repos_p1")
+p1_total=$(grep -i '^x-total-count:' "$admin_repos_p1_hdr" | tr -d '\r' | awk '{print $2}')
+[[ "$p1_count" == "1" && "$p1_total" == "$admin_total_hdr" ]] \
+    || { echo "FAIL: GET /v1/repos?limit=1 → body=$p1_count total=$p1_total (expected 1 / $admin_total_hdr)"; exit 1; }
+echo "    /v1/repos?limit=1 → 1 row, X-Total-Count=$p1_total (full total preserved)"
 
 # Read endpoints: per-repo detail + git plumbing (commits, refs, tree,
 # blob, diff, notes). All owner-scoped — admin token is fine here and

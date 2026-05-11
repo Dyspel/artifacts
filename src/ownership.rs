@@ -103,6 +103,27 @@ pub trait OwnershipStore: Send + Sync {
     /// index so this stays cheap as the table grows.
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>>;
 
+    /// Page-shaped variant of `list_by_owner`. Symmetric with
+    /// `list_paginated` but scoped to one owner — backs the paginated
+    /// `GET /v1/repos` so a user's fleet view isn't unbounded.
+    ///
+    /// Default impl falls back to `list_by_owner` + slice; SQLite
+    /// pushes `LIMIT`/`OFFSET` into the indexed query.
+    async fn list_paginated_by_owner(
+        &self,
+        subject: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<RepoRow>> {
+        let all = self.list_by_owner(subject).await?;
+        let off = offset as usize;
+        if off >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = (off + limit as usize).min(all.len());
+        Ok(all[off..end].to_vec())
+    }
+
     /// Fetch one row by id. Used by the admin-detail endpoint, which
     /// needs `created_at` alongside the ownership check. A dedicated
     /// PK-lookup is O(1); previously this was a `list_all().find(...)`
@@ -259,6 +280,37 @@ impl OwnershipStore for SqliteOwnershipStore {
                 created_at: row.get(2)?,
             })
         })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    async fn list_paginated_by_owner(
+        &self,
+        subject: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<RepoRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_subject, created_at
+             FROM repos
+             WHERE owner_subject = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![subject, limit as i64, offset as i64],
+            |row| {
+                Ok(RepoRow {
+                    id: row.get(0)?,
+                    owner: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -722,5 +774,59 @@ mod tests {
 
         // Offset past the end must terminate cleanly.
         assert!(store.list_paginated(10, total).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_paginated_by_owner_walks_owner_subset() {
+        // Same contract as the admin-list walk, but scoped to one
+        // owner — the user-facing `/v1/repos` endpoint relies on
+        // this. A buggy `WHERE owner_subject = ?` would either drop
+        // owner filtering (returning bob's rows to alice) or break
+        // pagination ordering.
+        let (_d, store) = fresh_store();
+        let owned: u32 = 60;
+        let other: u32 = 40;
+        for i in 0..owned {
+            store
+                .record_owner(&format!("alice-{i:03}"), Some("alice"))
+                .await
+                .unwrap();
+        }
+        for i in 0..other {
+            store
+                .record_owner(&format!("bob-{i:03}"), Some("bob"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count_by_owner("alice").await.unwrap(), owned as u64);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let chunk: u32 = 20;
+        let mut offset: u32 = 0;
+        loop {
+            let page = store
+                .list_paginated_by_owner("alice", chunk, offset)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                assert!(row.id.starts_with("alice-"), "bob's row leaked: {}", row.id);
+                assert!(
+                    seen.insert(row.id.clone()),
+                    "row {} appeared on more than one page",
+                    row.id,
+                );
+            }
+            offset += chunk;
+            assert!(offset <= owned + chunk, "paged past the dataset");
+        }
+        assert_eq!(seen.len(), owned as usize);
+        assert!(store
+            .list_paginated_by_owner("alice", 10, owned)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

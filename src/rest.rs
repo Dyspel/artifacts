@@ -891,8 +891,9 @@ async fn probe_stores(
 /// that already parse `/v1/admin/repos` don't need a second parser.
 pub async fn list_repos(
     State(state): State<RestState>,
+    axum::extract::Query(q): axum::extract::Query<AdminListReposQuery>,
     headers: HeaderMap,
-) -> Result<Json<Vec<AdminRepoSummary>>> {
+) -> Result<Response> {
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
@@ -900,14 +901,36 @@ pub async fn list_repos(
     )?;
     state.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
 
-    let rows = match &principal {
-        crate::auth::Principal::Admin => state.ownership.list_all().await?,
-        crate::auth::Principal::User { subject } => {
-            state.ownership.list_by_owner(subject).await?
-        }
+    let limit = q
+        .limit
+        .unwrap_or(ADMIN_LIST_REPOS_DEFAULT_LIMIT)
+        .min(ADMIN_LIST_REPOS_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+
+    let (rows, total) = match &principal {
+        crate::auth::Principal::Admin => (
+            state.ownership.list_paginated(limit, offset).await?,
+            state.ownership.count_all().await?,
+        ),
+        crate::auth::Principal::User { subject } => (
+            state
+                .ownership
+                .list_paginated_by_owner(subject, limit, offset)
+                .await?,
+            state.ownership.count_by_owner(subject).await?,
+        ),
     };
+
+    if offset == 0 && total > limit as u64 {
+        tracing::warn!(
+            total,
+            limit,
+            "/v1/repos returned a truncated page; caller should paginate via ?offset=",
+        );
+    }
+
     let repos_dir = state.cfg.repos_dir();
-    let summaries = rows
+    let summaries: Vec<AdminRepoSummary> = rows
         .into_iter()
         .map(|r| AdminRepoSummary {
             source_id: state.alternates_cache.lookup(&repos_dir, &r.id),
@@ -916,7 +939,15 @@ pub async fn list_repos(
             created_at: r.created_at,
         })
         .collect();
-    Ok(Json(summaries))
+
+    let body = Json(summaries).into_response();
+    let (mut parts, body) = body.into_parts();
+    parts.headers.insert(
+        axum::http::HeaderName::from_static("x-total-count"),
+        axum::http::HeaderValue::from_str(&total.to_string())
+            .expect("u64 decimal fits in a header value"),
+    );
+    Ok(Response::from_parts(parts, body))
 }
 
 // ──────────────────────────────────────────────────────────────────────
