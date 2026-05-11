@@ -554,6 +554,75 @@ mod tests {
     }
 
     #[test]
+    fn create_fails_with_repo_exists_when_id_taken() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = RepoId::try_from("repo-dup1").unwrap();
+        storage.create(&id).unwrap();
+        let err = storage.create(&id).unwrap_err();
+        assert!(
+            matches!(err, Error::RepoExists(ref s) if s == "repo-dup1"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_fails_with_repo_not_found_when_missing() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = RepoId::try_from("repo-gone").unwrap();
+        let err = storage.delete(&id).unwrap_err();
+        assert!(
+            matches!(err, Error::RepoNotFound(ref s) if s == "repo-gone"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn fork_fails_with_repo_not_found_when_source_missing() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let src = RepoId::try_from("src-nope").unwrap();
+        let fid = RepoId::try_from("fork-any1").unwrap();
+        let err = storage.fork(&src, &fid).unwrap_err();
+        assert!(
+            matches!(err, Error::RepoNotFound(ref s) if s == "src-nope"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn fork_fails_with_repo_exists_when_fork_id_taken() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let src = RepoId::try_from("src-fork1").unwrap();
+        let fid = RepoId::try_from("frk-taken").unwrap();
+        storage.create(&src).unwrap();
+        storage.create(&fid).unwrap();
+        let err = storage.fork(&src, &fid).unwrap_err();
+        assert!(
+            matches!(err, Error::RepoExists(ref s) if s == "frk-taken"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_repo_id_64_chars_is_valid() {
+        let long = "a".repeat(64);
+        assert!(validate_repo_id(&long).is_ok(), "64-char id must be valid");
+    }
+
+    #[test]
+    fn validate_repo_id_65_chars_is_invalid() {
+        let too_long = "a".repeat(65);
+        let err = validate_repo_id(&too_long).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRepoId(_)),
+            "expected InvalidRepoId, got: {err}"
+        );
+    }
+
+    #[test]
     fn fork_creates_alternates_and_snapshots_refs_to_packed() {
         let tmp = tempdir();
         let storage = FsStorage::new(tmp.join("repos")).unwrap();

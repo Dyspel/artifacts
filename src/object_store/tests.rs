@@ -589,3 +589,169 @@ fn sqlite_ingest_pack_empty_is_noop() {
     // Nothing landed in the table.
     assert!(store.list_loose(&r).unwrap().is_empty());
 }
+
+// ─── ObjectKind: as_str / from_pack_type ────────────────────────
+
+#[test]
+fn object_kind_as_str_all_variants() {
+    assert_eq!(ObjectKind::Commit.as_str(), "commit");
+    assert_eq!(ObjectKind::Tree.as_str(), "tree");
+    assert_eq!(ObjectKind::Blob.as_str(), "blob");
+    assert_eq!(ObjectKind::Tag.as_str(), "tag");
+}
+
+#[test]
+fn object_kind_from_pack_type_all_direct_kinds() {
+    assert_eq!(ObjectKind::from_pack_type(1), Some(ObjectKind::Commit));
+    assert_eq!(ObjectKind::from_pack_type(2), Some(ObjectKind::Tree));
+    assert_eq!(ObjectKind::from_pack_type(3), Some(ObjectKind::Blob));
+    assert_eq!(ObjectKind::from_pack_type(4), Some(ObjectKind::Tag));
+}
+
+#[test]
+fn object_kind_from_pack_type_out_of_range_returns_none() {
+    // 0, 5, 6, 7, 255 — none are direct-kind codes.
+    assert_eq!(ObjectKind::from_pack_type(0), None);
+    assert_eq!(ObjectKind::from_pack_type(5), None);
+    assert_eq!(ObjectKind::from_pack_type(6), None);
+    assert_eq!(ObjectKind::from_pack_type(7), None);
+    assert_eq!(ObjectKind::from_pack_type(255), None);
+}
+
+// ─── is_hex40_bytes reject paths ────────────────────────────────
+
+#[test]
+fn is_hex40_rejects_non_hex_chars() {
+    // 'g' is not a hex digit.
+    let bad: [u8; 40] = *b"gggggggggggggggggggggggggggggggggggggggg";
+    assert!(!is_hex40_bytes(&bad));
+}
+
+#[test]
+fn is_hex40_rejects_wrong_length() {
+    assert!(!is_hex40_bytes(b"deadbeef"));
+    assert!(!is_hex40_bytes(b""));
+    // 41 chars — one too many.
+    assert!(!is_hex40_bytes(
+        b"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c"
+    ));
+}
+
+#[test]
+fn is_hex40_accepts_uppercase_hex() {
+    // is_hex40_bytes is case-insensitive (A-F accepted). Note that
+    // Oid::try_from requires lowercase, but the byte-level helper
+    // deliberately accepts upper for the pack-wire path.
+    assert!(is_hex40_bytes(b"ABCDEF1234567890ABCDEF1234567890ABCDEF12"));
+}
+
+// ─── Trait default methods via minimal impl ─────────────────────
+
+struct MinimalObjectStore;
+
+impl ObjectStore for MinimalObjectStore {
+    fn read_loose(&self, _repo_id: &RepoId, _oid: &Oid) -> crate::error::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn write_loose(
+        &self,
+        _repo_id: &RepoId,
+        _oid: &Oid,
+        _bytes: &[u8],
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    fn list_loose(&self, _repo_id: &RepoId) -> crate::error::Result<Vec<LooseInfo>> {
+        Ok(vec![])
+    }
+
+    fn delete_loose(&self, _repo_id: &RepoId, _oid: &Oid) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+}
+
+#[test]
+fn trait_default_exists_uses_read_loose() {
+    // Default `exists` delegates to `read_loose`. MinimalStore always
+    // returns None from read_loose, so exists must return false.
+    let store = MinimalObjectStore;
+    let r = rid("repo-a");
+    let o = to_oid(&"a".repeat(40));
+    assert!(!store.exists(&r, &o).unwrap());
+}
+
+#[test]
+fn trait_default_ingest_pack_returns_err() {
+    let store = MinimalObjectStore;
+    let r = rid("repo-a");
+    let err = store
+        .ingest_pack(&r, b"fake-pack-bytes-longer-than-32-bytes-pad")
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ingest_pack") || msg.contains("not supported"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[test]
+fn trait_default_read_object_returns_err() {
+    let store = MinimalObjectStore;
+    let r = rid("repo-a");
+    let o = to_oid(&"b".repeat(40));
+    let err = store.read_object(&r, &o).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_object") || msg.contains("not supported"),
+        "unexpected message: {msg}"
+    );
+}
+
+// ─── FsObjectStore: missing repo / missing oid ──────────────────
+
+#[test]
+fn fs_exists_returns_false_for_missing_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    // The repos dir exists but the specific repo dir does not.
+    let r = rid("no-such-repo");
+    let o = to_oid(&"c".repeat(40));
+    assert!(!store.exists(&r, &o).unwrap());
+}
+
+#[test]
+fn fs_read_object_returns_none_for_missing_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    let r = rid("no-such-repo");
+    let o = to_oid(&"d".repeat(40));
+    assert!(store.read_object(&r, &o).unwrap().is_none());
+}
+
+#[test]
+fn fs_list_loose_returns_empty_for_missing_repo_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    let r = rid("no-such-repo");
+    // Should not error — missing dir == no loose objects.
+    let list = store.list_loose(&r).unwrap();
+    assert!(list.is_empty());
+}
+
+#[test]
+fn fs_delete_loose_returns_false_when_object_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let storage = crate::storage::FsStorage::new(&repos).unwrap();
+    let repo_id_str = crate::storage::new_repo_id();
+    storage
+        .create(&RepoId::try_from(repo_id_str.as_str()).unwrap())
+        .unwrap();
+    let store = FsObjectStore::new(&repos);
+    let r = rid(&repo_id_str);
+    let o = to_oid(&"e".repeat(40));
+    // Object was never written — delete should be a no-op returning false.
+    assert!(!store.delete_loose(&r, &o).unwrap());
+}
