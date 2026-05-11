@@ -432,7 +432,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         // Exactly 32 bytes — the canonical empty pack.
@@ -465,7 +467,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         use std::io::Write as _;
@@ -547,7 +551,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         let err = generate_pack(&git_dir, &["not-a-hex-oid".to_string()], &[]).unwrap_err();
@@ -564,7 +570,9 @@ mod tests {
         let repos = tmp.path().join("repos");
         let storage = FsStorage::new(&repos).unwrap();
         let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
         let git_dir = repos.join(format!("{repo_id}.git"));
 
         // We need a valid want so we don't hit the empty-wants short-circuit,
