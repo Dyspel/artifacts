@@ -243,6 +243,29 @@ fn git_config_user(repo: &Path) {
     git_must(repo, &["config", "user.name", "E2E"]);
 }
 
+/// True if `git clone <remote>` succeeds. Used for negative cases
+/// (unauthenticated / unknown repo) where we expect failure.
+fn git_clone_ok(remote: &str, dest: &Path) -> bool {
+    Command::new("git")
+        .args(["clone", "--quiet", remote, dest.to_str().unwrap()])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Strip `user:pass@` credentials from a clone URL, yielding the
+/// anonymous form (used to prove the smart-HTTP auth gate rejects it).
+fn strip_credentials(remote: &str) -> String {
+    match remote.split_once("://") {
+        Some((scheme, rest)) => {
+            let host_path = rest.rsplit_once('@').map_or(rest, |(_, hp)| hp);
+            format!("{scheme}://{host_path}")
+        },
+        None => remote.to_string(),
+    }
+}
+
 fn sign_jwt(secret: &str, user: &str) -> String {
     #[derive(serde::Serialize)]
     struct Claims<'a> {
@@ -634,6 +657,94 @@ fn e2e_inprocess_full_surface() {
         "owner-scoped listing: {}",
         alice_list.1
     );
+
+    // --- error / edge branches --------------------------------------
+    // Oversized REST commit blob (cap is 1024) → 400.
+    let big = send_json(
+        auth(ureq::post(&commit_url)),
+        &json!({
+            "branch":"main","parent":c2_sha,"message":"too big",
+            "changes":[{"op":"write","path":"big.txt","content":"x".repeat(2000)}]
+        }),
+    );
+    assert_status(&big, 400, "oversized blob");
+
+    // Reads error branches.
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/blob?commit=main&path=does/not/exist"
+        )))),
+        400,
+        "blob missing path",
+    );
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{rid}/notes?commit={c2_sha}"
+        )))),
+        404,
+        "missing note",
+    );
+    // Invalid ref characters are rejected before any git work (400).
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/tree?ref=bad%20ref"
+        )))),
+        400,
+        "tree invalid ref",
+    );
+    // Admin get on a missing repo → 404.
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/admin/repos/no-such-repo"
+        )))),
+        404,
+        "admin get missing repo",
+    );
+    // Audit list with pagination query params.
+    assert_status(
+        &send(auth(ureq::get(&format!("{base}/v1/admin/audit?limit=5")))),
+        200,
+        "admin audit paginated",
+    );
+
+    // Read-only fork rejects pushes.
+    let ro = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/forks"))),
+        &json!({"readOnly": true}),
+    );
+    assert_status(&ro, 200, "read-only fork");
+    let ro_remote = jstr(&parse(&ro.1), "remote").to_string();
+    let ro_clone = work.path().join("ro");
+    git_clone(&ro_remote, &ro_clone);
+    git_config_user(&ro_clone);
+    std::fs::write(ro_clone.join("x.txt"), "x\n").unwrap();
+    git_must(&ro_clone, &["add", "x.txt"]);
+    git_must(&ro_clone, &["commit", "-q", "-m", "attempt"]);
+    let pushed = git(&ro_clone, &["push", "-q", "origin", "HEAD:main"]);
+    assert!(
+        !pushed.status.success(),
+        "push to a read-only fork must be rejected"
+    );
+
+    // Smart-HTTP auth gate: anonymous clone of a private repo fails.
+    let anon = strip_credentials(&remote);
+    assert!(
+        !git_clone_ok(&anon, &work.path().join("anon")),
+        "anonymous clone must be rejected"
+    );
+    // Unknown repo clone fails too.
+    assert!(
+        !git_clone_ok(
+            &format!("{base}/git/no-such-repo"),
+            &work.path().join("missing")
+        ),
+        "clone of a missing repo must fail"
+    );
+
+    // Deleting a repo that still has dependent forks without ?force is
+    // refused (409 fork_dependency); repo_id has the fork created above.
+    let refused = send(auth(ureq::delete(&format!("{base}/v1/repos/{repo_id}"))));
+    assert_status(&refused, 409, "delete with dependent fork");
 
     // --- delete a repo (force, since it has a fork) ------------------
     let del = send(auth(ureq::delete(&format!(
