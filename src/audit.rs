@@ -603,6 +603,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn noop_store_uses_trait_default_verify_and_probe() {
+        // NoopAuditStore overrides record/list/count/prune but not
+        // verify_chain / probe_write — so this exercises the defaults.
+        let s = NoopAuditStore;
+        assert_eq!(s.verify_chain().await.unwrap().verified, 0);
+        s.probe_write().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_prune_task_disabled_for_zero_retention() {
+        let store: Arc<dyn AuditStore> = Arc::new(NoopAuditStore);
+        let handle = spawn_prune_task(
+            store,
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert!(handle.is_none(), "zero retention must not spawn a task");
+    }
+
+    #[tokio::test]
+    async fn refresh_events_stored_gauge_runs_without_panic() {
+        let (_d, s) = store();
+        refresh_events_stored_gauge(&s).await;
+    }
+
+    #[tokio::test]
+    async fn list_reconstructs_repo_id_from_row() {
+        let (_d, s) = store();
+        s.record(evt("repo.create", "admin", Some("repo-a")))
+            .await
+            .unwrap();
+        let rows = s.list(AuditQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].repo_id.as_ref().map(crate::ids::RepoId::as_str),
+            Some("repo-a")
+        );
+    }
+
+    #[tokio::test]
     async fn record_then_list_round_trips() {
         let (_d, s) = store();
         s.record(evt("repo.create", "admin", Some("repo-1")))

@@ -325,4 +325,84 @@ mod tests {
             Err(Error::Unauthorized)
         ));
     }
+
+    #[test]
+    fn authorize_rest_rejects_non_ascii_header() {
+        // A header value with non-visible bytes fails `to_str()` → 401.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap(),
+        );
+        assert!(matches!(
+            authorize_rest(&h, "sekret", None, None, None),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn basic_token_extracts_password_half() {
+        let b64 = STANDARD.encode("anyuser:the-token");
+        let got = basic_token(&headers(Some(&format!("Basic {b64}")))).unwrap();
+        assert_eq!(got, "the-token");
+    }
+
+    #[test]
+    fn basic_token_rejects_malformed_inputs() {
+        // Missing header, wrong scheme, bad base64, and no colon all 401.
+        assert!(basic_token(&headers(None)).is_err());
+        assert!(basic_token(&headers(Some("Bearer xyz"))).is_err());
+        assert!(basic_token(&headers(Some("Basic !!!not-base64!!!"))).is_err());
+        let no_colon = STANDARD.encode("nocolonhere");
+        assert!(basic_token(&headers(Some(&format!("Basic {no_colon}")))).is_err());
+        // A non-ASCII header value fails `to_str()`.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_bytes(b"Basic \xff").unwrap(),
+        );
+        assert!(basic_token(&h).is_err());
+    }
+
+    #[tokio::test]
+    async fn authorize_git_enforces_repo_and_scope() {
+        use crate::tokens::{Scope, SqliteTokenStore, TokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTokenStore::open(&dir.path().join("tok.db")).unwrap();
+        let repo = crate::ids::RepoId::try_from("repo-a").unwrap();
+        let token = store
+            .mint(&repo, Scope::Read, None, None)
+            .await
+            .unwrap()
+            .into_inner();
+        let b64 = STANDARD.encode(format!("x:{token}"));
+        let h = headers(Some(&format!("Basic {b64}")));
+
+        // Right repo + read scope → Ok.
+        assert!(authorize_git(&store, &h, "repo-a", Scope::Read)
+            .await
+            .is_ok());
+        // Read token used for a write request → 403 read-only.
+        assert!(matches!(
+            authorize_git(&store, &h, "repo-a", Scope::Write).await,
+            Err(Error::Forbidden(_))
+        ));
+        // Right token, wrong repo → 403 not-valid-for-this-repo.
+        assert!(matches!(
+            authorize_git(&store, &h, "repo-b", Scope::Read).await,
+            Err(Error::Forbidden(_))
+        ));
+        // Unknown token → 401.
+        let bad = STANDARD.encode("x:not-a-real-token");
+        assert!(matches!(
+            authorize_git(
+                &store,
+                &headers(Some(&format!("Basic {bad}"))),
+                "repo-a",
+                Scope::Read
+            )
+            .await,
+            Err(Error::UnauthorizedBasic)
+        ));
+    }
 }
