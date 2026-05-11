@@ -96,8 +96,11 @@ impl InProcServer {
         ])
         .args;
 
+        // 4 workers (vs the usual 2) gives the accept loop headroom so a
+        // ptrace-paused worker under coverage instrumentation doesn't
+        // starve connection acceptance mid-scenario.
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()
             .expect("build runtime");
@@ -169,20 +172,33 @@ fn collect(resp: ureq::Response) -> HttpReply {
     (status, resp.into_string().unwrap_or_default(), headers)
 }
 
+// Transient connect errors are retried: under coverage instrumentation
+// (ptrace) the in-process server's accept loop can be paused at an
+// inopportune moment, surfacing a spurious "connection refused". A
+// `Status` (any HTTP response, including 4xx/5xx) is a real answer and
+// returned immediately; only transport errors retry.
 fn send(req: ureq::Request) -> HttpReply {
-    match req.call() {
-        Ok(r) => collect(r),
-        Err(ureq::Error::Status(_, r)) => collect(r),
-        Err(e) => panic!("transport error: {e}"),
+    for attempt in 0..8 {
+        match req.clone().call() {
+            Ok(r) => return collect(r),
+            Err(ureq::Error::Status(_, r)) => return collect(r),
+            Err(e) if attempt == 7 => panic!("transport error after retries: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
     }
+    unreachable!()
 }
 
 fn send_json(req: ureq::Request, body: &Value) -> HttpReply {
-    match req.send_json(body.clone()) {
-        Ok(r) => collect(r),
-        Err(ureq::Error::Status(_, r)) => collect(r),
-        Err(e) => panic!("transport error: {e}"),
+    for attempt in 0..8 {
+        match req.clone().send_json(body.clone()) {
+            Ok(r) => return collect(r),
+            Err(ureq::Error::Status(_, r)) => return collect(r),
+            Err(e) if attempt == 7 => panic!("transport error after retries: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
     }
+    unreachable!()
 }
 
 fn bearer(token: &str) -> String {
