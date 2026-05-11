@@ -840,6 +840,61 @@ fn e2e_inprocess_full_surface() {
     );
     assert_status(&big, 400, "oversized blob");
 
+    // Commit-builder input validation branches.
+    let commit_bad = |body: Value, ctx: &'static str, want: u16| {
+        assert_status(&send_json(auth(ureq::post(&commit_url)), &body), want, ctx);
+    };
+    commit_bad(
+        json!({"branch":"bad branch","parent":c2_sha,"message":"m","changes":[]}),
+        "invalid branch name",
+        400,
+    );
+    commit_bad(
+        json!({"branch":"main","parent":c2_sha,"message":"m",
+               "changes":[{"op":"write","path":"f","content":"x","mode":"100600"}]}),
+        "unsupported mode",
+        400,
+    );
+    commit_bad(
+        json!({"branch":"main","parent":"0".repeat(40),"message":"m",
+               "changes":[{"op":"write","path":"f","content":"x"}]}),
+        "parent not found",
+        400,
+    );
+    commit_bad(
+        json!({"branch":"main","parent":c2_sha,"message":"m",
+               "changes":[{"op":"write","path":"f","content":"x","contentBase64":"eA=="}]}),
+        "both content and contentBase64",
+        400,
+    );
+    commit_bad(
+        json!({"branch":"main","parent":c2_sha,"message":"m",
+               "changes":[{"op":"write","path":"f","contentBase64":"!!notb64"}]}),
+        "bad base64",
+        400,
+    );
+    // Valid: base64 content + executable mode + an empty-content write,
+    // all in one commit (covers the decode, 100755, and (None,None) arms).
+    let ok_commit = send_json(
+        auth(ureq::post(&commit_url)),
+        &json!({"branch":"main","parent":c2_sha,"message":"mixed",
+        "changes":[
+            {"op":"write","path":"bin.dat","contentBase64":"aGVsbG8="},
+            {"op":"write","path":"run.sh","content":"#!/bin/sh\n","mode":"100755"},
+            {"op":"write","path":"empty"}
+        ]}),
+    );
+    assert_status(&ok_commit, 200, "mixed valid commit");
+    // Commit on a missing repo → 404.
+    assert_status(
+        &send_json(
+            auth(ureq::post(&format!("{base}/v1/repos/no-such-repo/commits"))),
+            &json!({"branch":"main","parent":null,"message":"m","changes":[]}),
+        ),
+        404,
+        "commit on missing repo",
+    );
+
     // Reads error branches.
     assert_status(
         &send(auth(ureq::get(&format!(
