@@ -638,4 +638,427 @@ mod tests {
         crate::pkt_line::write_flush(&mut body);
         assert!(parse_v2_fetch(&body).is_none());
     }
+
+    // ── ls-refs edge branches ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ls_refs_empty_body_returns_none() {
+        // An empty body has no first pkt-line at all → None.
+        assert!(parse_ls_refs_only(b"").is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_first_pkt_is_flush_returns_none() {
+        // A leading flush-pkt is not a command line.
+        let mut body = Vec::new();
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_first_pkt_is_delim_returns_none() {
+        // A leading delim is not a command line.
+        let mut body = Vec::new();
+        crate::pkt_line::write_delim(&mut body);
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_resp_end_in_caps_returns_none() {
+        // `0002` (response-end-pkt) anywhere in the capabilities section
+        // must cause rejection.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        // Inject a raw 0002 byte sequence.
+        body.extend_from_slice(b"0002");
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_no_delim_before_end_returns_none() {
+        // If the iterator is exhausted after the caps loop without seeing a
+        // delim, saw_delim stays false and we return None.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_data(&mut body, b"agent=git/test\n");
+        // No delim, no flush — buffer just ends. PktIter will return Truncated
+        // or simply end, so saw_delim remains false.
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_unknown_capability_returns_none() {
+        // A capability we don't recognise (not agent=, object-format=,
+        // session-id=) must trip the fallback.
+        let body = build_ls_refs_body(&["future-cap=yes"], &["peel"]);
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_session_id_capability_accepted() {
+        // session-id= is a known-safe capability; must not reject.
+        let body = build_ls_refs_body(
+            &["agent=git/2.43.0", "session-id=abc123"],
+            &["peel", "symrefs", "ref-prefix refs/heads/"],
+        );
+        let args = parse_ls_refs_only(&body).expect("session-id should be accepted");
+        assert!(args.peel);
+        assert!(args.symrefs);
+    }
+
+    #[test]
+    fn parse_ls_refs_delim_in_args_returns_none() {
+        // A delim-pkt inside the arguments section is malformed.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_delim(&mut body); // end of caps
+        crate::pkt_line::write_data(&mut body, b"peel\n");
+        crate::pkt_line::write_delim(&mut body); // unexpected second delim
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_resp_end_in_args_returns_none() {
+        // A response-end-pkt inside the arguments section is malformed.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"peel\n");
+        body.extend_from_slice(b"0002"); // RespEnd injected
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    #[test]
+    fn parse_ls_refs_unborn_argument_tolerated() {
+        // `unborn` is an accepted (no-op) argument; must not cause rejection.
+        let body = build_ls_refs_body(
+            &["agent=git/2.43.0"],
+            &["peel", "symrefs", "unborn", "ref-prefix HEAD"],
+        );
+        let args = parse_ls_refs_only(&body).expect("unborn should be tolerated");
+        assert!(args.peel);
+        assert!(args.symrefs);
+        assert_eq!(args.prefixes, vec!["HEAD".to_string()]);
+    }
+
+    #[test]
+    fn parse_ls_refs_args_loop_exhausted_without_flush_returns_none() {
+        // If the args loop runs out of input without a flush-pkt the outer
+        // None is returned (the for-loop falls through without matching Flush).
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=ls-refs\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"peel\n");
+        // No flush — just end of buffer; iterator exhausts normally.
+        assert!(parse_ls_refs_only(&body).is_none());
+    }
+
+    // ── v2 fetch edge branches ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_v2_fetch_empty_body_returns_none() {
+        assert!(parse_v2_fetch(b"").is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_first_pkt_is_flush_returns_none() {
+        let mut body = Vec::new();
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_flush_during_cap_loop_returns_none() {
+        // A flush immediately after the command line (before the delim) means
+        // no args section — spec says that's malformed for fetch.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_unknown_capability_returns_none() {
+        // Unrecognised capability in the caps section forces None — we'd
+        // rather subprocess than serve a wrong response.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_data(&mut body, b"future-cap=yes\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"done\n");
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_resp_end_in_caps_returns_none() {
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        body.extend_from_slice(b"0002");
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_no_delim_before_end_returns_none() {
+        // Buffer ends after caps without a delim.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_data(&mut body, b"agent=git/test\n");
+        // No delim — saw_delim stays false.
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_ofs_delta_and_include_tag_accepted() {
+        // ofs-delta and include-tag are standard caps; must not set
+        // has_unsupported.
+        let body = build_fetch_body(&[
+            "ofs-delta",
+            "include-tag",
+            "want 0123456789abcdef0123456789abcdef01234567",
+            "done",
+        ]);
+        let req = parse_v2_fetch(&body).expect("should parse");
+        assert!(req.is_simple());
+        assert!(!req.has_unsupported);
+    }
+
+    #[test]
+    fn parse_v2_fetch_have_invalid_hex_returns_none() {
+        let body = build_fetch_body(&[
+            "want 0123456789abcdef0123456789abcdef01234567",
+            "have not-a-sha",
+            "done",
+        ]);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_delim_in_args_returns_none() {
+        // A second delim in the args section is malformed.
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_data(&mut body, b"agent=git/test\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"done\n");
+        crate::pkt_line::write_delim(&mut body); // unexpected
+        crate::pkt_line::write_flush(&mut body);
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    #[test]
+    fn parse_v2_fetch_resp_end_in_args_returns_none() {
+        let mut body = Vec::new();
+        crate::pkt_line::write_data(&mut body, b"command=fetch\n");
+        crate::pkt_line::write_delim(&mut body);
+        crate::pkt_line::write_data(&mut body, b"done\n");
+        body.extend_from_slice(b"0002");
+        assert!(parse_v2_fetch(&body).is_none());
+    }
+
+    // ── receive-pack edge branches ───────────────────────────────────────────
+
+    #[test]
+    fn parse_receive_pack_malformed_pkt_returns_none() {
+        // A body that starts with a truncated / bad-hex pkt-line must return
+        // None rather than panic.
+        assert!(parse_receive_pack_body(b"zzz").is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_insufficient_parts_returns_none() {
+        // A data line that doesn't have three space-separated parts is wrong.
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(&mut buf, b"onlyone\n");
+        crate::pkt_line::write_flush(&mut buf);
+        assert!(parse_receive_pack_body(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_bad_old_oid_returns_none() {
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(
+            &mut buf,
+            b"not-hex-40 0123456789abcdef0123456789abcdef01234567 refs/heads/x\n",
+        );
+        crate::pkt_line::write_flush(&mut buf);
+        assert!(parse_receive_pack_body(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_bad_new_oid_returns_none() {
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(
+            &mut buf,
+            b"0123456789abcdef0123456789abcdef01234567 not-hex-40 refs/heads/x\n",
+        );
+        crate::pkt_line::write_flush(&mut buf);
+        assert!(parse_receive_pack_body(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_report_status_v2_sets_flag() {
+        // `report-status-v2` capability counts as has_report_status.
+        let body = build_receive_pack_body(
+            &[(
+                "0000000000000000000000000000000000000000",
+                "0123456789abcdef0123456789abcdef01234567",
+                "refs/heads/main",
+            )],
+            "report-status-v2 side-band-64k",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert!(req.has_report_status);
+        assert!(req.has_sideband_64k);
+    }
+
+    #[test]
+    fn parse_receive_pack_push_options_marks_unsupported() {
+        let body = build_receive_pack_body(
+            &[(
+                "0000000000000000000000000000000000000000",
+                "0123456789abcdef0123456789abcdef01234567",
+                "refs/heads/main",
+            )],
+            "report-status push-options",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert!(req.has_unsupported);
+    }
+
+    #[test]
+    fn parse_receive_pack_push_cert_marks_unsupported() {
+        let body = build_receive_pack_body(
+            &[(
+                "0000000000000000000000000000000000000000",
+                "0123456789abcdef0123456789abcdef01234567",
+                "refs/heads/main",
+            )],
+            "report-status push-cert",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert!(req.has_unsupported);
+    }
+
+    #[test]
+    fn parse_receive_pack_unknown_cap_marks_unsupported() {
+        // An unrecognised capability must set has_unsupported (safety net).
+        let body = build_receive_pack_body(
+            &[(
+                "0000000000000000000000000000000000000000",
+                "0123456789abcdef0123456789abcdef01234567",
+                "refs/heads/main",
+            )],
+            "report-status future-unknown-capability",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert!(req.has_unsupported);
+        assert!(!req.is_simple());
+    }
+
+    #[test]
+    fn parse_receive_pack_agent_and_session_id_caps_ignored() {
+        // agent= and session-id= are informational; must not set has_unsupported.
+        let body = build_receive_pack_body(
+            &[(
+                "0000000000000000000000000000000000000000",
+                "0123456789abcdef0123456789abcdef01234567",
+                "refs/heads/main",
+            )],
+            "report-status side-band-64k agent=git/2.43.0 session-id=xyz object-format=sha1",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert!(!req.has_unsupported);
+        assert!(req.has_report_status);
+    }
+
+    #[test]
+    fn parse_receive_pack_delim_in_updates_returns_none() {
+        // A delim-pkt inside the ref-updates section is malformed.
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(
+            &mut buf,
+            b"0000000000000000000000000000000000000000 0123456789abcdef0123456789abcdef01234567 refs/heads/main\0report-status\n",
+        );
+        crate::pkt_line::write_delim(&mut buf);
+        crate::pkt_line::write_flush(&mut buf);
+        assert!(parse_receive_pack_body(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_resp_end_in_updates_returns_none() {
+        // A response-end-pkt inside the ref-updates section is malformed.
+        let mut buf = Vec::new();
+        crate::pkt_line::write_data(
+            &mut buf,
+            b"0000000000000000000000000000000000000000 0123456789abcdef0123456789abcdef01234567 refs/heads/main\0report-status\n",
+        );
+        buf.extend_from_slice(b"0002");
+        assert!(parse_receive_pack_body(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_receive_pack_multiple_updates_second_no_caps() {
+        // Only the first update line has capabilities. Subsequent lines have
+        // no NUL; their (head, caps) split returns None for caps, which is
+        // ignored after `first` flips to false.
+        let body = build_receive_pack_body(
+            &[
+                (
+                    "0000000000000000000000000000000000000000",
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "refs/heads/main",
+                ),
+                (
+                    "0000000000000000000000000000000000000000",
+                    "89abcdef0123456789abcdef0123456789abcdef",
+                    "refs/heads/dev",
+                ),
+            ],
+            "report-status side-band-64k",
+            b"",
+        );
+        let req = parse_receive_pack_body(&body).expect("should parse");
+        assert_eq!(req.updates.len(), 2);
+        assert!(req.has_report_status);
+        assert!(!req.has_unsupported);
+    }
+
+    #[test]
+    fn ref_update_is_create_and_is_delete() {
+        let zero = RefUpdate::ZERO;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let create = RefUpdate {
+            old: zero.to_string(),
+            new: sha.to_string(),
+            name: "refs/heads/x".to_string(),
+        };
+        assert!(create.is_create());
+        assert!(!create.is_delete());
+
+        let delete = RefUpdate {
+            old: sha.to_string(),
+            new: zero.to_string(),
+            name: "refs/heads/x".to_string(),
+        };
+        assert!(!delete.is_create());
+        assert!(delete.is_delete());
+    }
+
+    #[test]
+    fn v2_fetch_request_is_simple_checks() {
+        let mut req = V2FetchRequest::default();
+        // Neither done nor simple.
+        assert!(!req.is_simple());
+        req.done = true;
+        assert!(req.is_simple());
+        req.has_unsupported = true;
+        assert!(!req.is_simple());
+    }
 }

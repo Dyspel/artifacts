@@ -245,4 +245,58 @@ mod tests {
         // We can still test the cap value as a guard against accidental drift.
         assert_eq!(PKT_LINE_MAX_PAYLOAD, 65516);
     }
+
+    #[test]
+    fn read_resp_end_sentinel() {
+        // `0002` is the response-end-pkt; we accept it for forward-compat.
+        let (line, rest) = read(b"0002").unwrap();
+        assert_eq!(line, PktLine::RespEnd);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn read_reserved_three_is_bad_length() {
+        // Length value 3 is reserved/undefined; must be rejected.
+        assert_eq!(read(b"0003").unwrap_err(), PktError::BadLength);
+    }
+
+    #[test]
+    fn iter_surfaces_error_and_stops() {
+        // Build a buffer with one valid data line followed immediately by a
+        // malformed frame (bad hex). The iterator should yield the valid line,
+        // then the error, then None (done = true halts further iteration).
+        let mut buf = Vec::new();
+        write_data(&mut buf, b"ok\n");
+        buf.extend_from_slice(b"zzzz"); // bad hex prefix
+        let mut iter = PktIter::new(&buf);
+        assert_eq!(iter.next().unwrap().unwrap(), PktLine::Data(b"ok\n"));
+        assert_eq!(iter.next().unwrap().unwrap_err(), PktError::BadLength);
+        // After an error the iterator must be exhausted.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn read_trailing_data_after_sentinel_is_returned_as_rest() {
+        // Flush pkt followed by leftover bytes — the flush is consumed and
+        // the leftover is returned as `rest`, not silently dropped.
+        let buf = b"0000extra";
+        let (line, rest) = read(buf).unwrap();
+        assert_eq!(line, PktLine::Flush);
+        assert_eq!(rest, b"extra");
+    }
+
+    #[test]
+    fn write_data_at_exact_cap_produces_valid_frame() {
+        // A payload exactly at the max should encode cleanly.
+        let payload = vec![0u8; PKT_LINE_MAX_PAYLOAD];
+        let mut out = Vec::new();
+        write_data(&mut out, &payload);
+        // Length prefix: 65516 + 4 = 65520 = 0xfff0.
+        assert_eq!(&out[..4], b"fff0");
+        assert_eq!(out.len(), PKT_LINE_MAX_PAYLOAD + 4);
+        // Round-trip: must parse back cleanly.
+        let (line, rest) = read(&out).unwrap();
+        assert_eq!(line, PktLine::Data(&payload));
+        assert!(rest.is_empty());
+    }
 }
