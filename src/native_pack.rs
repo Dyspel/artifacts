@@ -414,4 +414,198 @@ mod tests {
         validate_with_index_pack(&pack, scratch.path())
             .expect("native-generated pack must be a valid pack");
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage for edge paths
+    // -----------------------------------------------------------------------
+
+    // --- index_pack_into_repo: empty-pack short-circuit --------------------
+
+    #[test]
+    fn index_pack_into_repo_short_circuits_on_empty_pack() {
+        // A pack ≤ 32 bytes must return Ok(()) without writing anything.
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        // Exactly 32 bytes — the canonical empty pack.
+        let empty = generate_pack(&git_dir, &[], &[]).unwrap();
+        assert_eq!(empty.len(), 32);
+        index_pack_into_repo(&git_dir, &empty).expect("empty pack must succeed silently");
+
+        // Nothing should have been written to the pack directory.
+        let pack_dir = git_dir.join("objects/pack");
+        if pack_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&pack_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(entries.is_empty(), "no pack files should be written");
+        }
+
+        // Also test the < 32 bytes case (e.g. a raw 0-byte slice).
+        index_pack_into_repo(&git_dir, &[]).expect("zero bytes must succeed silently");
+        index_pack_into_repo(&git_dir, &[0u8; 16]).expect("16 bytes must succeed silently");
+    }
+
+    // --- index_pack_into_repo: real pack written and indexed ---------------
+
+    #[test]
+    fn index_pack_into_repo_writes_pack_for_real_pack() {
+        // Build a repo with one commit, generate a real pack, then feed it to
+        // index_pack_into_repo. The resulting .pack file must exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut blob_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        blob_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"idx-test\n")
+            .unwrap();
+        let blob = String::from_utf8(blob_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut tree_proc = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tree_proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob}\tidx.txt\n").as_bytes())
+            .unwrap();
+        let tree = String::from_utf8(tree_proc.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let commit_out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "idx-test", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let pack = generate_pack(&git_dir, &[commit], &[]).unwrap();
+        assert!(pack.len() > 32);
+
+        index_pack_into_repo(&git_dir, &pack).expect("should index a real pack");
+
+        // At least one .pack file must exist after indexing.
+        let pack_dir = git_dir.join("objects/pack");
+        let pack_files: Vec<_> = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "pack").unwrap_or(false))
+            .collect();
+        assert!(!pack_files.is_empty(), "pack file must be written");
+    }
+
+    // --- generate_pack: invalid OID in wants/haves -------------------------
+
+    #[test]
+    fn generate_pack_rejects_invalid_want_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        let err = generate_pack(&git_dir, &["not-a-hex-oid".to_string()], &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid oid") || msg.contains("not-a-hex"),
+            "expected invalid-oid error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn generate_pack_rejects_invalid_have_oid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = new_repo_id();
+        storage.create(&repo_id).unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        // We need a valid want so we don't hit the empty-wants short-circuit,
+        // but an invalid have.
+        // Use a syntactically valid 40-hex OID for wants (even if the object
+        // doesn't exist; it fails at rev_walk, not parse_oids).
+        // For the have, use garbage.
+        let valid_hex = "a".repeat(40);
+        let err = generate_pack(&git_dir, &[valid_hex], &["not-hex".to_string()]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid oid") || msg.contains("not-hex"),
+            "expected invalid-oid error for have, got: {msg}"
+        );
+    }
+
+    // --- empty_pack_bytes round-trips through our own parser ---------------
+
+    #[test]
+    fn empty_pack_bytes_is_valid_and_parseable() {
+        let pack = empty_pack_bytes();
+        assert_eq!(pack.len(), 32, "empty pack is always 32 bytes");
+        // The first 12 bytes must be the canonical pack header.
+        assert_eq!(&pack[..4], b"PACK");
+        assert_eq!(u32::from_be_bytes(pack[4..8].try_into().unwrap()), 2);
+        assert_eq!(u32::from_be_bytes(pack[8..12].try_into().unwrap()), 0);
+        // Our own parser must accept it and return zero entries.
+        let entries = parse::parse_pack(&pack).expect("empty pack must parse");
+        assert!(entries.is_empty());
+    }
+
+    // --- BoxStdErr: Display and source() delegates -------------------------
+
+    #[test]
+    fn box_std_err_display_and_source() {
+        use std::error::Error as StdError;
+        let inner: Box<dyn std::error::Error + Send + Sync + 'static> =
+            Box::new(std::io::Error::other("inner error"));
+        let wrapped = BoxStdErr(inner);
+        let display = format!("{wrapped}");
+        assert!(
+            display.contains("inner error"),
+            "display must include inner: {display}"
+        );
+        // source() returns None for io::Error (no chain).
+        let _ = wrapped.source();
+    }
 }

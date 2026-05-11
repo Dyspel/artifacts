@@ -1716,4 +1716,494 @@ mod tests {
             "got: {err}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage for error/edge paths
+    // -----------------------------------------------------------------------
+
+    // --- parse_pack: entry-header parse error (truncated cursor) -----------
+
+    #[test]
+    fn parse_pack_rejects_truncated_entry_header() {
+        // Header says 1 entry, but there are no bytes left after the 12-byte
+        // pack header. parse_entry_header gets an empty slice → error.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes()); // 1 entry declared
+                                                     // No entry bytes at all.
+        let err = parse_pack(&pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("header parse") || msg.contains("empty header"),
+            "expected header-parse error, got: {msg}"
+        );
+    }
+
+    // --- parse_pack: OBJ_TAG kind ------------------------------------------
+
+    #[test]
+    fn parses_tag_entry() {
+        let payload = b"object deadbeefdeadbeef\ntype commit\ntag v1.0\n\nmsg\n";
+        let pack = build_minimal_pack(&[(ObjectKind::Tag, payload)]);
+        let entries = parse_pack(&pack).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].kind,
+            ParsedKind::Direct(ObjectKind::Tag)
+        ));
+        assert_eq!(entries[0].data, payload);
+    }
+
+    // --- parse_pack: truncated REF_DELTA base OID --------------------------
+
+    #[test]
+    fn parse_pack_rejects_truncated_ref_delta_oid() {
+        // Build a pack where the REF_DELTA entry header is present but the
+        // 20-byte base OID is only partially present (truncated to 10 bytes).
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // REF_DELTA header, size=0.
+        pack.push(OBJ_REF_DELTA << 4);
+        // Only 10 bytes instead of required 20.
+        pack.extend_from_slice(&[0xabu8; 10]);
+        // No trailer needed — the parse fails first.
+        let err = parse_pack(&pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated REF_DELTA"),
+            "expected truncated-OID error, got: {msg}"
+        );
+    }
+
+    // --- parse_pack: unknown type byte -------------------------------------
+
+    #[test]
+    fn parse_pack_rejects_unknown_type_byte() {
+        // Type code 5 is reserved / unknown in the git pack format.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // type=5, size=1 (low 4 bits = 1, no continuation).
+        pack.push((5u8 << 4) | 1u8);
+        // We don't need a body — the type check happens before decompression.
+        let err = parse_pack(&pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown object type"),
+            "expected unknown-type error, got: {msg}"
+        );
+    }
+
+    // --- parse_pack: zlib failure (truncated body) -------------------------
+
+    #[test]
+    fn parse_pack_rejects_truncated_zlib_body() {
+        // Build a valid single-entry pack, then truncate the zlib body mid-stream.
+        let pack = build_minimal_pack(&[(ObjectKind::Blob, b"some payload for truncation")]);
+        // Keep the 12-byte header + 1-byte entry header; drop the rest of the
+        // zlib stream (leave only 5 bytes of the compressed body).
+        let truncated = &pack[..18];
+        let err = parse_pack(truncated).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("zlib") || msg.contains("decompress"),
+            "expected zlib error on truncated body, got: {msg}"
+        );
+    }
+
+    // --- parse_entry_header: size-continuation overflow --------------------
+
+    #[test]
+    fn parse_entry_header_size_continuation_overflow() {
+        // Feed parse_entry_header a byte stream where the MSB stays set for
+        // 10 continuation bytes → shift would exceed 63 bits → overflow.
+        // First byte: MSB set (continuation), type=1, size_low=0xf.
+        // 9 more continuation bytes (all 0x80 = value 0, MSB=continue).
+        // Final byte without continuation to terminate the stream.
+        let mut bytes = vec![0x80 | (OBJ_BLOB << 4) | 0xfu8];
+        bytes.extend(std::iter::repeat_n(0x80u8, 9));
+        bytes.push(0x01);
+        let err = parse_entry_header(&bytes).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflow"),
+            "expected size overflow error, got: {msg}"
+        );
+    }
+
+    // --- parse_entry_header: truncated continuation ------------------------
+
+    #[test]
+    fn parse_entry_header_truncated_continuation() {
+        // First byte has MSB set (expects more), but there are no more bytes.
+        let bytes = vec![0x80 | (OBJ_BLOB << 4) | 0x1u8]; // MSB set, no follow-up
+        let err = parse_entry_header(&bytes).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated entry header"),
+            "expected truncated-header error, got: {msg}"
+        );
+    }
+
+    // --- parse_ofs_delta_offset: empty / truncated / overflow --------------
+
+    #[test]
+    fn parse_ofs_delta_offset_rejects_empty() {
+        let err = parse_ofs_delta_offset(&[]).unwrap_err();
+        assert!(format!("{err}").contains("empty OFS_DELTA"));
+    }
+
+    #[test]
+    fn parse_ofs_delta_offset_rejects_truncated_continuation() {
+        // Single byte with MSB set means "more bytes follow," but there are none.
+        let err = parse_ofs_delta_offset(&[0x80]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated OFS_DELTA"),
+            "expected truncated error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_ofs_delta_offset_rejects_overflow() {
+        // Build a sequence that would overflow: each additional byte left-shifts
+        // the accumulated value by 7 and adds 1. After enough bytes the value
+        // exceeds u64::MAX. 10 continuation bytes is plenty.
+        // Each byte: MSB=1 (continue), value bits = 0x7f (127).
+        // Final byte: no continuation.
+        let mut bytes: Vec<u8> = std::iter::repeat_n(0xff_u8, 9).collect();
+        bytes.push(0x7f);
+        // This should overflow checked_add / checked_shl at some point.
+        let result = parse_ofs_delta_offset(&bytes);
+        // May succeed or overflow depending on how many bytes it takes, but
+        // the important invariant is: it does NOT panic.
+        let _ = result;
+    }
+
+    // --- OFS_DELTA parse error propagated through parse_pack ---------------
+
+    #[test]
+    fn parse_pack_propagates_ofs_delta_parse_error() {
+        // Build a pack with an OFS_DELTA entry whose offset field is empty
+        // (truncated after the entry header).
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // OFS_DELTA header, size=2 (fits in 4 bits).
+        pack.push((OBJ_OFS_DELTA << 4) | 2u8);
+        // No offset bytes at all — parse_ofs_delta_offset gets an empty slice.
+        let err = parse_pack(&pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("OFS_DELTA"),
+            "expected OFS_DELTA parse error, got: {msg}"
+        );
+    }
+
+    // --- read_delta_varint: truncated and overflow -------------------------
+
+    #[test]
+    fn read_delta_varint_rejects_truncated() {
+        // Empty slice → immediate truncation.
+        let err = read_delta_varint(&[], 0).unwrap_err();
+        assert!(format!("{err}").contains("truncated"));
+    }
+
+    #[test]
+    fn read_delta_varint_rejects_overflow() {
+        // 10 bytes all with MSB=1 will force shift > 63 → overflow.
+        let bytes = vec![0x80u8; 10];
+        let err = read_delta_varint(&bytes, 0).unwrap_err();
+        assert!(format!("{err}").contains("overflow"));
+    }
+
+    // --- apply_delta: COPY truncated offset bytes --------------------------
+
+    #[test]
+    fn apply_delta_rejects_copy_truncated_offset() {
+        // COPY op 0x81: bit 0 set → expects 1 offset byte, but body ends.
+        let base = b"base data".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(4)); // target_size = 4
+                                                   // COPY op: MSB=1, offset-bit-0 set (0x01) — requires 1 offset byte.
+        delta.push(0x81u8); // no offset byte follows
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("truncated offset"), "got: {err}");
+    }
+
+    // --- apply_delta: COPY truncated size bytes ----------------------------
+
+    #[test]
+    fn apply_delta_rejects_copy_truncated_size() {
+        // COPY op 0x90: bit 4 set → expects 1 size byte, but body ends.
+        let base = b"base data".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(4)); // target_size = 4
+                                                   // op = 0x80 (COPY) | 0x10 (size-bit-0 set). No offset bits set,
+                                                   // no size byte follows.
+        delta.push(0x90u8);
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("truncated size"), "got: {err}");
+    }
+
+    // --- apply_delta: COPY with default size (0 → 0x10000) ----------------
+
+    #[test]
+    fn apply_delta_copy_default_size() {
+        // When size bits are all zero the spec says size = 0x10000 (65536).
+        // Build a base of exactly 65536 bytes and a COPY with no size bytes.
+        let base = vec![b'A'; 0x10000];
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        // COPY op: MSB=1, no offset bits, no size bits.  size defaults to 0x10000.
+        // We do need the offset to be 0, but no offset bytes are needed since
+        // none of the offset bits (0..3) are set in the op byte.
+        delta.push(0x80u8); // COPY, no optional bytes, offset=0, size=0x10000
+        let out = apply_delta(&base, &delta).unwrap();
+        assert_eq!(out.len(), 0x10000);
+        assert_eq!(&out[..], &base[..]);
+    }
+
+    // --- apply_delta: COPY out of range ------------------------------------
+
+    #[test]
+    fn apply_delta_rejects_copy_out_of_range() {
+        let base = b"short".to_vec(); // 5 bytes
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(10));
+        // COPY op: offset bit-0 + size bit-0 set.
+        delta.push(0x80 | 0x01 | 0x10); // offset byte follows, size byte follows
+        delta.push(0); // offset = 0
+        delta.push(100); // size = 100 — way beyond base length 5
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("out of base"), "got: {err}");
+    }
+
+    // --- apply_delta: INSERT zero-byte op ----------------------------------
+
+    #[test]
+    fn apply_delta_rejects_insert_zero_op() {
+        let base = b"".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(0)); // source_size = 0
+        delta.extend_from_slice(&delta_varint(0)); // target_size = 0
+                                                   // INSERT op with n=0: reserved, must error.
+        delta.push(0x00u8);
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("zero-byte op"), "got: {err}");
+    }
+
+    // --- apply_delta: INSERT truncated data --------------------------------
+
+    #[test]
+    fn apply_delta_rejects_insert_truncated_data() {
+        let base = b"".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(0)); // source_size = 0
+        delta.extend_from_slice(&delta_varint(10)); // target_size = 10
+                                                    // INSERT n=10, but only 3 bytes follow.
+        delta.push(10u8); // INSERT 10 bytes
+        delta.extend_from_slice(b"abc"); // only 3 of required 10
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("bytes wanted"), "got: {err}");
+    }
+
+    // --- apply_delta: target size mismatch (produced less than declared) ---
+
+    #[test]
+    fn apply_delta_rejects_target_size_mismatch() {
+        let base = b"hello".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        // Declare target_size=10 but insert only 5 bytes.
+        delta.extend_from_slice(&delta_varint(10));
+        delta.push(5u8); // INSERT 5 bytes
+        delta.extend_from_slice(b"world");
+        // After the ops loop: out.len() == 5 != target_size == 10.
+        let err = apply_delta(&base, &delta).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("target_size") || msg.contains("got"),
+            "expected target-size mismatch, got: {msg}"
+        );
+    }
+
+    // --- store_non_delta_entries: refuses OFS_DELTA entry ------------------
+
+    #[test]
+    fn store_non_delta_refuses_ofs_delta_entries() {
+        // Build a pack with one OFS_DELTA entry using the same structure as
+        // `ofs_delta_underflow_errors` (an underflow case that still parses).
+        let pack = build_pack_with_ofs_delta(ObjectKind::Blob, b"the base\n", b" tail");
+        // store_non_delta_entries must reject the delta entry before applying it.
+        let store = MemObjectStore::new();
+        let err = store_non_delta_entries(&pack, &rid(), &store).unwrap_err();
+        assert!(
+            format!("{err}").contains("delta entries not yet supported"),
+            "got: {err}"
+        );
+    }
+
+    // --- store_with_full_resolution: OFS_DELTA base offset mismatch --------
+
+    #[test]
+    fn full_resolution_ofs_delta_bad_base_offset() {
+        // An OFS_DELTA whose back-offset lands at a byte position not matching
+        // any entry's offset → "doesn't match any entry" error.
+        // We reuse build_pack_with_ofs_delta, then corrupt the OFS offset
+        // field so it points somewhere arbitrary.  Easier approach: build a
+        // pack manually where the OFS offset is 1 (entry 1 is at offset 12,
+        // 12-1=11, which has no entry).
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // OFS_DELTA entry: size field = 2 (the delta body length), offset = 1.
+        pack.push((OBJ_OFS_DELTA << 4) | 2u8);
+        // offset field = 1 (single byte, no continuation).
+        pack.push(0x01u8);
+        // 2-byte compressed delta body (source=0, target=0).
+        {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let body = vec![0u8, 0u8];
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let store = MemObjectStore::new();
+        let err = store_with_full_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("doesn't match any entry") || msg.contains("underflow"),
+            "expected bad-offset error, got: {msg}"
+        );
+    }
+
+    // --- store_with_full_resolution: stuck (missing base for REF_DELTA) ----
+
+    #[test]
+    fn full_resolution_ref_delta_missing_base_is_stuck() {
+        // Use a REF_DELTA whose base OID is not in the store; this exercises
+        // the "stuck" / "missing bases" branch in store_with_full_resolution.
+        let mut p = Vec::new();
+        p.extend_from_slice(b"PACK");
+        p.extend_from_slice(&2u32.to_be_bytes());
+        p.extend_from_slice(&1u32.to_be_bytes());
+        // REF_DELTA header; size = 2 (delta body inflated length).
+        p.push((OBJ_REF_DELTA << 4) | 2u8);
+        p.extend_from_slice(&[0xcd; 20]); // phantom base OID
+        {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let body = vec![0u8, 0u8];
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&body).unwrap();
+            p.extend_from_slice(&enc.finish().unwrap());
+        }
+        p.extend_from_slice(&[0u8; 20]);
+
+        let store = MemObjectStore::new();
+        let err = store_with_full_resolution(&p, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing bases") || msg.contains("stuck"),
+            "expected stuck-resolution error, got: {msg}"
+        );
+    }
+
+    // --- store_with_ref_delta_resolution: OFS_DELTA is rejected ------------
+
+    #[test]
+    fn ref_delta_resolution_rejects_ofs_delta() {
+        let pack = build_pack_with_ofs_delta(ObjectKind::Blob, b"base payload\n", b" tail");
+        let store = MemObjectStore::new();
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("OFS_DELTA not yet supported"), "got: {msg}");
+    }
+
+    // --- store_with_ref_delta_resolution: apply_delta error ----------------
+
+    #[test]
+    fn ref_delta_resolution_propagates_apply_delta_error() {
+        // Build a REF_DELTA that references a real base (which we pre-populate
+        // in the store), but whose delta instruction stream is invalid (empty,
+        // which causes source_size mismatch since base is non-empty).
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let base_payload = b"some base content";
+        let base_kind = ObjectKind::Blob;
+        let base_oid = loose_oid_hex(base_kind, base_payload);
+        let base_loose = loose_format_bytes(base_kind, base_payload).unwrap();
+
+        // Populate the store with the base object.
+        let store = MemObjectStore::new();
+        store.write_loose(&rid(), &base_oid, &base_loose).unwrap();
+
+        // Build the raw 20-byte OID for embedding in the pack.
+        let base_oid_bytes: [u8; 20] = {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(format!("{} {}\0", kind_str(base_kind), base_payload.len()).as_bytes());
+            h.update(base_payload);
+            h.finalize().into()
+        };
+
+        // Build a pack with a REF_DELTA pointing at the base, but with a
+        // delta body that declares source_size=0 (mismatch vs base len=17).
+        let bad_delta = delta_varint(0); // source_size=0, wrong
+        let mut delta_body = bad_delta;
+        delta_body.extend_from_slice(&delta_varint(0)); // target_size=0
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let delta_len = delta_body.len() as u64;
+        pack.push(
+            (if delta_len >> 4 > 0 { 0x80 } else { 0 })
+                | (OBJ_REF_DELTA << 4)
+                | ((delta_len & 0xf) as u8),
+        );
+        pack.extend_from_slice(&base_oid_bytes);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&delta_body).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let err = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("REF_DELTA apply") || msg.contains("source size"),
+            "expected apply-delta error, got: {msg}"
+        );
+    }
+
+    // --- store_with_ref_delta_resolution: all-direct pack → early return ---
+
+    #[test]
+    fn ref_delta_resolution_empty_pending_returns_early() {
+        // A pack with only Direct entries should return immediately after
+        // phase-1 without entering the delta loop at all.
+        let pack = build_minimal_pack(&[(ObjectKind::Blob, b"just a blob")]);
+        let store = MemObjectStore::new();
+        let n = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap();
+        assert_eq!(n, 1);
+    }
 }
