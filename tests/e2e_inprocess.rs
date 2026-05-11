@@ -646,6 +646,7 @@ fn e2e_inprocess_full_surface() {
     let alice_repo =
         send(ureq::post(&format!("{base}/v1/repos")).set("Authorization", &bearer(&alice)));
     assert_status(&alice_repo, 200, "alice creates repo");
+    let alice_repo_id = jstr(&parse(&alice_repo.1), "id").to_string();
     let alice_list =
         send(ureq::get(&format!("{base}/v1/repos")).set("Authorization", &bearer(&alice)));
     assert_status(&alice_list, 200, "alice lists repos");
@@ -656,6 +657,103 @@ fn e2e_inprocess_full_surface() {
         Some(1),
         "owner-scoped listing: {}",
         alice_list.1
+    );
+
+    // Token ownership: alice can mint/list on her OWN repo (the
+    // subject-bound mint path) but is forbidden on admin's repo, and
+    // minting on a missing repo is a 404.
+    let aw = |req: ureq::Request| req.set("Authorization", &bearer(&alice));
+    assert_status(
+        &send_json(
+            aw(ureq::post(&format!(
+                "{base}/v1/repos/{alice_repo_id}/tokens"
+            ))),
+            &json!({"scope":"write"}),
+        ),
+        200,
+        "alice mints on her own repo",
+    );
+    assert_status(
+        &send(aw(ureq::get(&format!(
+            "{base}/v1/repos/{alice_repo_id}/tokens"
+        )))),
+        200,
+        "alice lists her own tokens",
+    );
+    assert_status(
+        &send_json(
+            aw(ureq::post(&format!("{base}/v1/repos/{repo_id}/tokens"))),
+            &json!({"scope":"read"}),
+        ),
+        403,
+        "alice forbidden on admin's repo",
+    );
+    assert_status(
+        &send_json(
+            aw(ureq::post(&format!("{base}/v1/repos/no-such-repo/tokens"))),
+            &json!({"scope":"read"}),
+        ),
+        404,
+        "mint on missing repo",
+    );
+
+    // --- merge strategy + no-op branches -----------------------------
+    // Re-merging an already-merged branch is a no-op (source reachable
+    // from target) → 200, fastForward=false, target unchanged.
+    let noop = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+        &json!({"sourceBranch":"feature","targetBranch":"main"}),
+    );
+    assert_status(&noop, 200, "no-op re-merge");
+    assert_eq!(
+        parse(&noop.1).get("fastForward").and_then(Value::as_bool),
+        Some(false)
+    );
+    // ff-only strategy refuses a diverged (conflicting) source → 400.
+    assert_status(
+        &send_json(
+            auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+            &json!({"sourceBranch":"clash","targetBranch":"main","strategy":"ff-only"}),
+        ),
+        400,
+        "ff-only refuses non-fast-forward",
+    );
+    // strategy=merge forces a merge commit even when a fast-forward is
+    // available: push a fresh branch off main, merge with strategy merge.
+    // (Re-clone with a freshly minted token — the earlier tokens/rotate
+    // revoked the credential baked into the first clone's remote.)
+    let fresh_tok = jstr(
+        &parse(
+            &send_json(
+                auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/tokens"))),
+                &json!({"scope":"write"}),
+            )
+            .1,
+        ),
+        "token",
+    )
+    .to_string();
+    let fresh_remote = format!(
+        "{}/git/{repo_id}.git",
+        base.replacen("http://", &format!("http://x:{fresh_tok}@"), 1)
+    );
+    let mw2 = work.path().join("merge_work2");
+    git_clone(&fresh_remote, &mw2);
+    git_config_user(&mw2);
+    git_must(&mw2, &["checkout", "-q", "-B", "ffforce", "main"]);
+    std::fs::write(mw2.join("ff.txt"), "ff\n").unwrap();
+    git_must(&mw2, &["add", "ff.txt"]);
+    git_must(&mw2, &["commit", "-q", "-m", "ffforce"]);
+    git_must(&mw2, &["push", "-q", "origin", "ffforce"]);
+    let forced = send_json(
+        auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/merge"))),
+        &json!({"sourceBranch":"ffforce","targetBranch":"main","strategy":"merge"}),
+    );
+    assert_status(&forced, 200, "strategy=merge forces a merge commit");
+    assert_eq!(
+        parse(&forced.1).get("fastForward").and_then(Value::as_bool),
+        Some(false),
+        "explicit merge strategy never fast-forwards"
     );
 
     // --- smart-HTTP v0/v1 advertise (no Git-Protocol header) --------
