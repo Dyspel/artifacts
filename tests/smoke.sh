@@ -515,12 +515,16 @@ for kind in repo.create token.mint; do
 done
 echo "    audit-event counter has labeled series for repo.create + token.mint"
 
-# Readiness probe — exercises both SQLite stores; must report all
-# components ok on a healthy server.
+# Readiness probe — exercises all SQLite stores; must report every
+# expected component as "ok" on a healthy server. Pinning the exact
+# set catches a regression where wiring drops a probe (e.g. someone
+# forgets to thread ownership through probe_stores again).
 ready_body=$(curl -fsS "$BASE_URL/v1/health/ready")
 ready_ok=$(echo "$ready_body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])')
 [[ "$ready_ok" == "True" ]] || { echo "FAIL: /v1/health/ready not ok: $ready_body"; exit 1; }
 ready_components=$(echo "$ready_body" | python3 -c 'import json,sys; c=json.load(sys.stdin)["components"]; print(",".join(f"{k}={v}" for k,v in sorted(c.items())))')
+[[ "$ready_components" == "audit=ok,ownership=ok,tokens=ok" ]] \
+    || { echo "FAIL: /v1/health/ready components changed: $ready_components"; exit 1; }
 echo "    /v1/health/ready → ok=true, components: $ready_components"
 
 # X-Request-Id roundtrip: client-supplied id must be echoed.

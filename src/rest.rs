@@ -789,10 +789,10 @@ pub async fn health() -> Json<serde_json::Value> {
 /// balancers catch a server that's running but can't actually serve
 /// traffic (DB file unreadable, schema drift, disk full, …).
 ///
-/// Returns 200 with `{ok:true, components:{tokens:"ok", audit:"ok"}}`
-/// when both stores respond. Returns 503 with `ok:false` and the
-/// failing component(s) flagged when any store errors out — k8s
-/// then refuses to route traffic to the pod.
+/// Returns 200 with `{ok:true, components:{tokens:"ok", audit:"ok",
+/// ownership:"ok"}}` when every store responds. Returns 503 with
+/// `ok:false` and the failing component(s) flagged when any store
+/// errors out — k8s then refuses to route traffic to the pod.
 ///
 /// Each component check has a 1-second deadline. Slow-but-not-broken
 /// stores fail closed rather than blocking the probe; an indefinitely
@@ -807,7 +807,7 @@ pub async fn health_ready(
     if let Some(resp) = drain_response_if_draining(&state.draining) {
         return resp;
     }
-    probe_stores(&*state.tokens, &*state.audit).await
+    probe_stores(&*state.tokens, &*state.audit, &*state.ownership).await
 }
 
 /// Pure helper: short-circuit readiness with `503 + {draining: true}`
@@ -841,6 +841,7 @@ pub(crate) fn drain_response_if_draining(
 async fn probe_stores(
     tokens: &dyn TokenStore,
     audit: &dyn crate::audit::AuditStore,
+    ownership: &dyn OwnershipStore,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -855,19 +856,29 @@ async fn probe_stores(
         tokio::time::timeout(deadline, audit.count()).await,
         Ok(Ok(_))
     );
-    let all_ok = tokens_ok && audit_ok;
+    // Same cheap-COUNT(*) shape as the audit probe — proves the
+    // ownership SQLite file is readable. Every mutation-on-existing-
+    // repo handler reads this store via `enforce_owner`, so a broken
+    // ownership store causes user-visible 500s while tokens/audit
+    // could still answer; including it here closes that gap.
+    let ownership_ok = matches!(
+        tokio::time::timeout(deadline, ownership.count_all()).await,
+        Ok(Ok(_))
+    );
+    let all_ok = tokens_ok && audit_ok && ownership_ok;
     let body = serde_json::json!({
         "ok": all_ok,
         "components": {
-            "tokens": if tokens_ok { "ok" } else { "fail" },
-            "audit":  if audit_ok  { "ok" } else { "fail" },
+            "tokens":    if tokens_ok    { "ok" } else { "fail" },
+            "audit":     if audit_ok     { "ok" } else { "fail" },
+            "ownership": if ownership_ok { "ok" } else { "fail" },
         }
     });
     let status = if all_ok {
         StatusCode::OK
     } else {
         tracing::warn!(
-            tokens_ok, audit_ok,
+            tokens_ok, audit_ok, ownership_ok,
             "/v1/health/ready failing — orchestrator should refuse traffic"
         );
         StatusCode::SERVICE_UNAVAILABLE
@@ -1503,6 +1514,7 @@ mod health_ready_tests {
     use super::*;
     use crate::audit::{AuditEvent, AuditQuery, AuditStore, NoopAuditStore};
     use crate::error::{Error, Result};
+    use crate::ownership::{OwnershipStore, RepoRow};
     use crate::tokens::{Scope, TokenRecord, TokenStore};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1552,6 +1564,46 @@ mod health_ready_tests {
         }
     }
 
+    /// `OwnershipStore` whose `count_all` outcome is configurable.
+    /// Other methods panic — `health_ready` only ever calls `count_all`.
+    struct StubOwnershipStore {
+        count_succeeds: bool,
+    }
+
+    #[async_trait]
+    impl OwnershipStore for StubOwnershipStore {
+        async fn record_owner(&self, _: &str, _: Option<&str>) -> Result<()> {
+            unreachable!("health_ready does not record")
+        }
+        async fn get_owner(&self, _: &str) -> Result<Option<Option<String>>> {
+            unreachable!("health_ready does not get_owner")
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!("health_ready does not delete")
+        }
+        async fn count_by_owner(&self, _: &str) -> Result<u64> {
+            unreachable!("health_ready does not count_by_owner")
+        }
+        async fn list_all(&self) -> Result<Vec<RepoRow>> {
+            unreachable!("health_ready does not list_all")
+        }
+        async fn count_all(&self) -> Result<u64> {
+            if self.count_succeeds {
+                Ok(0)
+            } else {
+                Err(Error::Other(anyhow::anyhow!(
+                    "simulated ownership-store failure"
+                )))
+            }
+        }
+        async fn list_by_owner(&self, _: &str) -> Result<Vec<RepoRow>> {
+            unreachable!("health_ready does not list_by_owner")
+        }
+        async fn get_row(&self, _: &str) -> Result<Option<RepoRow>> {
+            unreachable!("health_ready does not get_row")
+        }
+    }
+
     #[test]
     fn drain_response_returns_none_when_flag_clear() {
         let flag = AtomicBool::new(false);
@@ -1588,32 +1640,51 @@ mod health_ready_tests {
     async fn probe_stores_returns_200_when_all_ok() {
         let tokens = StubTokenStore { lookup_succeeds: true };
         let audit = NoopAuditStore;
-        let (status, body) = probe_stores(&tokens, &audit).await;
+        let ownership = StubOwnershipStore { count_succeeds: true };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body.0["ok"], serde_json::json!(true));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));
         assert_eq!(body.0["components"]["audit"], serde_json::json!("ok"));
+        assert_eq!(body.0["components"]["ownership"], serde_json::json!("ok"));
     }
 
     #[tokio::test]
     async fn probe_stores_returns_503_when_tokens_fails() {
         let tokens = StubTokenStore { lookup_succeeds: false };
         let audit = NoopAuditStore;
-        let (status, body) = probe_stores(&tokens, &audit).await;
+        let ownership = StubOwnershipStore { count_succeeds: true };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("fail"));
         assert_eq!(body.0["components"]["audit"], serde_json::json!("ok"));
+        assert_eq!(body.0["components"]["ownership"], serde_json::json!("ok"));
     }
 
     #[tokio::test]
     async fn probe_stores_returns_503_when_audit_fails() {
         let tokens = StubTokenStore { lookup_succeeds: true };
         let audit = FailingAuditStore;
-        let (status, body) = probe_stores(&tokens, &audit).await;
+        let ownership = StubOwnershipStore { count_succeeds: true };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));
         assert_eq!(body.0["components"]["audit"], serde_json::json!("fail"));
+        assert_eq!(body.0["components"]["ownership"], serde_json::json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn probe_stores_returns_503_when_ownership_fails() {
+        let tokens = StubTokenStore { lookup_succeeds: true };
+        let audit = NoopAuditStore;
+        let ownership = StubOwnershipStore { count_succeeds: false };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ok"], serde_json::json!(false));
+        assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));
+        assert_eq!(body.0["components"]["audit"], serde_json::json!("ok"));
+        assert_eq!(body.0["components"]["ownership"], serde_json::json!("fail"));
     }
 }
