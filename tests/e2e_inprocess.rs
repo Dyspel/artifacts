@@ -658,6 +658,79 @@ fn e2e_inprocess_full_surface() {
         alice_list.1
     );
 
+    // --- smart-HTTP v0/v1 advertise (no Git-Protocol header) --------
+    // A raw GET to info/refs WITHOUT the v2 negotiation header drives
+    // the subprocess advertise path (git upload-pack --advertise-refs),
+    // distinct from the native v2 fast path the git client uses.
+    let read_tok = jstr(
+        &parse(
+            &send_json(
+                auth(ureq::post(&format!("{base}/v1/repos/{repo_id}/tokens"))),
+                &json!({"scope":"read"}),
+            )
+            .1,
+        ),
+        "token",
+    )
+    .to_string();
+    let basic = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!("x:{read_tok}"))
+    };
+    let adv = match ureq::get(&format!(
+        "{base}/git/{repo_id}.git/info/refs?service=git-upload-pack"
+    ))
+    .set("Authorization", &format!("Basic {basic}"))
+    .call()
+    {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(s, _)) => s,
+        Err(e) => panic!("v0 advertise transport error: {e}"),
+    };
+    assert_eq!(adv, 200, "v0 info/refs advertise");
+
+    // --- per-user repo quota (alice's limit is 10) → 429 ------------
+    let mut last = 0u16;
+    for _ in 0..15 {
+        last =
+            send(ureq::post(&format!("{base}/v1/repos")).set("Authorization", &bearer(&alice))).0;
+        if last != 200 {
+            break;
+        }
+    }
+    assert_eq!(last, 429, "alice should hit the per-user repo quota");
+
+    // --- audit query filters + reads pagination/subpath -------------
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/admin/audit?event=repo.create&limit=5&offset=0"
+        )))),
+        200,
+        "audit filtered",
+    );
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/commits?ref=main&limit=1&skip=0"
+        )))),
+        200,
+        "commits paginated",
+    );
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/{repo_id}/tree?ref=main&path=src"
+        )))),
+        200,
+        "tree subpath",
+    );
+    // Reads on a missing repo → 404.
+    assert_status(
+        &send(auth(ureq::get(&format!(
+            "{base}/v1/repos/no-such-repo/commits"
+        )))),
+        404,
+        "commits on missing repo",
+    );
+
     // --- error / edge branches --------------------------------------
     // Oversized REST commit blob (cap is 1024) → 400.
     let big = send_json(
