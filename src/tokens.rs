@@ -587,6 +587,49 @@ mod tests {
         (dir, store)
     }
 
+    #[test]
+    fn scope_round_trips_and_rejects_unknown() {
+        assert_eq!(Scope::Read.as_str(), "read");
+        assert_eq!(Scope::Write.as_str(), "write");
+        assert!(matches!(Scope::parse("read"), Ok(Scope::Read)));
+        assert!(matches!(Scope::parse("write"), Ok(Scope::Write)));
+        assert!(Scope::parse("admin").is_err());
+        assert!(Scope::parse("").is_err());
+    }
+
+    /// A minimal store that overrides only the three required methods,
+    /// so the trait's DEFAULT impls (count_active → 0, revoke_all_for_repo
+    /// → Err, list_for_repo → Err, probe_write → Ok) are exercised.
+    struct DefaultsStore;
+
+    #[async_trait::async_trait]
+    impl TokenStore for DefaultsStore {
+        async fn mint(
+            &self,
+            _: &RepoId,
+            _: Scope,
+            _: Option<Duration>,
+            _: Option<&Subject>,
+        ) -> Result<Token> {
+            Ok(tok("dummy-token"))
+        }
+        async fn lookup(&self, _: &Token) -> Result<Option<TokenRecord>> {
+            Ok(None)
+        }
+        async fn revoke(&self, _: &Token) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn trait_default_methods_have_sane_fallbacks() {
+        let s = DefaultsStore;
+        assert_eq!(s.count_active().await.unwrap(), 0);
+        assert!(s.revoke_all_for_repo(&rid("repo-1")).await.is_err());
+        assert!(s.list_for_repo(&rid("repo-1"), None).await.is_err());
+        s.probe_write().await.unwrap();
+    }
+
     #[tokio::test]
     async fn mint_then_lookup_roundtrip() {
         let (_d, store) = open_store();

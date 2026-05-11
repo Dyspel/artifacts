@@ -529,6 +529,76 @@ mod tests {
         Subject::try_from(s).unwrap()
     }
 
+    /// Minimal store overriding only the required methods, so the
+    /// trait's DEFAULT impls (`list_paginated`, `count_all`,
+    /// `list_paginated_by_owner`, `probe_write`) are exercised —
+    /// including both the in-range slice and past-the-end branches.
+    struct DefaultsOwnership {
+        rows: Vec<RepoRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl OwnershipStore for DefaultsOwnership {
+        async fn record_owner(&self, _: &RepoId, _: Option<&Subject>) -> Result<()> {
+            Ok(())
+        }
+        async fn get_owner(&self, _: &RepoId) -> Result<Option<Option<Subject>>> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &RepoId) -> Result<()> {
+            Ok(())
+        }
+        async fn count_by_owner(&self, _: &Subject) -> Result<u64> {
+            Ok(0)
+        }
+        async fn list_all(&self) -> Result<Vec<RepoRow>> {
+            Ok(self.rows.clone())
+        }
+        async fn list_by_owner(&self, _: &Subject) -> Result<Vec<RepoRow>> {
+            Ok(self.rows.clone())
+        }
+        async fn get_row(&self, _: &RepoId) -> Result<Option<RepoRow>> {
+            Ok(self.rows.first().cloned())
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_trait_default_pagination_and_count() {
+        let s = DefaultsOwnership {
+            rows: vec![
+                RepoRow {
+                    id: rid("repo-a"),
+                    owner: None,
+                    created_at: 1,
+                },
+                RepoRow {
+                    id: rid("repo-b"),
+                    owner: Some(sub("alice")),
+                    created_at: 2,
+                },
+            ],
+        };
+        assert_eq!(s.count_all().await.unwrap(), 2);
+        // In-range slice.
+        assert_eq!(s.list_paginated(1, 0).await.unwrap().len(), 1);
+        // Offset past the end → empty.
+        assert!(s.list_paginated(10, 5).await.unwrap().is_empty());
+        // By-owner paginate: both branches.
+        assert_eq!(
+            s.list_paginated_by_owner(&sub("alice"), 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(s
+            .list_paginated_by_owner(&sub("alice"), 10, 99)
+            .await
+            .unwrap()
+            .is_empty());
+        s.probe_write().await.unwrap();
+    }
+
     #[tokio::test]
     async fn record_and_read_owner_roundtrip() {
         let (_d, store) = fresh_store();
