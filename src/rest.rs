@@ -615,4 +615,55 @@ mod router_tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn sse_stream_requires_auth() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        // No Authorization header → Unauthorized before any subscribe.
+        let r = crate::events::sse_stream(State(state), axum::http::HeaderMap::new()).await;
+        assert!(
+            r.is_err(),
+            "sse_stream must reject an unauthenticated caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_emits_a_published_event() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use futures::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let bus = state.observ.events.clone();
+
+        let mut hdrs = axum::http::HeaderMap::new();
+        hdrs.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {ADMIN}").parse().unwrap(),
+        );
+        // Subscribe happens inside sse_stream, so publish *after* it returns.
+        let sse = crate::events::sse_stream(State(state), hdrs)
+            .await
+            .expect("admin authorizes the SSE stream");
+        bus.publish(crate::events::Event::commit(
+            "repo-a",
+            "0".repeat(40),
+            "main",
+            "hello",
+        ));
+        // Read the first frame off the (otherwise infinite) SSE body.
+        let mut data = sse.into_response().into_body().into_data_stream();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), data.next())
+            .await
+            .expect("a frame should arrive within 2s")
+            .expect("stream yielded a frame")
+            .expect("frame is Ok");
+        let text = String::from_utf8_lossy(&frame);
+        assert!(
+            text.contains("\"kind\":\"commit\"") && text.contains("repo-a"),
+            "SSE frame should carry the published event: {text}"
+        );
+    }
 }
