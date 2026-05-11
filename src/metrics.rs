@@ -413,6 +413,81 @@ mod tests {
         assert_eq!(label, "<unmatched>");
     }
 
+    // -----------------------------------------------------------------------
+    // get_pooled and refresh_pool_gauges — covers the success path + gauge
+    // emission without requiring a live PrometheusHandle or init().
+    // -----------------------------------------------------------------------
+
+    /// `get_pooled` success path: obtains a connection from an r2d2 pool and
+    /// records the histogram. Uses a local DebuggingRecorder so the assertion
+    /// is process-isolated (no dependency on init()). Exercises the
+    /// `metrics::histogram!` call inside get_pooled (~line 277-281).
+    #[test]
+    fn get_pooled_returns_connection_and_records_histogram() {
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool: crate::db_migrate::DbPool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(50))
+            .build(manager)
+            .unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let conn = get_pooled(&pool, "test_tokens");
+            assert!(conn.is_ok(), "get_pooled must succeed on a healthy pool");
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let has_hist = snapshot
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "artifacts_sqlite_lock_wait_seconds");
+        assert!(
+            has_hist,
+            "get_pooled must record artifacts_sqlite_lock_wait_seconds histogram"
+        );
+    }
+
+    /// `refresh_pool_gauges` directly: emits the size + in_use gauges for a
+    /// named store. Exercises the two `metrics::gauge!` calls in that function
+    /// (~lines 298-299) without going through the spawned refresher task.
+    #[test]
+    fn refresh_pool_gauges_emits_size_and_in_use_gauges() {
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool: crate::db_migrate::DbPool = r2d2::Pool::builder()
+            .max_size(3)
+            .connection_timeout(std::time::Duration::from_millis(50))
+            .build(manager)
+            .unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            refresh_pool_gauges(&pool, "direct_store");
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let has_size = snapshot.iter().any(|(k, _, _, v)| {
+            k.key().name() == "artifacts_sqlite_pool_size" && matches!(v, DebugValue::Gauge(_))
+        });
+        let has_in_use = snapshot.iter().any(|(k, _, _, v)| {
+            k.key().name() == "artifacts_sqlite_pool_in_use" && matches!(v, DebugValue::Gauge(_))
+        });
+        assert!(has_size, "refresh_pool_gauges must emit pool_size gauge");
+        assert!(
+            has_in_use,
+            "refresh_pool_gauges must emit pool_in_use gauge"
+        );
+    }
+
     // NOTE: `init()` installs the global recorder exactly once per process;
     // a second call returns an error. The histogram-bucket registration arms
     // (metrics.rs ~171, 178, 185) are therefore only reachable on the first

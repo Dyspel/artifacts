@@ -1196,6 +1196,91 @@ fn fs_ingest_pack_real_pack_returns_ok_zero() {
     assert_eq!(count, 0, "FsObjectStore::ingest_pack always returns Ok(0)");
 }
 
+/// `FsObjectStore::list_loose` silently skips a 2-hex subdirectory whose
+/// contents are unreadable (inner `read_dir` failure, mod.rs ~354-357).
+/// On Linux, removing the execute bit from the shard dir makes the inner
+/// read_dir fail; the list continues and returns whatever valid entries
+/// remain. Skipped as root (root ignores permissions).
+#[test]
+fn fs_list_loose_skips_unreadable_subdir() {
+    // SAFETY: getuid() is always safe — no preconditions, no side effects.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let r = rid("noread-repo");
+    // Write one valid object so the outer read_dir succeeds.
+    let o_good = to_oid("aabbccddeeff00112233445566778899aabbccdd");
+    store.write_loose(&r, &o_good, b"good").unwrap();
+    // Create a second 2-hex shard with no execute bit.
+    let bad_shard = repos.join("noread-repo.git/objects/11");
+    std::fs::create_dir_all(&bad_shard).unwrap();
+    // Place a file with a 38-hex name so the outer read_dir sees the dir entry.
+    std::fs::write(bad_shard.join("2".repeat(38)), b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bad_shard, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = store.list_loose(&r);
+    // Restore before assertions.
+    std::fs::set_permissions(&bad_shard, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The list must succeed (inner read_dir errors are silently skipped).
+    let list = result.unwrap();
+    // The good object must still appear; the unreadable shard is silently ignored.
+    assert!(
+        list.iter().any(|i| i.oid == o_good),
+        "good object must appear even when another shard is unreadable"
+    );
+}
+
+/// `SqliteObjectStore::list_loose` malformed-oid skip (mod.rs ~783-790): if
+/// a row was written with an oid string that doesn't satisfy `Oid::try_from`
+/// (e.g. corrupted out-of-band), `list_loose` logs + skips rather than
+/// panicking. We inject the corrupt row directly via rusqlite.
+#[test]
+fn sqlite_list_loose_skips_malformed_oid_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("objects.db");
+    let store = SqliteObjectStore::open(&path).unwrap();
+    let r = rid("corr-repo");
+    // Write a valid row through the normal path first.
+    let good_oid = to_oid("1111111111111111111111111111111111111111");
+    store.write_loose(&r, &good_oid, b"good").unwrap();
+    // Inject a corrupt row directly: oid = "not-a-valid-oid".
+    {
+        let conn = store.lock();
+        conn.execute(
+            "INSERT INTO loose_objects (repo_id, oid, bytes, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![r.as_str(), "not-a-valid-oid", b"bad".as_ref(), 0i64],
+        )
+        .unwrap();
+    }
+    // list_loose must succeed and return only the valid row.
+    let list = store.list_loose(&r).unwrap();
+    assert_eq!(list.len(), 1, "malformed row must be silently skipped");
+    assert_eq!(list[0].oid, good_oid);
+}
+
+/// `record_read_object_metrics` "miss" or "error" outcome: when `read_object`
+/// is called for an oid that is absent from a real repo, the gix layer
+/// returns either `Ok(None)` ("miss" branch) or an `Err` ("error" branch)
+/// depending on the gix version's error variant mapping. Either way the
+/// `record_read_object_metrics` helper is called (it always runs in the
+/// `read_object` override). We verify that calling read_object on an absent
+/// oid in a valid repo doesn't panic — the exact Ok/Err shape is an
+/// implementation detail of the gix error mapping at the outer boundary.
+#[test]
+fn fs_read_object_handles_absent_oid_without_panic() {
+    let (_t, store, repo_id, _) = fs_fixture();
+    let absent = to_oid("f".repeat(40).as_str());
+    // Either Ok(None) (miss) or Err (error) is acceptable here — both
+    // routes exercise record_read_object_metrics. The important invariant
+    // is no panic. We also confirm that Ok(Some(_)) is NOT returned.
+    if let Ok(Some(_)) = store.read_object(&repo_id, &absent) {
+        panic!("absent oid must not return Some");
+    }
+}
+
 /// `record_read_object_metrics` "miss" outcome: reading an object that
 /// doesn't exist still calls the metrics helper with outcome="miss".
 /// Also covers the list_loose multi-fanout-dir path when multiple

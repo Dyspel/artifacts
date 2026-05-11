@@ -665,6 +665,77 @@ mod tests {
         );
     }
 
+    /// `generate_pack` where all wanted commits are already reachable from
+    /// `haves` — the rev-walk returns nothing (commit_ids is empty), so the
+    /// function returns the canonical 32-byte empty pack (line ~143-148).
+    #[test]
+    fn generate_pack_wants_already_in_haves_returns_empty_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let storage = FsStorage::new(&repos).unwrap();
+        let repo_id = new_repo_id();
+        storage
+            .create(&crate::ids::RepoId::try_from(repo_id.as_str()).unwrap())
+            .unwrap();
+        let git_dir = repos.join(format!("{repo_id}.git"));
+
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut bp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        bp.stdin.as_mut().unwrap().write_all(b"uptodate\n").unwrap();
+        let blob = String::from_utf8(bp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let mut tp = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["mktree"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        tp.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("100644 blob {blob}\tuptodate.txt\n").as_bytes())
+            .unwrap();
+        let tree = String::from_utf8(tp.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let co = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["commit-tree", "-m", "base", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(co.stdout).unwrap().trim().to_string();
+
+        // wants = [commit], haves = [commit] — client already has the commit,
+        // so rev_walk yields nothing and commit_ids is empty → empty pack.
+        let pack = generate_pack(&git_dir, &[commit.clone()], &[commit]).unwrap();
+        assert_eq!(
+            pack.len(),
+            32,
+            "pack must be the 32-byte empty pack when wants already covered by haves"
+        );
+    }
+
     /// `parse_oids` with a valid 40-hex string returns a single OID.
     #[test]
     fn parse_oids_accepts_valid_hex40() {
