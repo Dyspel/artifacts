@@ -667,3 +667,79 @@ mod router_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::{list_refs, remote_url};
+
+    fn cfg(base: &str) -> crate::config::Config {
+        crate::config::Config::new(
+            std::path::PathBuf::from("/tmp/x"),
+            base.to_string(),
+            "admin".to_string(),
+            None,
+            None,
+            None,
+            1,
+            1,
+            0,
+            false,
+        )
+    }
+
+    #[test]
+    fn remote_url_covers_https_http_and_other_bases() {
+        let tok = crate::ids::Token::try_from("tok").unwrap();
+        assert_eq!(
+            remote_url(&cfg("https://h.example"), "r", &tok),
+            "https://x:tok@h.example/git/r.git"
+        );
+        assert_eq!(
+            remote_url(&cfg("http://h.example/"), "r", &tok),
+            "http://x:tok@h.example/git/r.git"
+        );
+        // Non-http(s) base falls through to the credential-less form.
+        assert_eq!(
+            remote_url(&cfg("ssh://h.example"), "r", &tok),
+            "ssh://h.example/git/r.git"
+        );
+    }
+
+    #[test]
+    fn list_refs_merges_loose_and_packed_refs_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join("refs/heads")).unwrap();
+        std::fs::write(
+            repo.join("refs/heads/main"),
+            "1111111111111111111111111111111111111111\n",
+        )
+        .unwrap();
+        // packed-refs with a comment, a packed tag, a peeled line, and a
+        // duplicate of the loose `main` (which must be ignored).
+        std::fs::write(
+            repo.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\n\
+             2222222222222222222222222222222222222222 refs/tags/v1\n\
+             ^3333333333333333333333333333333333333333\n\
+             4444444444444444444444444444444444444444 refs/heads/main\n",
+        )
+        .unwrap();
+        let refs = list_refs(repo).unwrap();
+        let main = refs.iter().find(|r| r.name == "refs/heads/main").unwrap();
+        assert_eq!(
+            main.sha, "1111111111111111111111111111111111111111",
+            "loose ref wins over the packed-refs duplicate"
+        );
+        assert!(
+            refs.iter().any(|r| r.name == "refs/tags/v1"),
+            "packed tag is included"
+        );
+    }
+
+    #[test]
+    fn list_refs_on_repo_without_refs_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(list_refs(tmp.path()).unwrap().is_empty());
+    }
+}
