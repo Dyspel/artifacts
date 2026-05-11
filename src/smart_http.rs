@@ -215,12 +215,16 @@ fn native_v2_info_refs(service: &'static str) -> Result<Response<Body>> {
     body.extend_from_slice(b"0000");
 
     let content_type = format!("application/x-{service}-advertisement");
-    Response::builder()
+    // `200 OK` + a content-type derived from a validated service name +
+    // an in-memory body can't fail to build (`http::Response::builder`
+    // only errors on an invalid status/header), so `expect` keeps the
+    // impossible error path off the surface.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + validated content-type builds a valid response"))
 }
 
 /// Handle `GET /info/refs?service=...`.
@@ -281,12 +285,16 @@ async fn info_refs(
     body.extend_from_slice(&output.stdout);
 
     let content_type = format!("application/x-{service}-advertisement");
-    Response::builder()
+    // `200 OK` + a content-type derived from a validated service name +
+    // an in-memory body can't fail to build (`http::Response::builder`
+    // only errors on an invalid status/header), so `expect` keeps the
+    // impossible error path off the surface.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + validated content-type builds a valid response"))
 }
 
 /// Handle `POST /git-upload-pack` or `POST /git-receive-pack`. Spawns
@@ -412,12 +420,13 @@ async fn pack_handler(
     }
 
     let content_type = format!("application/x-git-{sub}-result");
-    Response::builder()
+    // Infallible build: 200 + validated content-type + in-memory body.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(stdout))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + validated content-type builds a valid response"))
 }
 
 /// Native receive-pack response. Steps:
@@ -602,7 +611,8 @@ async fn native_receive_pack_response(
         report
     };
 
-    Response::builder()
+    // Infallible build: 200 + static header literals + in-memory body.
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
@@ -610,7 +620,7 @@ async fn native_receive_pack_response(
         )
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
-        .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
+        .expect("200 + static headers builds a valid response"))
 }
 
 /// Apply one ref-update. Returns `Ok(())` on success or an `Err(reason)`
