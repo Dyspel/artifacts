@@ -706,4 +706,104 @@ mod tests {
         );
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
     }
+
+    // -----------------------------------------------------------------------
+    // native_v2_fetch_response fallback path (lines 58, 62-63 of v2.rs)
+    // -----------------------------------------------------------------------
+
+    /// When the native gix-pack path fails (e.g., want OID doesn't exist
+    /// so gix errors on rev_walk), `native_v2_fetch_response` falls back to
+    /// `generate_pack_via_pack_objects`. With an OID that doesn't exist in
+    /// the repo, pack-objects also fails, so the whole function returns `Err`.
+    /// This exercises the `Err(e) => { tracing::warn!(...); generate_pack... }`
+    /// fallback branch (lines ~58–63) and the pack-objects error return
+    /// (lines ~114–116).
+    #[tokio::test]
+    async fn native_v2_fetch_response_native_pack_failure_triggers_fallback_err() {
+        use std::process::Command as StdCmd;
+
+        let repo = crate::test_support::TestRepo::new();
+        let git_dir = &repo.git_dir;
+
+        // Create a real commit in the repo so gix::open succeeds, but ask
+        // for an OID that doesn't exist so native_pack fails.
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["config", "user.email", "t@t"])
+            .status()
+            .unwrap();
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["config", "user.name", "t"])
+            .status()
+            .unwrap();
+        let blob_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                c.stdin.as_mut().unwrap().write_all(b"fallback\n").unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let blob = String::from_utf8(blob_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mktree_out = StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["mktree"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(|mut c| {
+                use std::io::Write as _;
+                let line = format!("100644 blob {blob}\tfile.txt\n");
+                c.stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(line.as_bytes())
+                    .unwrap();
+                c.wait_with_output().unwrap()
+            })
+            .unwrap();
+        let tree = String::from_utf8(mktree_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        StdCmd::new("git")
+            .args(["--git-dir"])
+            .arg(git_dir)
+            .args(["commit-tree", "-m", "fb", &tree])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+
+        // Ask for an OID that is valid hex40 but doesn't exist in the repo.
+        // native_pack::generate_pack will error (unknown object), triggering
+        // the fallback path. pack-objects will also fail → function returns Err.
+        let nonexistent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let req = V2FetchRequest {
+            wants: vec![nonexistent],
+            haves: Vec::new(),
+            done: true,
+            has_unsupported: false,
+            no_progress: true,
+        };
+        let result = native_v2_fetch_response(git_dir, req).await;
+        assert!(
+            result.is_err(),
+            "requesting a non-existent OID must trigger the fallback and then return Err"
+        );
+    }
 }
