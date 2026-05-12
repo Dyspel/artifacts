@@ -666,9 +666,14 @@ echo "    ff-only refuses diverged branches with 400"
 # User-scoped repo listing. The new GET /v1/repos endpoint scopes by who's
 # asking: admin sees everything, user JWTs see only their own repos.
 echo "==> [16] user-scoped repo listing (GET /v1/repos)"
-# Alice has repos from earlier ownership tests; pull her list via her JWT.
+# Alice has repos from earlier ownership tests; pull her list via her JWT
+# with -D so we can pin X-Total-Count on the user-scoped path too. The
+# admin case below already pins it, but admin goes through count_all
+# while users go through count_by_owner — a regression in the
+# owner-scoped count could leave admin green while every user is broken.
 alice_list="${WORK_DIR}/alice_list.json"
-curl -fsS "${alice_auth[@]}" "$BASE_URL/v1/repos" -o "$alice_list"
+alice_list_hdr="${WORK_DIR}/alice_list.hdr"
+curl -fsS -D "$alice_list_hdr" "${alice_auth[@]}" "$BASE_URL/v1/repos" -o "$alice_list"
 alice_ids=$(python3 -c 'import json,sys; print(" ".join(r["id"] for r in json.load(sys.stdin)))' < "$alice_list")
 # Must contain her repo from step 11 (alice created repo `alice_repo`).
 echo "$alice_ids" | grep -q "$alice_repo" \
@@ -676,7 +681,11 @@ echo "$alice_ids" | grep -q "$alice_repo" \
 # Must NOT contain bob's repo from step 12 (cross-user isolation).
 echo "$alice_ids" | grep -qv "$bob_repo" \
     || { echo "FAIL: alice's list leaked bob's repo $bob_repo"; exit 1; }
-echo "    alice → GET /v1/repos → her repos only, bob's absent"
+alice_body_count=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$alice_list")
+alice_total_hdr=$(grep -i '^x-total-count:' "$alice_list_hdr" | tr -d '\r' | awk '{print $2}')
+[[ "$alice_total_hdr" == "$alice_body_count" ]] \
+    || { echo "FAIL: alice's X-Total-Count=$alice_total_hdr body=$alice_body_count"; exit 1; }
+echo "    alice → GET /v1/repos → her repos only, bob's absent (X-Total-Count=$alice_total_hdr)"
 
 # Admin sees all repos including ones alice doesn't own. Hit it with -i
 # so we can pin the X-Total-Count response header at the same time —
