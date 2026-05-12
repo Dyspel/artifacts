@@ -902,7 +902,7 @@ async fn probe_stores(
 /// that already parse `/v1/admin/repos` don't need a second parser.
 pub async fn list_repos(
     State(state): State<RestState>,
-    axum::extract::Query(q): axum::extract::Query<AdminListReposQuery>,
+    axum::extract::Query(q): axum::extract::Query<ListReposQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
     let principal = authorize_rest(
@@ -914,8 +914,8 @@ pub async fn list_repos(
 
     let limit = q
         .limit
-        .unwrap_or(ADMIN_LIST_REPOS_DEFAULT_LIMIT)
-        .min(ADMIN_LIST_REPOS_MAX_LIMIT);
+        .unwrap_or(LIST_REPOS_DEFAULT_LIMIT)
+        .min(LIST_REPOS_MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
 
     let (rows, total) = match &principal {
@@ -1001,24 +1001,25 @@ pub struct RefEntry {
     pub sha: String,
 }
 
-/// Pagination query for `GET /v1/admin/repos`. Both fields are optional;
-/// missing fields fall back to `DEFAULT_LIMIT` / `0`.
+/// Pagination query shared by `GET /v1/repos` (user-scoped) and
+/// `GET /v1/admin/repos` (admin-scoped). Both fields are optional;
+/// missing fields fall back to `LIST_REPOS_DEFAULT_LIMIT` / `0`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
-pub struct AdminListReposQuery {
-    /// Page size. Server-capped at `MAX_LIMIT` (5000); default 1000.
-    /// 1000 is high enough that no realistic prototype-stage caller
-    /// (the GUI poller, the smoke harness) hits it implicitly — the
-    /// cap is a safety bound on a previously-unbounded endpoint, not
-    /// a behaviour change for current users.
+pub struct ListReposQuery {
+    /// Page size. Server-capped at `LIST_REPOS_MAX_LIMIT` (5000);
+    /// default 1000. High enough that realistic prototype-stage callers
+    /// (the GUI poller, the smoke harness) hit it implicitly — the cap
+    /// is a safety bound on a previously-unbounded endpoint, not a
+    /// behaviour change for current users.
     pub limit: Option<u32>,
     /// Number of rows to skip (in `created_at DESC` order). Use the
     /// `X-Total-Count` response header to know when to stop paging.
     pub offset: Option<u32>,
 }
 
-const ADMIN_LIST_REPOS_DEFAULT_LIMIT: u32 = 1000;
-const ADMIN_LIST_REPOS_MAX_LIMIT: u32 = 5000;
+const LIST_REPOS_DEFAULT_LIMIT: u32 = 1000;
+const LIST_REPOS_MAX_LIMIT: u32 = 5000;
 
 /// `GET /v1/admin/repos`
 ///
@@ -1028,13 +1029,13 @@ const ADMIN_LIST_REPOS_MAX_LIMIT: u32 = 5000;
 /// detail endpoint.
 ///
 /// Pagination: `?limit=N&offset=M`. Default limit is
-/// [`ADMIN_LIST_REPOS_DEFAULT_LIMIT`], hard-capped at
-/// [`ADMIN_LIST_REPOS_MAX_LIMIT`]. The total row count is returned in
+/// [`LIST_REPOS_DEFAULT_LIMIT`], hard-capped at
+/// [`LIST_REPOS_MAX_LIMIT`]. The total row count is returned in
 /// the `X-Total-Count` response header so callers can tell whether
 /// they need to fetch more pages.
 pub async fn admin_list_repos(
     State(state): State<RestState>,
-    axum::extract::Query(q): axum::extract::Query<AdminListReposQuery>,
+    axum::extract::Query(q): axum::extract::Query<ListReposQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
     require_admin(&state, &headers)?;
@@ -1045,8 +1046,8 @@ pub async fn admin_list_repos(
 
     let limit = q
         .limit
-        .unwrap_or(ADMIN_LIST_REPOS_DEFAULT_LIMIT)
-        .min(ADMIN_LIST_REPOS_MAX_LIMIT);
+        .unwrap_or(LIST_REPOS_DEFAULT_LIMIT)
+        .min(LIST_REPOS_MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
 
     let total = state.ownership.count_all().await?;
