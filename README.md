@@ -67,6 +67,7 @@ end-to-end in a day, not a quarter.
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
 | `POST /v1/repos` — create empty repo, get `{ remote, token }`    | ✅     |
+| `GET /v1/repos` — list caller's repos (admin sees all); paginated | ✅     |
 | `POST /v1/repos/:id/forks` — O(1) fork via `alternates`          | ✅     |
 | `POST /v1/repos/:id/tokens` — mint additional scoped tokens      | ✅     |
 | `DELETE /v1/repos/:id` — alternates-aware (refuses if forks live) | ✅     |
@@ -289,14 +290,14 @@ challenge dance.
 `GET /v1/health` → `{"ok":true}` — cheap liveness probe, no auth.
 
 `GET /v1/health/ready` — readiness probe, no auth. Exercises the
-tokens and audit SQLite stores via cheap queries (1-second
-deadline each):
+tokens, audit, and ownership SQLite stores via cheap queries
+(1-second deadline each):
 
 ```json
 // healthy
-{ "ok": true,  "components": {"tokens": "ok", "audit": "ok"} }
+{ "ok": true,  "components": {"tokens": "ok", "audit": "ok", "ownership": "ok"} }
 // unhealthy — returns HTTP 503 so k8s/systemd refuses traffic
-{ "ok": false, "components": {"tokens": "ok", "audit": "fail"} }
+{ "ok": false, "components": {"tokens": "ok", "audit": "fail", "ownership": "ok"} }
 // shutting down — also 503; distinguishable from infra failure
 { "ok": false, "draining": true }
 ```
@@ -697,6 +698,22 @@ supplied one on the request and it's well-formed (≤128 chars of
 every log line the handler emits carries `request_id=<id>` as a
 structured field — grep-friendly for incident debugging.
 
+### Listing your repos
+
+```
+GET /v1/repos                                →  [{ id, owner, createdAt, sourceId? }, ...]
+GET /v1/repos?limit=N&offset=M               →  same, paginated
+```
+
+Scoped by who's asking: an admin token returns every repo the server
+knows about; a JWT principal returns only repos that user owns
+(admin-owned rows are excluded from user listings). Same
+`limit`/`offset`/`X-Total-Count` shape as the admin endpoint below —
+the defaults and 5000-row cap apply to both. Distinct from
+`/v1/admin/repos` because the user path's auth model is different
+(JWT subject filter on `owner_subject`) and shouldn't require the
+admin token.
+
 ### Admin inspection (read-only)
 
 ```
@@ -705,7 +722,7 @@ GET /v1/admin/repos?limit=N&offset=M         →  same, paginated
 GET /v1/admin/repos/:id                      →  { …summary, sizeBytes, refs: [{ name, sha }] }
 ```
 
-Both admin-only. `sourceId` is derived by reading the repo's
+Admin-only. `sourceId` is derived by reading the repo's
 `objects/info/alternates` file, so forks are discoverable via the
 admin list without a separate column. The list endpoint intentionally
 omits size and ref walks (O(n_repos) each); those live on the detail
@@ -899,8 +916,8 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 221 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, webhook-secret encryption + master-key rotation, object-store read+write+list+delete conformance, bind-safety)
-./tests/smoke.sh            # 14-step end-to-end integration test
+cargo test                  # 249 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, webhook-secret encryption + master-key rotation, object-store read+write+list+delete conformance, bind-safety, error-response contracts, health-readiness probes, metrics cardinality)
+./tests/smoke.sh            # end-to-end integration smoke (multi-step)
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
 FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
