@@ -569,6 +569,7 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
                         if (200..400).contains(&status) {
                             metrics::counter!(
                                 "artifacts_webhook_deliveries_total",
+                                "kind" => kind.clone(),
                                 "outcome" => "success",
                             )
                             .increment(1);
@@ -591,6 +592,7 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
                             );
                             metrics::counter!(
                                 "artifacts_webhook_deliveries_total",
+                                "kind" => kind.clone(),
                                 "outcome" => "client_error",
                             )
                             .increment(1);
@@ -613,6 +615,7 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
             }
             metrics::counter!(
                 "artifacts_webhook_deliveries_total",
+                "kind" => kind.clone(),
                 "outcome" => "exhausted",
             )
             .increment(1);

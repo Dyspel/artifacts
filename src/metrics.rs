@@ -44,8 +44,11 @@
 //!   before disk fills. Refreshed at startup, every 60 seconds, and
 //!   at the tail of each hourly prune sweep.
 //! - `artifacts_webhook_deliveries_total{kind, outcome}` — counter
-//!   (already-shipped; incremented by the webhook dispatcher with
-//!   outcome ∈ {ok, http_error, transport_error})
+//!   incremented by the webhook dispatcher.
+//!   `kind` is the event type (`commit`, `fork`, `status`).
+//!   `outcome` ∈ {`success` (2xx-3xx), `client_error` (4xx, not
+//!   retried), `exhausted` (gave up after MAX_ATTEMPTS retries on
+//!   5xx / transport error)}.
 //! - `artifacts_build_info{version}` — gauge=1, static for version info
 //!
 //! The `path` label is the *matched route template* (`/v1/repos/:id`),
