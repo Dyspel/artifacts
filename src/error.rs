@@ -199,3 +199,121 @@ impl IntoResponse for Error {
         resp
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pin the HTTP-response shapes that clients depend on. These are
+    //! public contracts — `code` strings, response status, custom
+    //! headers — so a refactor that quietly renames `rate_limited` →
+    //! `RATE_LIMITED` or drops Retry-After breaks every caller. Smoke
+    //! catches them eventually; unit-pinning catches them in cargo test.
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut headers = serde_json::Map::new();
+        for (k, val) in parts.headers.iter() {
+            headers.insert(
+                k.as_str().to_string(),
+                json!(val.to_str().unwrap_or("")),
+            );
+        }
+        json!({
+            "status": parts.status.as_u16(),
+            "body": v,
+            "headers": serde_json::Value::Object(headers),
+        })
+    }
+
+    #[tokio::test]
+    async fn rate_limited_emits_429_and_retry_after_header() {
+        let resp = Error::RateLimited { retry_after_secs: 30 }.into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 429);
+        assert_eq!(v["headers"]["retry-after"], "30");
+        assert_eq!(v["body"]["error"]["code"], "rate_limited");
+        assert_eq!(v["body"]["error"]["retryAfter"], 30);
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_emits_429_with_limit_in_body() {
+        let resp = Error::QuotaExceeded {
+            subject: "alice".to_string(),
+            limit: 100,
+        }
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 429);
+        // Distinct `code` from rate_limited so clients can branch:
+        // quota is persistent, rate-limit is transient.
+        assert_eq!(v["body"]["error"]["code"], "quota_exceeded");
+        assert_eq!(v["body"]["error"]["subject"], "alice");
+        assert_eq!(v["body"]["error"]["limit"], 100);
+        assert!(v["headers"].get("retry-after").is_none());
+    }
+
+    #[tokio::test]
+    async fn ref_conflict_emits_409_with_expected_and_current() {
+        let resp = Error::RefConflict {
+            branch: "main".to_string(),
+            expected: Some("aaaa".to_string()),
+            current: Some("bbbb".to_string()),
+        }
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 409);
+        assert_eq!(v["body"]["error"]["code"], "ref_conflict");
+        assert_eq!(v["body"]["error"]["branch"], "main");
+        assert_eq!(v["body"]["error"]["expected"], "aaaa");
+        assert_eq!(v["body"]["error"]["current"], "bbbb");
+    }
+
+    #[tokio::test]
+    async fn fork_dependency_emits_409_with_dependent_fork_ids() {
+        let resp = Error::ForkDependency {
+            repo_id: "r1".to_string(),
+            forks: vec!["f1".to_string(), "f2".to_string()],
+        }
+        .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 409);
+        assert_eq!(v["body"]["error"]["code"], "fork_dependency");
+        assert_eq!(v["body"]["error"]["repoId"], "r1");
+        assert_eq!(v["body"]["error"]["forks"], json!(["f1", "f2"]));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_basic_emits_www_authenticate_header() {
+        let resp = Error::UnauthorizedBasic.into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 401);
+        // Critical for git clients — without this header git gives up
+        // after the first 401 instead of retrying with URL credentials.
+        assert_eq!(
+            v["headers"]["www-authenticate"],
+            "Basic realm=\"artifacts\""
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_omits_www_authenticate_header() {
+        // The non-Basic variant must NOT emit WWW-Authenticate; clients
+        // that get 401 without the header know it isn't a git-style
+        // challenge and won't retry. The split between the two variants
+        // is the contract — pin it.
+        let resp = Error::Unauthorized.into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 401);
+        assert!(v["headers"].get("www-authenticate").is_none());
+    }
+
+    #[tokio::test]
+    async fn other_returns_500_with_internal_code() {
+        let resp = Error::Other(anyhow::anyhow!("boom")).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 500);
+        assert_eq!(v["body"]["error"]["code"], "internal");
+    }
+}
