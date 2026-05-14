@@ -35,6 +35,7 @@ use crate::{
     tokens::{SqliteTokenStore, TokenStore},
 };
 use axum::{
+    extract::DefaultBodyLimit,
     middleware as axum_middleware,
     routing::{delete, get, post},
     Router,
@@ -58,6 +59,16 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 /// around for 24h so an admin investigating a stale token failure can
 /// still see when/why it died before the row vanishes.
 const TOKEN_PRUNE_GRACE: Duration = Duration::from_secs(86400);
+
+/// Per-request body size cap for the REST surface (`/v1/*`). 1 MiB
+/// is well above realistic JSON payloads (the largest is a
+/// `create_commit` with inline file contents; even a few dozen
+/// source files easily fit) and well below where an unauthenticated
+/// client could DoS the server by streaming megabytes into the
+/// JSON deserializer. Git smart-HTTP (`/git/*`) has its own much
+/// larger cap inside `smart_http.rs` because clone / push bodies
+/// are legitimately huge.
+const REST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "artifacts", version, about = "Versioned filesystem that speaks Git")]
@@ -531,7 +542,12 @@ async fn main() -> anyhow::Result<()> {
                 // /git, which streams large bodies where per-request
                 // timing is a poor signal) and not /metrics itself
                 // (self-scraping would be noise).
-                .layer(axum_middleware::from_fn(metrics::track_metrics));
+                .layer(axum_middleware::from_fn(metrics::track_metrics))
+                // 1 MiB body cap on the REST surface. axum's default
+                // is 2 MiB and only applies to extractors that consult
+                // it; setting it explicitly hardens against a slow
+                // streaming-body DoS aimed at the JSON deserializer.
+                .layer(DefaultBodyLimit::max(REST_BODY_LIMIT_BYTES));
 
             // /metrics is outside the REST router so the track_metrics
             // middleware doesn't observe its own scrape.
