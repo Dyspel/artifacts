@@ -42,6 +42,23 @@ use axum::{
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+/// Cadence the active-* gauges (tokens, repos, webhooks, audit) refresh
+/// at. 60s is the smallest interval that keeps dashboards "live to the
+/// minute" without making `SELECT COUNT(*)` against indexed tables a
+/// noticeable load. Used everywhere we spawn a gauge refresher.
+const GAUGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Cadence the periodic-prune tasks run at. Tokens (revoked + expired
+/// rows), audit log (rows older than retention). Hourly is the
+/// standard "doesn't paper over a bug, doesn't pile up unboundedly"
+/// trade-off.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Token-prune grace window after expiry. Keeps recently-expired rows
+/// around for 24h so an admin investigating a stale token failure can
+/// still see when/why it died before the row vanishes.
+const TOKEN_PRUNE_GRACE: Duration = Duration::from_secs(86400);
+
 #[derive(Parser)]
 #[command(name = "artifacts", version, about = "Versioned filesystem that speaks Git")]
 struct Cli {
@@ -252,8 +269,8 @@ async fn main() -> anyhow::Result<()> {
             // recently-expired tokens before they're gone.
             tokens::spawn_prune_task(
                 sqlite_tokens.clone(),
-                Duration::from_secs(3600),
-                Duration::from_secs(86400),
+                PRUNE_INTERVAL,
+                TOKEN_PRUNE_GRACE,
             );
             // Populate the active-token gauge before any handler can
             // observe it as zero, then spawn a 60-second refresher so
@@ -261,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
             // minute rather than waiting for the hourly prune.
             tokens::refresh_active_token_gauge(&*sqlite_tokens).await;
             let tokens: Arc<dyn TokenStore> = sqlite_tokens;
-            tokens::spawn_active_gauge_refresher(tokens.clone(), Duration::from_secs(60));
+            tokens::spawn_active_gauge_refresher(tokens.clone(), GAUGE_REFRESH_INTERVAL);
             // Reuses the same SQLite file for a separate `repos` table.
             // Separate table and separate connection keeps the concerns
             // cleanly split; WAL-mode lets them coexist without lock
@@ -276,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
             ownership::refresh_repos_gauge(&*ownership).await;
             ownership::spawn_repos_gauge_refresher(
                 ownership.clone(),
-                Duration::from_secs(60),
+                GAUGE_REFRESH_INTERVAL,
             );
             // Audit log lives in its own DB so it can be archived /
             // rotated independently of the token store. Same WAL-mode
@@ -291,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
             // `spawn_prune_task` honors by not spawning at all.
             audit::spawn_prune_task(
                 audit.clone(),
-                Duration::from_secs(3600),
+                PRUNE_INTERVAL,
                 Duration::from_secs(audit_retention_days * 86400),
             );
             // Stored-events gauge — populate before the listener
@@ -303,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
             audit::refresh_events_stored_gauge(&*audit).await;
             audit::spawn_events_stored_gauge_refresher(
                 audit.clone(),
-                Duration::from_secs(60),
+                GAUGE_REFRESH_INTERVAL,
             );
             // Emit a startup audit event so a compliance reviewer can
             // see "when did this server boot, with what
@@ -402,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
             webhooks::refresh_active_webhook_gauge(&*webhook_registry);
             webhooks::spawn_active_gauge_refresher(
                 webhook_registry.clone(),
-                Duration::from_secs(60),
+                GAUGE_REFRESH_INTERVAL,
             );
 
             // Shared drain flag. Flipped from `false` → `true` by the
