@@ -1,0 +1,334 @@
+//! Repo lifecycle endpoints: create, fork, delete, list.
+
+use super::{
+    remote_url, AdminRepoSummary, ListReposQuery, RepoHandle, RestState,
+    LIST_REPOS_DEFAULT_LIMIT, LIST_REPOS_MAX_LIMIT,
+};
+use crate::{
+    auth::authorize_rest,
+    error::{Error, Result},
+    ownership::{check_repo_quota, enforce_owner},
+    rate_limit::Class,
+    storage::new_repo_id,
+    tokens::Scope,
+};
+use axum::{
+    extract::{Path, State},
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct CreateRepoBody {
+    /// Optional caller-supplied id. If omitted we generate one.
+    pub id: Option<String>,
+}
+
+/// POST /v1/repos
+///
+/// Creates an empty repo owned by the caller. If the caller is `Admin`
+/// the owner is recorded as `NULL` (admin-owned); if the caller is a
+/// user, their JWT subject becomes the owner for all subsequent
+/// access checks.
+pub async fn create_repo(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+    body: Option<Json<CreateRepoBody>>,
+) -> Result<Json<RepoHandle>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token(),
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, Class::Create)?;
+    check_repo_quota(
+        &*state.ownership,
+        &principal,
+        state.cfg.max_repos_per_user,
+    )
+    .await?;
+    let id = body
+        .and_then(|Json(b)| b.id)
+        .unwrap_or_else(new_repo_id);
+    state.storage.create(&id)?;
+    // Record ownership *before* minting the token so a crash between the
+    // two leaves a repo we can identify the owner of.
+    state
+        .ownership
+        .record_owner(&id, principal.subject())
+        .await?;
+    let token = state
+        .tokens
+        .mint(&id, Scope::Write, None, principal.subject())
+        .await?;
+    let remote = remote_url(&state.cfg, &id, &token);
+    crate::audit::record(
+        &*state.audit,
+        "repo.create",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({}),
+        None,
+    )
+    .await;
+    // Emit a status transition so subscribers pick up brand-new repos
+    // without polling. "unknown → idle" matches the repo's initial
+    // state in the Fleet UI's RepoStatus enum.
+    state.events.publish(crate::events::Event::status(&id, "unknown", "idle"));
+    Ok(Json(RepoHandle { id, remote, token }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct ForkBody {
+    pub id: Option<String>,
+    #[serde(rename = "readOnly")]
+    pub read_only: bool,
+}
+
+/// POST /v1/repos/:id/forks
+///
+/// Forking requires read access to the source (enforced as ownership, so
+/// only the source's owner — or admin — can fork). The fork itself is
+/// owned by the caller; this lets a user fork their own template into a
+/// personal workspace, but prevents arbitrary users from cloning each
+/// other's repos via this endpoint.
+pub async fn fork_repo(
+    State(state): State<RestState>,
+    Path(source_id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<ForkBody>>,
+) -> Result<Json<RepoHandle>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token(),
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, Class::Create)?;
+    if !state.storage.exists(&source_id) {
+        return Err(Error::RepoNotFound(source_id));
+    }
+    enforce_owner(&*state.ownership, &principal, &source_id).await?;
+    check_repo_quota(
+        &*state.ownership,
+        &principal,
+        state.cfg.max_repos_per_user,
+    )
+    .await?;
+    let (fork_id, read_only) = body
+        .map(|Json(b)| (b.id, b.read_only))
+        .unwrap_or((None, false));
+    let fork_id = fork_id.unwrap_or_else(new_repo_id);
+    state.storage.fork(&source_id, &fork_id)?;
+    state
+        .ownership
+        .record_owner(&fork_id, principal.subject())
+        .await?;
+    let scope = if read_only { Scope::Read } else { Scope::Write };
+    let token = state
+        .tokens
+        .mint(&fork_id, scope, None, principal.subject())
+        .await?;
+    let remote = remote_url(&state.cfg, &fork_id, &token);
+    crate::audit::record(
+        &*state.audit,
+        "repo.fork",
+        principal.audit_label(),
+        Some(&fork_id),
+        serde_json::json!({ "source_id": source_id, "read_only": read_only }),
+        None,
+    )
+    .await;
+    state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
+    Ok(Json(RepoHandle { id: fork_id, remote, token }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct DeleteRepoQuery {
+    /// Allow deletion even if other repos depend on this one via
+    /// `objects/info/alternates`. Without this flag a delete that
+    /// would orphan a fork's object graph fails with 409.
+    pub force: Option<bool>,
+    /// If set, also delete every fork that depends on this repo
+    /// (transitively). Mutually exclusive with `force=true` — pick
+    /// "delete the chain together" or "orphan deliberately", not both.
+    /// The response body returns
+    /// the list of all deleted IDs in the response body.
+    pub cascade: Option<bool>,
+}
+
+/// DELETE /v1/repos/:id
+pub async fn delete_repo(
+    State(state): State<RestState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteRepoQuery>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token(),
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, Class::Default)?;
+    enforce_owner(&*state.ownership, &principal, &id).await?;
+
+    let force = q.force.unwrap_or(false);
+    let cascade = q.cascade.unwrap_or(false);
+    if force && cascade {
+        return Err(Error::BadRequest(
+            "force and cascade are mutually exclusive — pick one".to_string(),
+        ));
+    }
+
+    if cascade {
+        let order = super::cascade_delete_order(
+            &state.cfg.repos_dir(),
+            &id,
+            &state.alternates_cache,
+        )?;
+        for dep in &order {
+            if dep != &id {
+                enforce_owner(&*state.ownership, &principal, dep).await?;
+            }
+        }
+        let mut deleted = Vec::with_capacity(order.len());
+        for dep in &order {
+            state.storage.delete(dep)?;
+            state.ownership.delete(dep).await?;
+            state.alternates_cache.invalidate(dep);
+            deleted.push(dep.clone());
+        }
+        crate::audit::record(
+            &*state.audit,
+            "repo.delete",
+            principal.audit_label(),
+            Some(&id),
+            serde_json::json!({
+                "mode": "cascade",
+                "count": deleted.len(),
+                "deleted": deleted,
+            }),
+            None,
+        )
+        .await;
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "deleted": deleted,
+        })));
+    }
+
+    let forks = crate::reads::list_forks_of(
+        &state.cfg.repos_dir(),
+        &id,
+        &state.alternates_cache,
+    )?;
+    if !forks.is_empty() {
+        if force {
+            tracing::warn!(
+                repo = %id,
+                fork_count = forks.len(),
+                forks = ?forks,
+                "delete with force=true; forks will be orphaned",
+            );
+        } else {
+            return Err(Error::ForkDependency {
+                repo_id: id,
+                forks,
+            });
+        }
+    }
+
+    state.storage.delete(&id)?;
+    state.ownership.delete(&id).await?;
+    state.alternates_cache.invalidate(&id);
+    let mode = if force { "force" } else { "default" };
+    crate::audit::record(
+        &*state.audit,
+        "repo.delete",
+        principal.audit_label(),
+        Some(&id),
+        serde_json::json!({ "mode": mode }),
+        None,
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `GET /v1/repos`
+///
+/// User-facing repo listing. Scoped by who's asking:
+///   - `Admin` → every repo the server knows about.
+///   - `User { subject }` → only repos that user owns.
+///
+/// Kept separate from `/v1/admin/repos` (which is Admin-only and serves
+/// the operator-facing GUI) because the auth model differs: this endpoint
+/// exists so a user's Fleet view can list their own repos without the
+/// backend proxying each request with the admin token. Admin callers get
+/// the same response shape as a convenience for tooling.
+///
+/// Response shape intentionally matches `AdminRepoSummary` so clients
+/// that already parse `/v1/admin/repos` don't need a second parser.
+pub async fn list_repos(
+    State(state): State<RestState>,
+    axum::extract::Query(q): axum::extract::Query<ListReposQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let principal = authorize_rest(
+        &headers,
+        &state.cfg.admin_token(),
+        state.cfg.jwt_secret.as_deref(),
+    )?;
+    state.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
+
+    let limit = q
+        .limit
+        .unwrap_or(LIST_REPOS_DEFAULT_LIMIT)
+        .min(LIST_REPOS_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+
+    let (rows, total) = match &principal {
+        crate::auth::Principal::Admin => (
+            state.ownership.list_paginated(limit, offset).await?,
+            state.ownership.count_all().await?,
+        ),
+        crate::auth::Principal::User { subject } => (
+            state
+                .ownership
+                .list_paginated_by_owner(subject, limit, offset)
+                .await?,
+            state.ownership.count_by_owner(subject).await?,
+        ),
+    };
+
+    if offset == 0 && total > limit as u64 {
+        tracing::warn!(
+            total,
+            limit,
+            "/v1/repos returned a truncated page; caller should paginate via ?offset=",
+        );
+    }
+
+    let repos_dir = state.cfg.repos_dir();
+    let summaries: Vec<AdminRepoSummary> = rows
+        .into_iter()
+        .map(|r| AdminRepoSummary {
+            source_id: state.alternates_cache.lookup(&repos_dir, &r.id),
+            id: r.id,
+            owner: r.owner,
+            created_at: r.created_at,
+        })
+        .collect();
+
+    let body = Json(summaries).into_response();
+    let (mut parts, body) = body.into_parts();
+    parts.headers.insert(
+        axum::http::HeaderName::from_static("x-total-count"),
+        axum::http::HeaderValue::from_str(&total.to_string())
+            .expect("u64 decimal fits in a header value"),
+    );
+    Ok(Response::from_parts(parts, body))
+}
