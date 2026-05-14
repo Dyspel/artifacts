@@ -144,13 +144,7 @@ pub async fn create_repo(
         .mint(&id, Scope::Write, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
-    tracing::info!(
-        target: "audit",
-        event = "repo.create",
-        actor = principal.audit_label(),
-        repo_id = %id,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "repo.create",
         principal.audit_label(),
@@ -221,7 +215,7 @@ pub async fn fork_repo(
         .mint(&fork_id, scope, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "repo.fork",
         principal.audit_label(),
@@ -230,14 +224,6 @@ pub async fn fork_repo(
         None,
     )
     .await;
-    tracing::info!(
-        target: "audit",
-        event = "repo.fork",
-        actor = principal.audit_label(),
-        source_id = %source_id,
-        repo_id = %fork_id,
-        read_only,
-    );
     state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
@@ -288,15 +274,7 @@ pub async fn mint_token(
             .map(|now| now.as_secs() + d.as_secs())
             .unwrap_or(0)
     });
-    tracing::info!(
-        target: "audit",
-        event = "token.mint",
-        actor = principal.audit_label(),
-        repo_id = %id,
-        scope = ?body.scope,
-        ttl_seconds = ?body.ttl_seconds,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "token.mint",
         principal.audit_label(),
@@ -368,14 +346,7 @@ pub async fn revoke_token(
     }
 
     let revoked = state.tokens.revoke(&body.token).await?;
-    tracing::info!(
-        target: "audit",
-        event = "token.revoke",
-        actor = principal.audit_label(),
-        repo_id = target_repo.as_deref().unwrap_or("unknown"),
-        revoked,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "token.revoke",
         principal.audit_label(),
@@ -563,15 +534,7 @@ pub async fn rotate_tokens(
         .mint(&id, scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
-    tracing::info!(
-        target: "audit",
-        event = "token.rotate",
-        actor = principal.audit_label(),
-        repo_id = %id,
-        revoked,
-        scope = ?scope,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "token.rotate",
         principal.audit_label(),
@@ -662,7 +625,7 @@ pub async fn delete_repo(
             state.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
         }
-        crate::audit::record_silent(
+        crate::audit::record(
             &*state.audit,
             "repo.delete",
             principal.audit_label(),
@@ -675,15 +638,6 @@ pub async fn delete_repo(
             None,
         )
         .await;
-        tracing::info!(
-            target: "audit",
-            event = "repo.delete",
-            actor = principal.audit_label(),
-            repo_id = %id,
-            mode = "cascade",
-            count = deleted.len(),
-            deleted = ?deleted,
-        );
         return Ok(Json(serde_json::json!({
             "ok": true,
             "deleted": deleted,
@@ -720,14 +674,7 @@ pub async fn delete_repo(
     // a stale hit if a future repo ever reuses the same id.
     state.alternates_cache.invalidate(&id);
     let mode = if force { "force" } else { "default" };
-    tracing::info!(
-        target: "audit",
-        event = "repo.delete",
-        actor = principal.audit_label(),
-        repo_id = %id,
-        mode,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "repo.delete",
         principal.audit_label(),
@@ -1231,12 +1178,7 @@ pub async fn admin_rotate_token(
     require_admin(&state, &headers)?;
     let new = crate::random_admin_token();
     state.cfg.rotate_admin_token(new.clone());
-    tracing::info!(
-        target: "audit",
-        event = "admin.token.rotate",
-        actor = "admin",
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "admin.token.rotate",
         "admin",
@@ -1307,13 +1249,7 @@ pub async fn admin_rotate_webhook_key(
         }
     }
 
-    tracing::info!(
-        target: "audit",
-        event = "admin.webhook_key.rotate",
-        actor = "admin",
-        rotated,
-    );
-    crate::audit::record_silent(
+    crate::audit::record(
         &*state.audit,
         "admin.webhook_key.rotate",
         "admin",

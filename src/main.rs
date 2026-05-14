@@ -313,20 +313,7 @@ async fn main() -> anyhow::Result<()> {
             // capacity. Live `tracing::info!` mirrors the same fields
             // for live log subscribers — same shape as the rest of
             // the audit-event call sites.
-            tracing::info!(
-                target: "audit",
-                event = "server.start",
-                actor = "admin",
-                bind = %bind,
-                public_base_url = %cfg.public_base_url,
-                tls_enabled,
-                allow_insecure,
-                max_repos_per_user,
-                audit_retention_days,
-                shutdown_timeout_secs,
-                shutdown_drain_delay_secs,
-            );
-            crate::audit::record_silent(
+            crate::audit::record(
                 &*audit,
                 "server.start",
                 "admin",
@@ -845,15 +832,7 @@ async fn emit_server_shutdown(
         shutdown_timeout,
     );
     let uptime_secs = started_at.elapsed().as_secs();
-    tracing::info!(
-        target: "audit",
-        event = "server.shutdown",
-        actor = "admin",
-        kind = %kind,
-        uptime_secs,
-        shutdown_timeout_secs = shutdown_timeout.as_secs(),
-    );
-    audit::record_silent(
+    audit::record(
         audit,
         "server.shutdown",
         "admin",

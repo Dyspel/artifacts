@@ -339,10 +339,38 @@ pub fn spawn_events_stored_gauge_refresher(
     });
 }
 
-/// Convenience: write to the store, log + swallow on failure. Audit
-/// persistence is best-effort — a SQLite hiccup must not fail an
-/// otherwise-successful mutation. The live `tracing!(target: "audit")`
-/// call at the call site is the durable copy of last resort.
+/// Emit an audit event: both as a live `tracing::info!(target: "audit",
+/// …)` line *and* into the durable `AuditStore`. Single helper so call
+/// sites can't drop one half of the pair.
+///
+/// The `fields` value is serialized as one JSON blob in the tracing
+/// line (downstream log processors can re-parse it) — we trade
+/// per-key structured tracing fields for call-site brevity and the
+/// guarantee that the live and durable copies agree by construction.
+pub async fn record(
+    store: &dyn AuditStore,
+    event: &str,
+    actor: &str,
+    repo_id: Option<&str>,
+    fields: serde_json::Value,
+    request_id: Option<String>,
+) {
+    tracing::info!(
+        target: "audit",
+        event,
+        actor,
+        repo_id,
+        fields = %fields,
+    );
+    record_silent(store, event, actor, repo_id, fields, request_id).await;
+}
+
+/// Lower-level: write to the store only, log + swallow on failure.
+/// Audit persistence is best-effort — a SQLite hiccup must not fail
+/// an otherwise-successful mutation. Prefer [`record`] from REST
+/// handlers; use this directly only when the caller already emits its
+/// own tracing line (e.g. server start/stop in main.rs, where the
+/// live shape is part of the operator-visible logs).
 pub async fn record_silent(
     store: &dyn AuditStore,
     event: &str,
