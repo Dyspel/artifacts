@@ -49,6 +49,13 @@
 //!   `outcome` ∈ {`success` (2xx-3xx), `client_error` (4xx, not
 //!   retried), `exhausted` (gave up after MAX_ATTEMPTS retries on
 //!   5xx / transport error)}.
+//! - `artifacts_sqlite_lock_wait_seconds{store}` — histogram
+//!   recording how long each handler waits to acquire the per-store
+//!   `tokio::sync::Mutex<Connection>` before issuing its SQL. Each
+//!   store has one connection and one mutex, so this is the
+//!   contention signal: if p99 climbs the SQLite-serialization is
+//!   becoming a bottleneck and a connection pool (`deadpool-sqlite`)
+//!   would help. `store` ∈ {`tokens`, `ownership`, `audit`}.
 //! - `artifacts_build_info{version}` — gauge=1, static for version info
 //!
 //! The `path` label is the *matched route template* (`/v1/repos/:id`),
@@ -77,6 +84,14 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
     const BUCKETS: &[f64] = &[
         0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
     ];
+    // SQLite-lock waits are typically microseconds; sub-millisecond
+    // buckets give a useful low-end. The shared top-end (10s) matches
+    // the request-duration histogram so dashboards can render both on
+    // the same axis. A wait this long means the process is wedged on
+    // a single store anyway.
+    const SQLITE_LOCK_BUCKETS: &[f64] = &[
+        0.000_010, 0.000_050, 0.000_100, 0.000_500, 0.001, 0.005, 0.010, 0.050, 0.100, 1.0, 10.0,
+    ];
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
@@ -85,6 +100,13 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             BUCKETS,
         )
         .map_err(|e| anyhow::anyhow!("register histogram buckets: {e}"))?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "artifacts_sqlite_lock_wait_seconds".to_string(),
+            ),
+            SQLITE_LOCK_BUCKETS,
+        )
+        .map_err(|e| anyhow::anyhow!("register sqlite-lock histogram buckets: {e}"))?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     // Emit a static build_info metric so scrapers can see what's running.
@@ -146,6 +168,29 @@ pub(crate) fn path_label_for(matched: Option<&str>, raw_uri: &str) -> String {
             "<unmatched>".to_string()
         }
     }
+}
+
+/// Lock a SQLite connection mutex and record how long the wait took.
+///
+/// Wraps `tokio::sync::Mutex::lock()` with a histogram measurement
+/// keyed by store name (`tokens` / `ownership` / `audit`). Every
+/// store-side handler funnels through here, so the histogram is the
+/// canonical "is SQLite contention real yet?" signal.
+///
+/// Returns the same `MutexGuard` the caller would have got from
+/// `.lock().await` — no behavior change beyond the metric emission.
+pub(crate) async fn lock_sqlite<'a>(
+    conn: &'a tokio::sync::Mutex<rusqlite::Connection>,
+    store: &'static str,
+) -> tokio::sync::MutexGuard<'a, rusqlite::Connection> {
+    let start = Instant::now();
+    let guard = conn.lock().await;
+    metrics::histogram!(
+        "artifacts_sqlite_lock_wait_seconds",
+        "store" => store,
+    )
+    .record(start.elapsed().as_secs_f64());
+    guard
 }
 
 /// Render the Prometheus exposition. Returns `text/plain; version=0.0.4`

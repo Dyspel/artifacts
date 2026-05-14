@@ -175,7 +175,7 @@ fn now_secs() -> i64 {
 #[async_trait]
 impl OwnershipStore for SqliteOwnershipStore {
     async fn record_owner(&self, repo_id: &str, owner: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         conn.execute(
             "INSERT OR REPLACE INTO repos (id, owner_subject, created_at)
              VALUES (?1, ?2, ?3)",
@@ -185,7 +185,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn get_owner(&self, repo_id: &str) -> Result<Option<Option<String>>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt =
             conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id])?;
@@ -198,13 +198,13 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn delete(&self, repo_id: &str) -> Result<()> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         conn.execute("DELETE FROM repos WHERE id = ?1", params![repo_id])?;
         Ok(())
     }
 
     async fn count_by_owner(&self, subject: &str) -> Result<u64> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn
             .prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
         let mut rows = stmt.query(params![subject])?;
@@ -214,7 +214,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_all(&self) -> Result<Vec<RepoRow>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -235,7 +235,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_paginated(&self, limit: u32, offset: u32) -> Result<Vec<RepoRow>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -257,7 +257,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn count_all(&self) -> Result<u64> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM repos")?;
         let mut rows = stmt.query([])?;
         let row = rows.next()?.expect("COUNT(*) always returns one row");
@@ -266,7 +266,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -293,7 +293,7 @@ impl OwnershipStore for SqliteOwnershipStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<RepoRow>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -319,7 +319,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at FROM repos WHERE id = ?1",
         )?;

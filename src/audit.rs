@@ -170,7 +170,7 @@ impl SqliteAuditStore {
 #[async_trait]
 impl AuditStore for SqliteAuditStore {
     async fn record(&self, evt: AuditEvent) -> Result<()> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
         conn.execute(
             "INSERT INTO audit_events (ts, event, actor, repo_id, fields_json, request_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -187,7 +187,7 @@ impl AuditStore for SqliteAuditStore {
     }
 
     async fn list(&self, q: AuditQuery) -> Result<Vec<AuditEvent>> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
         let limit = q.limit.unwrap_or(100).min(1000) as i64;
 
         // Build the WHERE clause + bound parameters in lockstep so the
@@ -242,13 +242,13 @@ impl AuditStore for SqliteAuditStore {
     }
 
     async fn count(&self) -> Result<u64> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))?;
         Ok(n.max(0) as u64)
     }
 
     async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64> {
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
         let affected = conn.execute(
             "DELETE FROM audit_events WHERE ts < ?1",
             params![cutoff_ts],

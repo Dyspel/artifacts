@@ -238,7 +238,7 @@ impl SqliteTokenStore {
     pub async fn prune(&self, expiry_grace: Duration) -> Result<u64> {
         let now = now_secs() as i64;
         let expiry_cutoff = now.saturating_sub(expiry_grace.as_secs() as i64);
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         // `<=` not `<` mirrors lookup semantics: a row with
         // `expires_at == now` is already unusable (lookup uses
         // `expires_at > now`), so it's logically expired and prunable.
@@ -327,7 +327,7 @@ impl TokenStore for SqliteTokenStore {
         let hash = sha256_hex(&token);
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         conn.execute(
             "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at, subject)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -339,7 +339,7 @@ impl TokenStore for SqliteTokenStore {
     async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         let mut stmt = conn.prepare_cached(
             "SELECT repo_id, scope, expires_at, subject FROM tokens
              WHERE token_hash = ?1
@@ -365,7 +365,7 @@ impl TokenStore for SqliteTokenStore {
     async fn revoke(&self, token: &str) -> Result<bool> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         let affected = conn.execute(
             "UPDATE tokens SET revoked_at = ?1
              WHERE token_hash = ?2 AND revoked_at IS NULL",
@@ -376,7 +376,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn revoke_all_for_repo(&self, repo_id: &str) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         // We only flip rows that are still authorizing — already-expired
         // tokens are dead anyway, so leaving their `revoked_at` NULL keeps
         // the audit trail honest ("this token expired" vs "this token was
@@ -393,7 +393,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn count_active(&self) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         // Mirrors the lookup predicate exactly — a row is active iff it
         // would currently resolve to a TokenRecord. Pruning is what
         // keeps this aggregate cheap; an unbounded `tokens` table with
@@ -416,7 +416,7 @@ impl TokenStore for SqliteTokenStore {
         subject_filter: Option<&str>,
     ) -> Result<Vec<TokenSummary>> {
         let now = now_secs() as i64;
-        let conn = self.conn.lock().await;
+        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
         let mut stmt = conn.prepare_cached(
             "SELECT token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject
              FROM tokens
