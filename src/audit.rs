@@ -41,10 +41,42 @@ use crate::error::Result;
 use async_trait::async_trait;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
+
+/// Seed for the audit hash chain — 32 zero bytes. The first row's
+/// `prev_hash` is GENESIS when the table is empty or has no chained
+/// rows yet (migration v2 just ran against a populated table).
+pub const GENESIS_HASH: [u8; 32] = [0u8; 32];
+
+/// SHA-256 of `prev_hash || ts || event || \0 || actor || \0 ||
+/// repo_id || \0 || fields_json || \0 || request_id`. The `\0`
+/// separators stop concatenation ambiguity (without them, distinct
+/// field combinations could produce the same byte string).
+///
+/// Inputs come from `AuditEvent` after the caller has already
+/// serialized `fields_json`; the hash is therefore deterministic
+/// given the same logical event content. Stable across releases —
+/// changing this function silently breaks chain verification on
+/// existing rows, so it's intentionally simple.
+pub fn hash_row(prev_hash: &[u8], evt: &AuditEvent) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(prev_hash);
+    h.update(evt.ts.to_le_bytes());
+    h.update(evt.event.as_bytes());
+    h.update([0]);
+    h.update(evt.actor.as_bytes());
+    h.update([0]);
+    h.update(evt.repo_id.as_deref().unwrap_or("").as_bytes());
+    h.update([0]);
+    h.update(evt.fields_json.as_bytes());
+    h.update([0]);
+    h.update(evt.request_id.as_deref().unwrap_or("").as_bytes());
+    h.finalize().to_vec()
+}
 
 /// One row of the audit log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +143,14 @@ pub trait AuditStore: Send + Sync {
     /// cleanups. A `cutoff_ts == 0` is a no-op (the table can't
     /// have negative-timestamp rows).
     async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64>;
+    /// Walk the chained portion of the log and recompute each
+    /// `row_hash`. Returns the number of rows whose stored hash
+    /// matched, or `Err` on the first mismatch. Default impl
+    /// returns `Ok(0)` so non-chain-aware stores (`NoopAuditStore`)
+    /// compose without overriding.
+    async fn verify_chain(&self) -> Result<ChainVerifyOk> {
+        Ok(ChainVerifyOk { verified: 0 })
+    }
 }
 
 /// Drops every write on the floor. Useful in unit tests where audit
@@ -141,8 +181,8 @@ pub struct SqliteAuditStore {
     conn: Arc<TokioMutex<Connection>>,
 }
 
-const MIGRATIONS: [crate::db_migrate::Migration; 1] =
-    [crate::db_migrate::Migration {
+const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
+    crate::db_migrate::Migration {
         version: 1,
         name: "init",
         up: |c| {
@@ -162,7 +202,22 @@ const MIGRATIONS: [crate::db_migrate::Migration; 1] =
                  CREATE INDEX IF NOT EXISTS idx_audit_repoid ON audit_events(repo_id);",
             )
         },
-    }];
+    },
+    crate::db_migrate::Migration {
+        // Tamper-evidence: each row's `row_hash` chains to the
+        // previous row's `row_hash` via `prev_hash`. Rows inserted
+        // before this migration ran keep both columns NULL and stand
+        // outside the chain — the chain still detects edits to any
+        // row written after the upgrade, which is the practical
+        // threat model (live audit data).
+        version: 2,
+        name: "add_hash_chain",
+        up: |c| {
+            crate::db_migrate::add_column_if_missing(c, "audit_events", "prev_hash", "BLOB")?;
+            crate::db_migrate::add_column_if_missing(c, "audit_events", "row_hash", "BLOB")
+        },
+    },
+];
 
 impl SqliteAuditStore {
     pub fn open(path: &Path) -> Result<Self> {
@@ -176,15 +231,42 @@ impl SqliteAuditStore {
             conn: Arc::new(TokioMutex::new(conn)),
         })
     }
+
+}
+
+/// Result of a successful `verify_chain` run.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ChainVerifyOk {
+    /// Number of rows whose stored `row_hash` matched the recomputed
+    /// hash. Rows that predate v2 (NULL `row_hash`) are not counted.
+    pub verified: u64,
 }
 
 #[async_trait]
 impl AuditStore for SqliteAuditStore {
     async fn record(&self, evt: AuditEvent) -> Result<()> {
         let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
+        // Read the most-recent chained row's hash under the same
+        // lock so a concurrent recorder can't insert between the
+        // SELECT and the INSERT. The first row of a fresh chain
+        // uses GENESIS_HASH (all-zero 32 bytes); rows that predate
+        // the v2 migration have NULL row_hash and are not part of
+        // the chain — we still chain forward from there using
+        // GENESIS_HASH so the new tail is self-consistent.
+        let prev_hash: Vec<u8> = conn
+            .query_row(
+                "SELECT row_hash FROM audit_events
+                 WHERE row_hash IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap_or_else(|_| GENESIS_HASH.to_vec());
+        let row_hash = hash_row(&prev_hash, &evt);
         conn.execute(
-            "INSERT INTO audit_events (ts, event, actor, repo_id, fields_json, request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO audit_events
+               (ts, event, actor, repo_id, fields_json, request_id, prev_hash, row_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 evt.ts,
                 evt.event,
@@ -192,6 +274,8 @@ impl AuditStore for SqliteAuditStore {
                 evt.repo_id,
                 evt.fields_json,
                 evt.request_id,
+                prev_hash,
+                row_hash,
             ],
         )?;
         Ok(())
@@ -265,6 +349,51 @@ impl AuditStore for SqliteAuditStore {
             params![cutoff_ts],
         )?;
         Ok(affected as u64)
+    }
+
+    async fn verify_chain(&self) -> Result<ChainVerifyOk> {
+        let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, event, actor, repo_id, fields_json, request_id,
+                    prev_hash, row_hash
+             FROM audit_events
+             WHERE row_hash IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut expected_prev: Option<Vec<u8>> = None;
+        let mut verified: u64 = 0;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let evt = AuditEvent {
+                id,
+                ts: row.get(1)?,
+                event: row.get(2)?,
+                actor: row.get(3)?,
+                repo_id: row.get(4)?,
+                fields_json: row.get(5)?,
+                request_id: row.get(6)?,
+            };
+            let stored_prev: Vec<u8> = row.get(7)?;
+            let stored_hash: Vec<u8> = row.get(8)?;
+            // First chained row's `prev_hash` must equal GENESIS;
+            // subsequent rows chain to the previously-verified hash.
+            let expected = expected_prev.as_deref().unwrap_or(&GENESIS_HASH);
+            if stored_prev != expected {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "audit chain broken at row id={id}: prev_hash mismatch"
+                )));
+            }
+            let recomputed = hash_row(&stored_prev, &evt);
+            if recomputed != stored_hash {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "audit chain broken at row id={id}: row_hash mismatch"
+                )));
+            }
+            expected_prev = Some(stored_hash);
+            verified += 1;
+        }
+        Ok(ChainVerifyOk { verified })
     }
 }
 
@@ -672,5 +801,85 @@ mod tests {
         )
         .await;
         assert_eq!(s.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_chain_verifies_zero_rows() {
+        let (_d, s) = store();
+        let ok = s.verify_chain().await.unwrap();
+        assert_eq!(ok.verified, 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_inserts_chain_correctly() {
+        let (_d, s) = store();
+        for i in 0..3 {
+            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+        }
+        let ok = s.verify_chain().await.unwrap();
+        assert_eq!(ok.verified, 3);
+    }
+
+    #[tokio::test]
+    async fn tampered_field_breaks_chain() {
+        // Insert two events, then directly rewrite the first row's
+        // event name in SQLite without recomputing the hash. The
+        // verifier must catch the mismatch at row id=1.
+        let (dir, s) = store();
+        s.record(evt("e1", "admin", None)).await.unwrap();
+        s.record(evt("e2", "admin", None)).await.unwrap();
+        // Sneak around the AuditStore trait — direct SQLite write.
+        let conn = rusqlite::Connection::open(dir.path().join("audit.db")).unwrap();
+        conn.execute(
+            "UPDATE audit_events SET event = 'TAMPERED' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let err = s.verify_chain().await.expect_err("expected ChainBreak");
+        assert!(
+            err.to_string().contains("audit chain broken"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_prev_hash_breaks_chain() {
+        let (dir, s) = store();
+        s.record(evt("a", "admin", None)).await.unwrap();
+        s.record(evt("b", "admin", None)).await.unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("audit.db")).unwrap();
+        // Overwrite row id=2's prev_hash with bogus bytes — row_hash
+        // is no longer derivable from prev_hash, so verification
+        // must fail on the prev_hash branch (the recompute would
+        // also fail, but prev_hash mismatch is the first check).
+        conn.execute(
+            "UPDATE audit_events SET prev_hash = X'DEADBEEF' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(s.verify_chain().await.is_err());
+    }
+
+    #[test]
+    fn hash_row_is_deterministic_and_distinguishes_inputs() {
+        let evt_a = AuditEvent {
+            id: 0,
+            ts: 1000,
+            event: "x".into(),
+            actor: "admin".into(),
+            repo_id: None,
+            fields_json: "{}".into(),
+            request_id: None,
+        };
+        let mut evt_b = evt_a.clone();
+        evt_b.actor = "user".into();
+        let h_a1 = hash_row(&GENESIS_HASH, &evt_a);
+        let h_a2 = hash_row(&GENESIS_HASH, &evt_a);
+        let h_b = hash_row(&GENESIS_HASH, &evt_b);
+        assert_eq!(h_a1, h_a2, "same input must hash the same");
+        assert_ne!(h_a1, h_b, "different actors must hash differently");
+        assert_eq!(h_a1.len(), 32, "SHA-256 output is 32 bytes");
     }
 }

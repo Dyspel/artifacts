@@ -552,6 +552,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/v1/admin/webhook-key/rotate", post(rest::admin_rotate_webhook_key))
                 .route("/v1/admin/audit", get(rest::admin_list_audit))
                 .route("/v1/admin/audit/stats", get(rest::admin_audit_stats))
+                .route("/v1/admin/audit/verify-chain", get(rest::admin_verify_audit_chain))
                 .route("/v1/admin/repos", get(rest::admin_list_repos))
                 .route("/v1/admin/repos/:id", get(rest::admin_get_repo))
                 .route(

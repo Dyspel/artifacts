@@ -348,6 +348,25 @@ pub async fn admin_audit_stats(
     Ok(Json(AdminAuditStats { count }))
 }
 
+/// `GET /v1/admin/audit/verify-chain`
+///
+/// Walk the audit-log hash chain and recompute every row's hash.
+/// Returns `{verified: N}` on success — the count of chained rows
+/// whose stored hash matched. Returns 500 with a descriptive error
+/// on the first mismatch (post-hoc tampering of the SQLite file by
+/// anyone with shell access to the data dir).
+///
+/// Admin-only. Cost is one full scan over `audit_events`; safe to
+/// call from compliance tooling on demand.
+pub async fn admin_verify_audit_chain(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::audit::ChainVerifyOk>> {
+    require_admin(&state, &headers)?;
+    let ok = state.audit.verify_chain().await?;
+    Ok(Json(ok))
+}
+
 /// `GET /v1/admin/audit`
 ///
 /// Returns the persisted audit log, filtered by query params.

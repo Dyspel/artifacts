@@ -42,7 +42,7 @@ use std::sync::Arc;
 pub use admin::{
     admin_audit_stats, admin_gc_preview, admin_gc_run, admin_get_repo,
     admin_list_audit, admin_list_repos, admin_rotate_token,
-    admin_rotate_webhook_key,
+    admin_rotate_webhook_key, admin_verify_audit_chain,
 };
 pub use health::{health, health_ready};
 pub use repos::{create_repo, delete_repo, fork_repo, list_repos};
