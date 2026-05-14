@@ -100,6 +100,11 @@ end-to-end in a day, not a quarter.
 | `POST /v1/admin/webhook-key/rotate` — re-encrypt every webhook secret under a fresh master key | ✅     |
 | `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
 | `GET /v1/admin/audit/stats` — cheap row-count totals             | ✅     |
+| `GET /v1/admin/audit/verify-chain` — SHA-256 hash-chain tamper detection | ✅     |
+| Per-IP rate limit on unauth `/v1/health*` (burst 60, sustain 2/s) | ✅     |
+| 1 MiB body cap on `/v1/*` (git smart-HTTP stays at 1 GiB)        | ✅     |
+| Forward-only schema migrator (`schema_version` per store)        | ✅     |
+| SQLite lock-wait histogram (`artifacts_sqlite_lock_wait_seconds`) | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
 
 **Known not-yet:**
@@ -916,7 +921,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 249 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, webhook-secret encryption + master-key rotation, object-store read+write+list+delete conformance, bind-safety, error-response contracts, health-readiness probes, metrics cardinality)
+cargo test                  # 264 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, audit hash-chain tamper detection, webhook-secret encryption + master-key rotation, object-store read+write+list+delete conformance, bind-safety, error-response contracts, health-readiness probes, metrics cardinality, schema-migration framework, per-IP rate-limit at unauth boundary, pagination proptest)
 ./tests/smoke.sh            # end-to-end integration smoke (multi-step)
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
