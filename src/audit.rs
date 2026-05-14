@@ -141,26 +141,37 @@ pub struct SqliteAuditStore {
     conn: Arc<TokioMutex<Connection>>,
 }
 
+const MIGRATIONS: [crate::db_migrate::Migration; 1] =
+    [crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit_events (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ts          INTEGER NOT NULL,
+                     event       TEXT NOT NULL,
+                     actor       TEXT NOT NULL,
+                     repo_id     TEXT,
+                     fields_json TEXT NOT NULL DEFAULT '{}',
+                     request_id  TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_events(ts);
+                 CREATE INDEX IF NOT EXISTS idx_audit_event  ON audit_events(event);
+                 CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_events(actor);
+                 CREATE INDEX IF NOT EXISTS idx_audit_repoid ON audit_events(repo_id);",
+            )
+        },
+    }];
+
 impl SqliteAuditStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS audit_events (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 ts          INTEGER NOT NULL,
-                 event       TEXT NOT NULL,
-                 actor       TEXT NOT NULL,
-                 repo_id     TEXT,
-                 fields_json TEXT NOT NULL DEFAULT '{}',
-                 request_id  TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_events(ts);
-             CREATE INDEX IF NOT EXISTS idx_audit_event  ON audit_events(event);
-             CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_events(actor);
-             CREATE INDEX IF NOT EXISTS idx_audit_repoid ON audit_events(repo_id);",
+             PRAGMA synchronous=NORMAL;",
         )?;
+        crate::db_migrate::run(&conn, "audit", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(TokioMutex::new(conn)),
         })

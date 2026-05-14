@@ -123,6 +123,34 @@ pub struct SqliteWebhookRegistry {
     master_key: std::sync::RwLock<Arc<crate::secrets::MasterKey>>,
 }
 
+const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
+    crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS webhooks (
+                     id          TEXT PRIMARY KEY,
+                     repo_id     TEXT NOT NULL,
+                     url         TEXT NOT NULL,
+                     secret      TEXT,
+                     events_json TEXT NOT NULL,
+                     created_at  INTEGER NOT NULL,
+                     revoked_at  INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_webhooks_repo ON webhooks(repo_id);",
+            )
+        },
+    },
+    crate::db_migrate::Migration {
+        // M6-deliver-secrets: per-row AES-GCM nonce. Plaintext rows
+        // (NULL nonce) stay readable as a transition state.
+        version: 2,
+        name: "add_secret_nonce_column",
+        up: |c| crate::db_migrate::add_column_if_missing(c, "webhooks", "secret_nonce", "BLOB"),
+    },
+];
+
 impl SqliteWebhookRegistry {
     pub fn open(
         path: &std::path::Path,
@@ -131,31 +159,9 @@ impl SqliteWebhookRegistry {
         let conn = rusqlite::Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS webhooks (
-                 id          TEXT PRIMARY KEY,
-                 repo_id     TEXT NOT NULL,
-                 url         TEXT NOT NULL,
-                 secret      TEXT,
-                 events_json TEXT NOT NULL,
-                 created_at  INTEGER NOT NULL,
-                 revoked_at  INTEGER
-             );
-             CREATE INDEX IF NOT EXISTS idx_webhooks_repo ON webhooks(repo_id);",
+             PRAGMA synchronous=NORMAL;",
         )?;
-        // M6-deliver-secrets migration: add `secret_nonce` column.
-        // Idempotent — swallow the duplicate-column error so we can
-        // run unchanged against both fresh DBs and DBs that already
-        // ran this migration. Same forward-only pattern the token
-        // store uses for its `subject` column.
-        match conn.execute("ALTER TABLE webhooks ADD COLUMN secret_nonce BLOB", []) {
-            Ok(_) => {
-                tracing::info!("webhook store migrated: added `secret_nonce` column");
-            }
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(crate::error::Error::from(e)),
-        }
+        crate::db_migrate::run(&conn, "webhooks", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
             master_key: std::sync::RwLock::new(master_key),

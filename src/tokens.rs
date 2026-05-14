@@ -189,35 +189,42 @@ pub struct SqliteTokenStore {
     conn: Arc<TokioMutex<Connection>>,
 }
 
+const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
+    crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tokens (
+                     token_hash TEXT PRIMARY KEY,
+                     repo_id    TEXT NOT NULL,
+                     scope      TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER,
+                     revoked_at INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_tokens_repo_id ON tokens(repo_id);",
+            )
+        },
+    },
+    crate::db_migrate::Migration {
+        // M4b-account migration: the `subject` column lets us track
+        // which JWT subject minted each token, so a user can list /
+        // revoke tokens they own without needing admin.
+        version: 2,
+        name: "add_subject_column",
+        up: |c| crate::db_migrate::add_column_if_missing(c, "tokens", "subject", "TEXT"),
+    },
+];
+
 impl SqliteTokenStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS tokens (
-                 token_hash TEXT PRIMARY KEY,
-                 repo_id    TEXT NOT NULL,
-                 scope      TEXT NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 expires_at INTEGER,
-                 revoked_at INTEGER
-             );
-             CREATE INDEX IF NOT EXISTS idx_tokens_repo_id ON tokens(repo_id);",
+             PRAGMA synchronous=NORMAL;",
         )?;
-        // M4b-account migration: add `subject` column if absent. Idempotent
-        // because we swallow the duplicate-column error from sqlite. We
-        // can't `CREATE TABLE IF NOT EXISTS` with the new column because
-        // existing databases may have the old shape; ALTER is the
-        // forward-only path that works for both new and legacy DBs.
-        match conn.execute("ALTER TABLE tokens ADD COLUMN subject TEXT", []) {
-            Ok(_) => {
-                tracing::info!("token store migrated: added `subject` column");
-            }
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(Error::from(e)),
-        }
+        crate::db_migrate::run(&conn, "tokens", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(TokioMutex::new(conn)),
         })

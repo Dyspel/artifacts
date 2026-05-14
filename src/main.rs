@@ -3,6 +3,7 @@ mod audit;
 mod auth;
 mod commits;
 mod config;
+mod db_migrate;
 mod error;
 mod events;
 mod gc;

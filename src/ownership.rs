@@ -146,19 +146,30 @@ pub struct SqliteOwnershipStore {
     conn: Arc<TokioMutex<Connection>>,
 }
 
+const MIGRATIONS: [crate::db_migrate::Migration; 1] =
+    [crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS repos (
+                     id             TEXT PRIMARY KEY,
+                     owner_subject  TEXT,
+                     created_at     INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_subject);",
+            )
+        },
+    }];
+
 impl SqliteOwnershipStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS repos (
-                 id             TEXT PRIMARY KEY,
-                 owner_subject  TEXT,
-                 created_at     INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_subject);",
+             PRAGMA synchronous=NORMAL;",
         )?;
+        crate::db_migrate::run(&conn, "ownership", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(TokioMutex::new(conn)),
         })
