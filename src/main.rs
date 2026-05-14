@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod events;
 mod gc;
+mod ip_rate_limit;
 mod jwt;
 mod merge;
 mod metrics;
@@ -372,6 +373,17 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(3600),
             );
 
+            // Per-IP rate limiter for the two unauth health endpoints.
+            // Same shape as `RateLimiter` but keyed on peer IP instead
+            // of subject; lives behind a middleware layer attached to
+            // `/v1/health*` so authenticated traffic is unaffected.
+            let ip_rate_limit = Arc::new(ip_rate_limit::IpRateLimiter::with_defaults());
+            ip_rate_limit::spawn_cleanup(
+                ip_rate_limit.clone(),
+                Duration::from_secs(300),
+                Duration::from_secs(3600),
+            );
+
             let event_bus = events::EventBus::new();
             // Webhook subscription store: SQLite-backed if
             // ARTIFACTS_WEBHOOK_DB is set (or implicitly when a
@@ -495,9 +507,21 @@ async fn main() -> anyhow::Result<()> {
                 disable_native,
             };
 
-            let rest_router = Router::new()
+            // Health routes carry their own per-IP rate-limit layer so
+            // an unauthenticated scanner can't pound /v1/health* — the
+            // principal-keyed limiter can't see them because auth
+            // doesn't run. State is dedicated (the limiter Arc); the
+            // main router's `RestState` is unaffected.
+            let health_router = Router::new()
                 .route("/v1/health", get(rest::health))
                 .route("/v1/health/ready", get(rest::health_ready))
+                .layer(axum_middleware::from_fn_with_state(
+                    ip_rate_limit.clone(),
+                    ip_rate_limit_middleware,
+                ));
+
+            let rest_router = Router::new()
+                .merge(health_router)
                 .route("/v1/repos", post(rest::create_repo).get(rest::list_repos))
                 .route("/v1/repos/:id", delete(rest::delete_repo).get(reads::get_repo))
                 .route("/v1/repos/:id/forks", post(rest::fork_repo))
@@ -614,7 +638,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 axum_server::bind_rustls(addr, config)
                     .handle(handle)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
                 emit_server_shutdown(
                     &*audit_for_shutdown,
@@ -636,12 +660,15 @@ async fn main() -> anyhow::Result<()> {
                 // connections and lets in-flight requests finish (up to
                 // a tower-managed deadline). The outer timeout ensures
                 // we exit even if a request is genuinely stuck.
-                let serve = axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown_signal(
-                        draining.clone(),
-                        shutdown_drain_delay,
-                        drain_started.clone(),
-                    ));
+                let serve = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_signal(
+                    draining.clone(),
+                    shutdown_drain_delay,
+                    drain_started.clone(),
+                ));
                 if shutdown_timeout.is_zero() {
                     serve.await?;
                 } else {
@@ -904,6 +931,30 @@ fn spawn_shutdown_listener(
         shutdown_signal(draining, drain_delay, drain_started).await;
         handle.graceful_shutdown(Some(timeout));
     });
+}
+
+/// Axum middleware: charge one token from the per-IP bucket before
+/// running the wrapped handler; return 429 if the bucket is empty.
+///
+/// `ConnectInfo` is read out of the request's extensions
+/// (populated by `into_make_service_with_connect_info::<SocketAddr>`).
+/// If for some reason it's missing — e.g. a test harness shoves
+/// requests in directly — the check is skipped rather than failing
+/// the request, because per-IP limiting is a defense-in-depth layer,
+/// not a hard correctness boundary.
+async fn ip_rate_limit_middleware(
+    axum::extract::State(limiter): axum::extract::State<Arc<ip_rate_limit::IpRateLimiter>>,
+    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(axum::extract::ConnectInfo(addr)) = connect_info {
+        if let Err(e) = limiter.check(addr.ip()) {
+            return e.into_response();
+        }
+    }
+    next.run(req).await
 }
 
 pub(crate) fn random_admin_token() -> String {
