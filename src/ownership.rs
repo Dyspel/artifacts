@@ -840,4 +840,108 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    // Property tests live in a sub-module so the proptest macros don't
+    // expand inside the existing `tests` namespace.
+    mod prop {
+        //! Pagination invariants checked across a randomized parameter
+        //! space:
+        //!
+        //!   - Walking pages of size L over N rows returns exactly N
+        //!     distinct rows; no duplicates, no gaps.
+        //!   - `count_all` agrees with the row count we just inserted.
+        //!   - The first page (`offset = 0`) plus a non-overlapping
+        //!     second page (`offset = L`) cover the start of the table
+        //!     without intersection.
+        //!
+        //! These complement the hand-written cases above by sweeping
+        //! the parameter space — small N, large N, L > N, L equal to N,
+        //! and so on. Case count is capped low so the SQLite-per-case
+        //! cost doesn't blow up the test runtime.
+        use super::super::SqliteOwnershipStore;
+        use super::super::OwnershipStore;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+        use tempfile::TempDir;
+        use tokio::runtime::Runtime;
+
+        fn fresh_blocking() -> (TempDir, SqliteOwnershipStore) {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("artifacts.db");
+            let store = SqliteOwnershipStore::open(&path).unwrap();
+            (dir, store)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 24,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn page_walk_returns_every_row_exactly_once(
+                n in 0u32..40,
+                limit in 1u32..15,
+            ) {
+                let rt = Runtime::new().unwrap();
+                rt.block_on(async {
+                    let (_d, store) = fresh_blocking();
+                    for i in 0..n {
+                        store.record_owner(&format!("r{i:03}"), Some("u")).await.unwrap();
+                    }
+                    let total = store.count_all().await.unwrap();
+                    prop_assert_eq!(total, n as u64);
+
+                    let mut seen: HashSet<String> = HashSet::new();
+                    let mut offset = 0u32;
+                    loop {
+                        let page = store.list_paginated(limit, offset).await.unwrap();
+                        if page.is_empty() {
+                            break;
+                        }
+                        for row in &page {
+                            prop_assert!(
+                                seen.insert(row.id.clone()),
+                                "duplicate row across pages: {}",
+                                row.id,
+                            );
+                        }
+                        prop_assert!(
+                            page.len() as u32 <= limit,
+                            "page exceeded requested limit",
+                        );
+                        offset += limit;
+                        // Defensive: should never overshoot. The page-empty
+                        // break is the real termination condition.
+                        prop_assert!(offset <= n + limit, "ran past the dataset");
+                    }
+                    prop_assert_eq!(seen.len() as u32, n);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn two_disjoint_pages_dont_intersect(
+                n in 5u32..40,
+                limit in 1u32..15,
+            ) {
+                let rt = Runtime::new().unwrap();
+                rt.block_on(async {
+                    let (_d, store) = fresh_blocking();
+                    for i in 0..n {
+                        store.record_owner(&format!("r{i:03}"), Some("u")).await.unwrap();
+                    }
+                    let p0 = store.list_paginated(limit, 0).await.unwrap();
+                    let p1 = store.list_paginated(limit, limit).await.unwrap();
+                    let s0: HashSet<&str> = p0.iter().map(|r| r.id.as_str()).collect();
+                    let s1: HashSet<&str> = p1.iter().map(|r| r.id.as_str()).collect();
+                    prop_assert!(
+                        s0.is_disjoint(&s1),
+                        "page 0 and page 1 must not share rows",
+                    );
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }
