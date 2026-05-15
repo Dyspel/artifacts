@@ -111,7 +111,7 @@ end-to-end in a day, not a quarter.
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait (read + write + list + delete) + `MemObjectStore` + atomic-write `FsObjectStore` + conformance suite + `gc` routed through trait; protocol-layer routing + chunked-KV impl remain | 🟡 M2b |
+| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait (read + write + list + delete + exists) + `MemObjectStore` + atomic-write `FsObjectStore` + `SqliteObjectStore` (the KV-shaped second backend) + conformance suite + `gc` routed through trait + commits parent-exists routed through trait; remaining: receive-pack + read paths through gix-driven ObjectStore | 🟡 M2b |
 | Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
 | Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
 | Admin-token rotation (in-process) | ✅ M4b-key-rotation |
@@ -142,16 +142,22 @@ when subprocess isn't an option.
 Remaining, in order:
 
 1. **M2b — chunked-KV `Storage` impl.** `ObjectStore` trait
-   (`read_loose` + `write_loose` + `list_loose` + `delete_loose`)
-   + two impls — `FsObjectStore` with atomic tmp+rename writes,
-   `MemObjectStore` — and a shared conformance suite landed. **The
-   `gc` module is now routed through the trait** — both
-   `admin_gc_preview` and `admin_gc_run` enumerate and delete loose
-   objects via `ObjectStore`, so a future chunked-KV impl makes
-   gc backend-neutral with no further gc-side refactor. Remaining
-   for full M2b: route the receive-pack and commits-plumbing
-   read paths through the trait (those still go to the filesystem
-   directly or via gix), then the chunked-KV impl itself.
+   (`read_loose` + `write_loose` + `list_loose` + `delete_loose` +
+   `exists`) + three impls — `FsObjectStore` with atomic
+   tmp+rename writes, `MemObjectStore`, and `SqliteObjectStore`
+   (the KV-shaped second backend matching the DO+SQLite production
+   target). Shared conformance suite covers all three. **Two
+   production paths are now routed through the trait**:
+   `admin_gc_preview` / `admin_gc_run` enumerate and delete loose
+   objects via `ObjectStore`, and `create_commit`'s parent-exists
+   check goes through `ObjectStore::exists` (replacing a
+   `git cat-file -e` subprocess; the FS impl stats the loose
+   path first, falls back to a gix-driven pack-index walk).
+   Remaining: route receive-pack writes + the blob-read endpoint
+   through the trait (both still go to the filesystem via
+   subprocess or gix). The chunked-KV protocol-routing slice is
+   blocked on M1b-3-gix becoming default (subprocess `git
+   unpack-objects` is currently faster on small pushes).
 2. **M3b — distributed `RefStore` impl.** `MemRefStore` + a
    concurrent-CAS conformance test landed; the consensus log
    (openraft) + per-repo state machine + leader election +
@@ -941,7 +947,7 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 264 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, audit hash-chain tamper detection, webhook-secret encryption + master-key rotation, object-store read+write+list+delete conformance, bind-safety, error-response contracts, health-readiness probes, metrics cardinality, schema-migration framework, per-IP rate-limit at unauth boundary, pagination proptest)
+cargo test                  # 281 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, audit hash-chain tamper detection, webhook-secret encryption + master-key rotation, object-store conformance across Fs/Mem/SQLite, bind-safety, error-response contracts, health-readiness probes, metrics cardinality, schema-migration framework, per-IP rate-limit at unauth boundary, pagination proptest)
 ./tests/smoke.sh            # end-to-end integration smoke (multi-step)
 ./scripts/bench_fork.sh     # fork benchmark, knobs via env:
 FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
@@ -974,7 +980,7 @@ RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 | **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
 | **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
 | **M1b-3-gix** | 🟡 opt-in | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Available behind `ARTIFACTS_NATIVE_INDEX_PACK=1`; the bench (see Push latency above) showed `gix-pack` is ~4× slower than `git unpack-objects` on typical small pushes, so the default is the subprocess until the crossover improves upstream. The dispatch + helper are wired so a future chunked-KV `Storage` impl (which can't shell out) gets a working native path on day one. | n/a (default subprocess) |
-| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait (`read_loose` + `write_loose` + `list_loose` + `delete_loose`) + atomic-write `FsObjectStore` + `MemObjectStore` + a shared conformance suite landed. **First production-routing slice shipped**: `gc` enumerates and deletes loose objects through the trait. Receive-pack + commits-plumbing routing + the chunked-KV impl itself + lifecycle ops remain. | bare repos on disk |
+| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait (`read_loose` + `write_loose` + `list_loose` + `delete_loose` + `exists`) + atomic-write `FsObjectStore` + `MemObjectStore` + `SqliteObjectStore` (the KV-shaped second backend) + shared conformance suite landed. **Production routing**: `gc` enumerates/deletes through the trait; `create_commit`'s parent-exists goes through `ObjectStore::exists`. Receive-pack writes + blob-read endpoint routing remain; the chunked-KV impl is wired but not yet plumbed into `RestState`. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
 | **M4b-key-rotation** | ✅ done | In-process admin-token rotation (`POST /v1/admin/token/rotate`). `Config::admin_token` is a runtime `RwLock<String>`; rotation atomically swaps the cell, the previous token stops authorizing on the next request, and the event lands on the `audit` tracing target. | env-var-on-restart only |
