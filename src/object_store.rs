@@ -114,6 +114,20 @@ pub trait ObjectStore: Send + Sync {
     /// (idempotent — a second delete of the same oid is fine).
     /// Malformed oid is an error, mirroring `write_loose`.
     fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool>;
+
+    /// Does the store have an object with this oid? Covers loose
+    /// **and** packed in backends that have a pack concept (the FS
+    /// impl walks `objects/pack/*.idx` via gix); KV-shaped backends
+    /// where every object is loose just answer from their loose set.
+    /// Malformed oid returns `Ok(false)` — same shape as `read_loose`.
+    ///
+    /// Default impl is `read_loose(...).is_some()`. Backends that
+    /// can answer existence without reading the body (FS stat-only,
+    /// pack `.idx` binary-search, KV row-presence) should override
+    /// to skip the body fetch.
+    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        Ok(self.read_loose(repo_id, oid)?.is_some())
+    }
 }
 
 /// Filesystem-backed `ObjectStore`. Reads from
@@ -260,6 +274,39 @@ impl ObjectStore for FsObjectStore {
             Err(e) => Err(Error::from(e)),
         }
     }
+
+    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        // Fast path: stat the loose location. Cheaper than opening
+        // gix and never wakes the pack index. Most freshly-pushed
+        // objects live here until `git gc` repacks them.
+        if let Some(path) = self.loose_path(repo_id, oid) {
+            if path.exists() {
+                return Ok(true);
+            }
+        } else {
+            return Ok(false);
+        }
+        // Slow path: pack visibility. Open the repo via gix and
+        // consult its object database — gix walks `objects/pack/*.idx`
+        // and resolves the oid binary-search-style. Cheaper than
+        // shelling out to `git cat-file -e` (no process fork, no
+        // child handshake) but still pays for the gix::open.
+        let repo_path = self.root.join(format!("{repo_id}.git"));
+        if !repo_path.is_dir() {
+            return Ok(false);
+        }
+        let repo = match gix::open(&repo_path) {
+            Ok(r) => r,
+            // A repo that gix refuses to open can't have the oid
+            // either; treat as "no such object" rather than bubbling.
+            Err(_) => return Ok(false),
+        };
+        let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
+            Ok(o) => o,
+            Err(_) => return Ok(false),
+        };
+        Ok(repo.find_header(gix_oid).is_ok())
+    }
 }
 
 /// In-memory `ObjectStore`. Backed by an `RwLock<HashMap<(repo_id, oid),
@@ -389,6 +436,18 @@ impl ObjectStore for MemObjectStore {
             .expect("MemObjectStore lock poisoned")
             .remove(&(repo_id.to_string(), oid.to_string()))
             .is_some())
+    }
+
+    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        if !oid_is_valid(oid) {
+            return Ok(false);
+        }
+        // Skip the body clone — `contains_key` is all we need.
+        Ok(self
+            .objects
+            .read()
+            .expect("MemObjectStore lock poisoned")
+            .contains_key(&(repo_id.to_string(), oid.to_string())))
     }
 }
 
@@ -562,6 +621,26 @@ pub(crate) mod conformance {
             assert!(r.is_err(), "expected delete_loose({bad:?}) to error, got {r:?}");
         }
     }
+
+    /// `exists` agrees with `read_loose` for both present and absent
+    /// oids. The trait promises this — a backend whose existence
+    /// check disagrees with its body fetch is broken.
+    pub fn exists_agrees_with_read<S: ObjectStore>(store: &S, repo_id: &str, present_oid: &str) {
+        assert!(
+            store.exists(repo_id, present_oid).unwrap(),
+            "exists must return true for a known-present oid",
+        );
+        let absent = "0000000000000000000000000000000000000000";
+        assert!(
+            !store.exists(repo_id, absent).unwrap(),
+            "exists must return false for a never-written oid",
+        );
+        // Malformed oid: same shape as read_loose — false, not an error.
+        assert!(
+            !store.exists(repo_id, "not-a-real-oid").unwrap(),
+            "exists must return false for a malformed oid",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +712,71 @@ mod tests {
         assert!(bytes.len() > 2);
     }
 
+    #[test]
+    fn fs_exists_agrees_with_read_for_loose() {
+        let (_t, store, repo_id, oid) = fs_fixture();
+        conformance::exists_agrees_with_read(&store, &repo_id, &oid);
+    }
+
+    /// FS-specific: an object that's been packed (no longer loose) is
+    /// still visible to `exists` via the gix pack-index walk. This is
+    /// the contract the commits-plumbing existence check depends on
+    /// — without it, a `cat-file -e` -> `exists()` swap would break
+    /// commits-after-gc.
+    #[test]
+    fn fs_exists_finds_packed_objects() {
+        use std::process::Command;
+        let (_t, store, repo_id, oid) = fs_fixture();
+        let git_dir = store.root.join(format!("{repo_id}.git"));
+        // Need a ref pointing at the object so `git repack` keeps
+        // it. Blobs aren't reachable from a ref on their own, so
+        // wrap it in a commit. Reuse hash-object → write-tree → commit-tree.
+        let tree_oid = {
+            let out = Command::new("git")
+                .arg("--git-dir").arg(&git_dir)
+                .args(["mktree"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            use std::io::Write as _;
+            let mut out = out;
+            writeln!(out.stdin.as_mut().unwrap(), "100644 blob {oid}\thello.txt").unwrap();
+            let o = out.wait_with_output().unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        let commit_oid = {
+            let out = Command::new("git")
+                .arg("--git-dir").arg(&git_dir)
+                .args(["commit-tree", &tree_oid, "-m", "t"])
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        Command::new("git")
+            .arg("--git-dir").arg(&git_dir)
+            .args(["update-ref", "refs/heads/main", &commit_oid])
+            .status().unwrap();
+        // Repack + prune: blob moves from objects/<aa>/<bb...> into a packfile.
+        Command::new("git")
+            .arg("--git-dir").arg(&git_dir)
+            .args(["repack", "-ad"])
+            .status().unwrap();
+        // The loose path is gone now.
+        let loose_path = store.loose_path(&repo_id, &oid).unwrap();
+        assert!(
+            !loose_path.exists(),
+            "test setup broken: blob should have been packed away",
+        );
+        // …but exists() still finds it through the pack-index walk.
+        assert!(
+            store.exists(&repo_id, &oid).unwrap(),
+            "exists must find packed objects, not just loose ones",
+        );
+    }
+
     // ─── MemObjectStore conformance ────────────────────────────────
 
     /// Synthesize a deterministic 40-hex oid for a Mem fixture. The
@@ -691,6 +835,12 @@ mod tests {
     fn mem_write_loose_rejects_malformed_oid() {
         let store = MemObjectStore::new();
         conformance::write_loose_rejects_malformed_oid(&store);
+    }
+
+    #[test]
+    fn mem_exists_agrees_with_read() {
+        let (store, repo_id, oid) = mem_fixture();
+        conformance::exists_agrees_with_read(&store, &repo_id, &oid);
     }
 
     #[test]

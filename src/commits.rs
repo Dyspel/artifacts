@@ -169,12 +169,16 @@ pub async fn create_commit(
     let base_tree = match &body.parent {
         Some(sha) => {
             validate_sha(sha)?;
-            // Verify parent exists. cat-file -e exits 0 if present.
-            let (rc, _, stderr) = run_git(&git_dir, &["cat-file", "-e", sha], &[], None).await?;
-            if rc != 0 {
+            // Existence check via `ObjectStore::exists` — first
+            // production routing of the trait for a read path. FS impl
+            // stats the loose location then falls through to gix's
+            // pack-index walk if needed, so this works against both
+            // freshly-pushed (loose) and gc'd (packed) parents. A future
+            // chunked-KV impl satisfies the same call without a
+            // subprocess.
+            if !state.objects.exists(&repo_id, sha)? {
                 return Err(Error::BadRequest(format!(
-                    "parent commit not found: {sha} ({})",
-                    String::from_utf8_lossy(&stderr).trim()
+                    "parent commit not found: {sha}"
                 )));
             }
             // Get its tree.
