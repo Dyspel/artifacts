@@ -484,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
                 webhooks: webhook_registry,
                 audit,
                 webhook_key_path,
-                objects,
+                objects: objects.clone(),
                 draining: draining.clone(),
             };
             // Bench A/B kill-switch. Production never sets this; the
@@ -505,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg: cfg.clone(),
                 tokens,
                 refs,
+                objects,
                 disable_native,
             };
 

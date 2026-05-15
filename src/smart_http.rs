@@ -59,6 +59,13 @@ pub struct GitState {
     /// the REST commits path uses; the trait gives us `list` +
     /// `read_head` without going through git subprocesses.
     pub refs: Arc<dyn RefStore>,
+    /// Object backend. M2b production routing: when the native pack
+    /// indexer runs, it goes through `objects.ingest_pack(...)`
+    /// rather than calling into `native_pack` directly. The FS impl
+    /// is a thin wrapper today; a future chunked-KV impl would
+    /// satisfy the same trait method without touching the receive
+    /// handler.
+    pub objects: Arc<dyn crate::object_store::ObjectStore>,
     /// When `true`, every native dispatcher (ls-refs / fetch /
     /// receive-pack / pack-indexing) is short-circuited and the
     /// request falls through to the legacy subprocess path. Wired
@@ -91,7 +98,11 @@ pub async fn git_handler(
     let native_ctx = if state.disable_native {
         None
     } else {
-        Some((repo_id.as_str(), state.refs.as_ref()))
+        Some((
+            repo_id.as_str(),
+            state.refs.as_ref(),
+            state.objects.as_ref(),
+        ))
     };
     match (method.as_str(), rest.as_str()) {
         ("GET", "info/refs") => {
@@ -296,14 +307,14 @@ async fn pack_handler(
     repo_path: &Path,
     sub: &str, // "upload-pack" or "receive-pack"
     request: Request,
-    refs_for_native: Option<(&str, &dyn RefStore)>,
+    refs_for_native: Option<(&str, &dyn RefStore, &dyn crate::object_store::ObjectStore)>,
 ) -> Result<Response<Body>> {
     let headers = request.headers().clone();
     let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024 * 1024)
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!("read body: {e}")))?;
 
-    if let Some((repo_id, refs)) = refs_for_native {
+    if let Some((repo_id, refs, objects)) = refs_for_native {
         // upload-pack natives (v2 ls-refs / fetch).
         if sub == "upload-pack" {
             if let Some(args) = parse_ls_refs_only(&body_bytes) {
@@ -337,7 +348,7 @@ async fn pack_handler(
                         "native receive-pack (no subprocess)"
                     );
                     return native_receive_pack_response(
-                        repo_path, repo_id, refs, req,
+                        repo_path, repo_id, refs, objects, req,
                     )
                     .await;
                 }
@@ -896,6 +907,7 @@ async fn native_receive_pack_response(
     repo_path: &Path,
     repo_id: &str,
     refs: &dyn RefStore,
+    objects: &dyn crate::object_store::ObjectStore,
     req: ReceivePackRequest,
 ) -> Result<Response<Body>> {
     // Pack-indexing leaf. Two paths exist:
@@ -929,21 +941,25 @@ async fn native_receive_pack_response(
     let unpack_outcome: std::result::Result<(), String> = if req.pack.is_empty() {
         Ok(())
     } else if prefer_native_index {
-        let repo_path_buf = repo_path.to_path_buf();
-        let pack = req.pack.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::native_pack::index_pack_into_repo(&repo_path_buf, &pack)
-        })
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "native pack index failed; falling back to unpack-objects");
+        // Route through `ObjectStore::ingest_pack`. The FS impl
+        // delegates to `native_pack::index_pack_into_repo` (writes
+        // pack file + index inside the repo's `objects/pack/`); a
+        // future chunked-KV impl would unpack to its own loose
+        // representation behind the same trait method. The gix
+        // path is sync so we briefly block the worker thread —
+        // for typical small pushes the cost is the same ~50ms
+        // `Bundle::write_to_directory` overhead noted upstream.
+        match objects.ingest_pack(repo_id, &req.pack) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "native pack ingest failed; falling back to unpack-objects",
+                );
                 unpack_objects_via_subprocess(repo_path, &req.pack)
                     .await
                     .map_err(|e| format!("{e}"))
             }
-            Err(e) => Err(format!("native index join: {e}")),
         }
     } else {
         unpack_objects_via_subprocess(repo_path, &req.pack)

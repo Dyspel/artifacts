@@ -128,6 +128,27 @@ pub trait ObjectStore: Send + Sync {
     fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
         Ok(self.read_loose(repo_id, oid)?.is_some())
     }
+
+    /// Ingest a pack file's contents into the store. The receive-pack
+    /// handler calls this after parsing the incoming push; whatever
+    /// the backend stores objects as (pack files on disk, individual
+    /// rows in a KV) is the backend's choice.
+    ///
+    /// Returns the number of objects ingested (best-effort — backends
+    /// that can't enumerate without a full re-scan may return 0; the
+    /// receive-pack handler doesn't depend on this for correctness,
+    /// just for tracing).
+    ///
+    /// Default impl returns `UnsupportedIngest`. Backends that can't
+    /// resolve thin-pack deltas (the Mem and SQLite impls today
+    /// — both lack a base-object lookup against an existing repo)
+    /// fall through to this default and the receive-pack handler
+    /// errors out. The FS impl overrides with `gix_pack` ingestion.
+    fn ingest_pack(&self, _repo_id: &str, _pack_bytes: &[u8]) -> Result<usize> {
+        Err(Error::Other(anyhow::anyhow!(
+            "ingest_pack: not supported by this ObjectStore backend"
+        )))
+    }
 }
 
 /// Filesystem-backed `ObjectStore`. Reads from
@@ -306,6 +327,26 @@ impl ObjectStore for FsObjectStore {
             Err(_) => return Ok(false),
         };
         Ok(repo.find_header(gix_oid).is_ok())
+    }
+
+    fn ingest_pack(&self, repo_id: &str, pack_bytes: &[u8]) -> Result<usize> {
+        // Delegates to the existing native pack indexer. The pack file
+        // lands at `<repo>/objects/pack/pack-<sha>.{pack,idx}`; gix
+        // resolves thin-pack deltas against the repo's existing odb.
+        // Returns 0 for empty packs (delete-only refspecs) — the
+        // helper short-circuits on `len <= 32` and we mirror that
+        // here to keep the "objects added" count meaningful.
+        if pack_bytes.len() <= 32 {
+            return Ok(0);
+        }
+        let repo_path = self.root.join(format!("{repo_id}.git"));
+        crate::native_pack::index_pack_into_repo(&repo_path, pack_bytes)?;
+        // The helper doesn't surface the count; the receive-pack
+        // tracing already logs it inside index_pack_into_repo via
+        // the `objects` field, so returning 0 here is fine — callers
+        // shouldn't rely on the return value for anything but a
+        // tracing breadcrumb.
+        Ok(0)
     }
 }
 
