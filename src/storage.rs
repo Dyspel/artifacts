@@ -283,19 +283,6 @@ pub(crate) fn write_bare_repo_layout(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)] // retained as a fallback path; no longer called from create()
-fn write_config_flag(repo: &Path, key: &str, value: &str) -> Result<()> {
-    let status = Command::new("git")
-        .arg("--git-dir")
-        .arg(repo)
-        .args(["config", key, value])
-        .status()?;
-    if !status.success() {
-        return Err(Error::Other(anyhow::anyhow!("git config {key} failed")));
-    }
-    Ok(())
-}
-
 /// Snapshot source refs into the fork's `packed-refs` atomically.
 ///
 /// Uses `git show-ref` on the source to get a consistent iteration of

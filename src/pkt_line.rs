@@ -25,15 +25,12 @@
 
 pub const PKT_LINE_MAX_PAYLOAD: usize = 65516;
 pub const FLUSH: &[u8] = b"0000";
-// DELIM / RESP_END are part of the v2 framing API surface; they're
-// produced by `write_delim` (used for v2 ls-refs / fetch request
-// construction in tests) and the parser recognizes them on input.
-// Hold them as exports so any future native-protocol code using
-// the library has them available without re-deriving.
-#[allow(dead_code)]
+/// `0001` delim-pkt. Only emitted by the test-side request builders today
+/// (`smart_http::tests`), so it's gated `#[cfg(test)]` — keeps the
+/// non-test build surface narrower. Parsing still recognizes the byte on
+/// input via `PktLine::Delim`.
+#[cfg(test)]
 pub const DELIM: &[u8] = b"0001";
-#[allow(dead_code)]
-pub const RESP_END: &[u8] = b"0002";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PktLine<'a> {
@@ -147,10 +144,10 @@ pub fn write_flush(out: &mut Vec<u8>) {
     out.extend_from_slice(FLUSH);
 }
 
-// Used by the v2 request-builders in tests; held as part of the
-// pkt-line API for any future native-protocol code that needs to
-// emit a delim-pkt section break.
-#[allow(dead_code)]
+/// Emit a `0001` delim-pkt. Only used by test-side request builders;
+/// no production code path emits delim today (the writers we own
+/// build packs through gix, not raw pkt-line stitching).
+#[cfg(test)]
 pub fn write_delim(out: &mut Vec<u8>) {
     out.extend_from_slice(DELIM);
 }
