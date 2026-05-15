@@ -270,7 +270,7 @@ Run the test suite:
 
 ```sh
 cargo test                # unit tests
-./tests/smoke.sh          # 7-step end-to-end: create / clone / push / fork / scopes
+./tests/smoke.sh          # end-to-end: create / clone / push / fork / scopes / REST commits / revoke / restart / JWT / quota / metrics / merge / paginated list / read APIs / SSE
 ./scripts/bench_fork.sh   # fork benchmark (FORKS=10000 PARALLEL=64 by default)
 ```
 
@@ -684,6 +684,7 @@ Exposed metrics:
 | `artifacts_webhooks_active_total`              | gauge     | —                        |
 | `artifacts_repos_total`                        | gauge     | —                        |
 | `artifacts_audit_events_stored_total`          | gauge     | —                        |
+| `artifacts_sqlite_lock_wait_seconds`           | histogram | `store`                  |
 | `artifacts_build_info`                         | gauge     | `version`                |
 
 The `path` label is the **route template** (`/v1/repos/:id/tokens`),
@@ -770,18 +771,36 @@ artifacts/
 │   ├── main.rs                CLI + server wiring (axum router)
 │   ├── config.rs              runtime config (data dir, base URL, admin token)
 │   ├── error.rs               error type + IntoResponse + WWW-Authenticate
-│   ├── tokens.rs              in-memory token store, scopes
 │   ├── auth.rs                Basic/Bearer extraction + authorization helpers
+│   ├── jwt.rs                 HS256 verification (Dyspel `userId` / `sub`)
 │   ├── tokens.rs              TokenStore trait + InMemory + SQLite impls
+│   ├── ownership.rs           OwnershipStore trait + SQLite repos table + quota
 │   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
 │   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
-│   ├── smart_http.rs          direct shell-outs to git upload-pack / git receive-pack
+│   ├── object_store.rs        ObjectStore trait + Fs / Mem impls + gc routing
+│   ├── alternates_cache.rs    memoizes alternates → source_id lookups
+│   ├── smart_http.rs          native v2 pack handlers + pack-handler shell-out fallback
+│   ├── pkt_line.rs            git smart-HTTP pkt-line parser
+│   ├── native_pack.rs         empty-pack / sideband helpers used by smart_http
 │   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
-│   ├── rest.rs                REST endpoints (create / fork / tokens / revoke / delete / admin)
+│   ├── merge.rs               three-way + fast-forward merge
+│   ├── reads.rs               read APIs (tree / blob / diff / notes / forks-of)
+│   ├── gc.rs                  alternates-aware loose-object reachability sweep
+│   ├── events.rs              in-process EventBus + SSE bridge
+│   ├── webhooks.rs            WebhookRegistry trait + SQLite/Mem impls + dispatcher
+│   ├── secrets.rs             AES-256-GCM master key (env + file resolver)
+│   ├── audit.rs               persistent audit log + SHA-256 hash-chain
+│   ├── db_migrate.rs          forward-only schema migrator (per-store namespaces)
+│   ├── metrics.rs             Prometheus exporter + track_metrics middleware
+│   ├── rate_limit.rs          per-subject token bucket
+│   ├── ip_rate_limit.rs       per-IP token bucket for unauth /v1/health*
+│   ├── request_id.rs          X-Request-Id roundtrip + per-request span
+│   ├── rest.rs                shared RestState + helpers; handlers in rest/*
+│   ├── rest/                  repos.rs / tokens.rs / webhooks.rs / admin.rs / health.rs
 │   └── bin/
-│       └── artifacts-gui.rs   feature-gated: eframe/egui Wayland/X11 visualizer
+│       └── artifacts-gui/     feature-gated: eframe/egui Wayland/X11 visualizer
 ├── tests/
-│   └── smoke.sh               14-step end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart → JWT → quota → blob-cap → /metrics
+│   └── smoke.sh               end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart → JWT → quota → blob-cap → /metrics → merge → paginated list → read APIs → SSE
 └── scripts/
     ├── bench_fork.sh          10,000-fork benchmark; measures disk + latency
     └── bench_clone.sh         clone-latency benchmark; p50/p95/p99/max over N clones
@@ -791,8 +810,9 @@ Under `$DATA_DIR` at runtime:
 
 ```
 data/
-├── tokens.db                  SQLite — minted tokens (hashed), expiry, revocation, ownership, webhooks
-├── audit.db                   SQLite — persisted audit events (queryable via GET /v1/admin/audit)
+├── tokens.db                  SQLite — minted tokens (hashed) + ownership (`repos`). Shared file, separate namespaces in schema_version.
+├── audit.db                   SQLite — persisted audit events (hash-chained, queryable via GET /v1/admin/audit)
+├── webhooks.db                SQLite — webhook subscriptions + AES-256-GCM-sealed secrets (created on first webhook add)
 ├── webhook-key.bin            32-byte AES-256 master key (auto-generated, 0600). Pin via ARTIFACTS_WEBHOOK_KEY env in prod.
 └── repos/
     ├── abc12...xy.git/        bare git repo (source)
