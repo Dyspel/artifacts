@@ -50,8 +50,8 @@
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// One row of `ObjectStore::list_loose`. Captures the metadata
 /// `gc` needs without an extra round-trip per object — the FS impl
@@ -448,6 +448,162 @@ impl ObjectStore for MemObjectStore {
             .read()
             .expect("MemObjectStore lock poisoned")
             .contains_key(&(repo_id.to_string(), oid.to_string())))
+    }
+}
+
+/// SQLite-backed `ObjectStore`. The second-generation impl that
+/// matches the README's chunked-KV target shape (one row per loose
+/// object today; horizontal chunking can be layered on later without
+/// changing the trait).
+///
+/// Why this exists in the prototype: the production target is "objects
+/// chunked into a KV, matching the DO+SQLite shape." Picking SQLite
+/// for the prototype means the row format is the same one a DO would
+/// use, and the schema-migration framework already in place handles
+/// the rollout. Today this impl is wired only through the conformance
+/// suite — production code still uses `FsObjectStore` — but the
+/// conformance guarantees prove the trait shape isn't FS-specific.
+///
+/// Concurrency: `std::sync::Mutex<Connection>` (not the tokio variant)
+/// because `ObjectStore` is a sync trait. Mirrors the
+/// `SqliteWebhookRegistry` shape for the same reason. The
+/// `metrics::lock_sqlite` helper only fits the tokio mutex shape, so
+/// no contention metric on this store yet; if we wire it into
+/// production we should reconsider whether the trait should be async.
+#[allow(dead_code)]
+pub struct SqliteObjectStore {
+    conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+const SQLITE_OBJECT_STORE_MIGRATIONS: [crate::db_migrate::Migration; 1] =
+    [crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS loose_objects (
+                     repo_id    TEXT NOT NULL,
+                     oid        TEXT NOT NULL,
+                     bytes      BLOB NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     PRIMARY KEY (repo_id, oid)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_loose_repo ON loose_objects(repo_id);",
+            )
+        },
+    }];
+
+#[allow(dead_code)]
+impl SqliteObjectStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;",
+        )?;
+        crate::db_migrate::run(&conn, "object_store", &SQLITE_OBJECT_STORE_MIGRATIONS)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        // Poisoned lock recovery: a panic inside one method should
+        // not deadlock every subsequent caller; recover the inner
+        // Connection. Mirrors `SqliteWebhookRegistry::lock`.
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl ObjectStore for SqliteObjectStore {
+    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
+        if !oid_is_valid(oid) {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let res = conn.query_row(
+            "SELECT bytes FROM loose_objects WHERE repo_id = ?1 AND oid = ?2",
+            rusqlite::params![repo_id, oid],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        match res {
+            Ok(b) => Ok(Some(b)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
+        if !oid_is_valid(oid) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "write_loose: invalid oid {oid:?}"
+            )));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let conn = self.lock();
+        // `INSERT OR IGNORE` keeps writes idempotent — loose objects
+        // are content-addressed (same oid implies same bytes), so a
+        // second write of the same row is meaningless. Same semantics
+        // as `FsObjectStore::write_loose`'s early-return-on-exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO loose_objects (repo_id, oid, bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![repo_id, oid, bytes, now],
+        )?;
+        Ok(())
+    }
+
+    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT oid, LENGTH(bytes), created_at
+             FROM loose_objects
+             WHERE repo_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo_id], |row| {
+            Ok(LooseInfo {
+                oid: row.get(0)?,
+                size: row.get::<_, i64>(1)? as u64,
+                created_secs: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        if !oid_is_valid(oid) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "delete_loose: invalid oid {oid:?}"
+            )));
+        }
+        let conn = self.lock();
+        let affected = conn.execute(
+            "DELETE FROM loose_objects WHERE repo_id = ?1 AND oid = ?2",
+            rusqlite::params![repo_id, oid],
+        )?;
+        Ok(affected > 0)
+    }
+
+    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+        if !oid_is_valid(oid) {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        // `EXISTS` skips returning the bytes; the planner sees the
+        // covering index and answers from the index alone.
+        let n: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM loose_objects WHERE repo_id = ?1 AND oid = ?2)",
+            rusqlite::params![repo_id, oid],
+            |row| row.get(0),
+        )?;
+        Ok(n != 0)
     }
 }
 
@@ -953,5 +1109,144 @@ mod tests {
             vec!["9".repeat(38)],
             "expected only the canonical loose-object file, got {entries:?}"
         );
+    }
+
+    // ─── SqliteObjectStore conformance ──────────────────────────────
+    //
+    // Runs the same conformance helpers as Fs/Mem against a fresh
+    // SQLite-backed impl. Each test opens its own tempfile so cases
+    // don't share state. The trait contract is the only contract;
+    // an impl that can't satisfy it is broken regardless of backend.
+
+    fn sqlite_fixture() -> (tempfile::TempDir, SqliteObjectStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("objects.db");
+        let store = SqliteObjectStore::open(&path).unwrap();
+        (tmp, store)
+    }
+
+    fn sqlite_oid(seed: u8) -> String {
+        let mut s = String::with_capacity(40);
+        for _ in 0..40 {
+            s.push(char::from_digit((seed % 16) as u32, 16).unwrap());
+        }
+        s
+    }
+
+    #[test]
+    fn sqlite_read_after_write_round_trips() {
+        let (_t, store) = sqlite_fixture();
+        let oid = sqlite_oid(0x1);
+        store.write_loose("r", &oid, b"hello-kv").unwrap();
+        conformance::read_after_write_round_trips(&store, "r", &oid);
+    }
+
+    #[test]
+    fn sqlite_missing_oid_returns_none() {
+        let (_t, store) = sqlite_fixture();
+        conformance::missing_oid_returns_none(&store, "r");
+    }
+
+    #[test]
+    fn sqlite_malformed_oid_returns_none() {
+        let (_t, store) = sqlite_fixture();
+        conformance::malformed_oid_returns_none(&store);
+    }
+
+    #[test]
+    fn sqlite_write_then_read_round_trips() {
+        let (_t, store) = sqlite_fixture();
+        conformance::write_then_read_round_trips(&store);
+    }
+
+    #[test]
+    fn sqlite_write_loose_idempotent_on_repeat() {
+        let (_t, store) = sqlite_fixture();
+        conformance::write_loose_idempotent_on_repeat(&store);
+    }
+
+    #[test]
+    fn sqlite_write_loose_rejects_malformed_oid() {
+        let (_t, store) = sqlite_fixture();
+        conformance::write_loose_rejects_malformed_oid(&store);
+    }
+
+    #[test]
+    fn sqlite_list_loose_enumerates_writes() {
+        let (_t, store) = sqlite_fixture();
+        conformance::list_loose_enumerates_writes(&store);
+    }
+
+    #[test]
+    fn sqlite_list_loose_empty_returns_empty_vec() {
+        let (_t, store) = sqlite_fixture();
+        conformance::list_loose_empty_returns_empty_vec(&store);
+    }
+
+    #[test]
+    fn sqlite_delete_loose_round_trips() {
+        let (_t, store) = sqlite_fixture();
+        conformance::delete_loose_round_trips(&store);
+    }
+
+    #[test]
+    fn sqlite_delete_loose_rejects_malformed_oid() {
+        let (_t, store) = sqlite_fixture();
+        conformance::delete_loose_rejects_malformed_oid(&store);
+    }
+
+    #[test]
+    fn sqlite_exists_agrees_with_read() {
+        let (_t, store) = sqlite_fixture();
+        let oid = sqlite_oid(0x7);
+        store.write_loose("r", &oid, b"present").unwrap();
+        conformance::exists_agrees_with_read(&store, "r", &oid);
+    }
+
+    /// SQLite-specific: bytes round-trip with byte-exact fidelity.
+    /// A BLOB column shouldn't transform the payload (UTF-8 cast,
+    /// NUL truncation, etc.) — same shape as the Mem-impl
+    /// "exact bytes" assertion.
+    #[test]
+    fn sqlite_read_returns_exact_bytes_written() {
+        let (_t, store) = sqlite_fixture();
+        let oid = sqlite_oid(0x3);
+        let payload: Vec<u8> = (0..=255).cycle().take(4096).collect();
+        store.write_loose("r", &oid, &payload).unwrap();
+        let got = store.read_loose("r", &oid).unwrap().unwrap();
+        assert_eq!(got, payload);
+    }
+
+    /// SQLite-specific: rows from one repo don't leak into another's
+    /// `list_loose`. Trivial for Fs (directory scoping) and Mem
+    /// (HashMap key tuple), but worth pinning for SQLite — the
+    /// `WHERE repo_id = ?1` clause is the only thing keeping the
+    /// scope honest.
+    #[test]
+    fn sqlite_list_loose_is_repo_scoped() {
+        let (_t, store) = sqlite_fixture();
+        let oid_a = sqlite_oid(0xa);
+        let oid_b = sqlite_oid(0xb);
+        store.write_loose("repo-a", &oid_a, b"a-bytes").unwrap();
+        store.write_loose("repo-b", &oid_b, b"b-bytes").unwrap();
+        let listed_a = store.list_loose("repo-a").unwrap();
+        let listed_b = store.list_loose("repo-b").unwrap();
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_a[0].oid, oid_a);
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_b[0].oid, oid_b);
+    }
+
+    /// SQLite-specific: migrations are idempotent. Open the same
+    /// file twice (with two store instances) — both should succeed
+    /// without re-applying v1. Mirrors the contract proved by
+    /// `db_migrate::tests::second_run_skips_already_applied`.
+    #[test]
+    fn sqlite_reopen_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("objects.db");
+        let _s1 = SqliteObjectStore::open(&path).unwrap();
+        // Drop _s1's lock by letting it survive (separate Connection).
+        let _s2 = SqliteObjectStore::open(&path).unwrap();
     }
 }
