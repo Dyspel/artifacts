@@ -7,6 +7,7 @@ mod db_migrate;
 mod error;
 mod events;
 mod gc;
+mod git_proto;
 mod ip_rate_limit;
 mod jwt;
 mod merge;
