@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod gc;
 mod git_proto;
+mod git_wire_v2;
 mod ip_rate_limit;
 mod jwt;
 mod merge;
