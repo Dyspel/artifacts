@@ -95,7 +95,7 @@ impl FsStorage {
     ///   2. Every component of the relative remainder is a `Normal`
     ///      path component (rejecting `..`, leading `/`, prefix
     ///      drives on Windows, etc).
-    pub fn repo_path(&self, id: &str) -> PathBuf {
+    fn repo_path(&self, id: &str) -> PathBuf {
         let path = self.root.join(format!("{id}.git"));
         if let Err(violation) = path_is_safe_descendant(&self.root, &path) {
             // Catch in tests/dev. validate_repo_id contract was
