@@ -153,13 +153,14 @@ pub trait AuditStore: Send + Sync {
     }
 }
 
-/// Drops every write on the floor. Useful in unit tests where audit
-/// persistence isn't being exercised, and as the obvious "audit
-/// disabled" knob if a deployment ever wants to skip the SQLite write
-/// (live tracing alone may be enough for some operators).
-#[allow(dead_code)] // available as a deployment knob; tests exercise it
+/// Drops every write on the floor. Used by tests where audit
+/// persistence isn't being exercised — gated `#[cfg(test)]` because
+/// no production wiring instantiates it (deployments that don't want
+/// durable history can point the SQLite path at a tmpfs).
+#[cfg(test)]
 pub struct NoopAuditStore;
 
+#[cfg(test)]
 #[async_trait]
 impl AuditStore for NoopAuditStore {
     async fn record(&self, _: AuditEvent) -> Result<()> {
@@ -507,11 +508,10 @@ pub async fn record(
 
 /// Lower-level: write to the store only, log + swallow on failure.
 /// Audit persistence is best-effort — a SQLite hiccup must not fail
-/// an otherwise-successful mutation. Prefer [`record`] from REST
-/// handlers; use this directly only when the caller already emits its
-/// own tracing line (e.g. server start/stop in main.rs, where the
-/// live shape is part of the operator-visible logs).
-pub async fn record_silent(
+/// an otherwise-successful mutation. Called only from [`record`]; not
+/// public because every production call site wants both halves (live
+/// tracing + durable write).
+async fn record_silent(
     store: &dyn AuditStore,
     event: &str,
     actor: &str,
