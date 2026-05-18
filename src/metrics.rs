@@ -56,6 +56,20 @@
 //!   contention signal: if p99 climbs the SQLite-serialization is
 //!   becoming a bottleneck and a connection pool (`deadpool-sqlite`)
 //!   would help. `store` ∈ {`tokens`, `ownership`, `audit`}.
+//! - `artifacts_object_reads_total{backend, outcome}` — counter,
+//!   incremented once per `ObjectStore::read_object` call. `backend`
+//!   names the impl (`fs` today; a future chunked-KV impl would
+//!   add its own label). `outcome` ∈ {`hit` (object found),
+//!   `miss` (object absent — includes malformed oid + missing repo),
+//!   `error` (gix surfaced a non-NotFound error)}. Driven by every
+//!   blob-read endpoint hit and any other production caller of the
+//!   trait method.
+//! - `artifacts_object_read_duration_seconds{backend}` — histogram
+//!   over the same call site. Loose-object reads are sub-millisecond;
+//!   pack-resolved reads pay a `gix::open` + index binary-search and
+//!   land in the low-millisecond range. p99 climbing means either a
+//!   cold disk cache or pack indexes too large for the binary-search
+//!   to stay snappy.
 //! - `artifacts_build_info{version}` — gauge=1, static for version info
 //!
 //! The `path` label is the *matched route template* (`/v1/repos/:id`),
@@ -92,6 +106,15 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
     const SQLITE_LOCK_BUCKETS: &[f64] = &[
         0.000_010, 0.000_050, 0.000_100, 0.000_500, 0.001, 0.005, 0.010, 0.050, 0.100, 1.0, 10.0,
     ];
+    // ObjectStore reads: loose-object hits sit in the 10s-of-µs range,
+    // pack-resolved hits cross 1ms because gix::open + index walk.
+    // Sub-millisecond buckets keep the loose vs pack split visible;
+    // the 1s top-end catches "something fell off a cliff" without
+    // wasting buckets on the request-level 10s timeout.
+    const OBJECT_READ_BUCKETS: &[f64] = &[
+        0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.002, 0.005, 0.010, 0.025, 0.100,
+        1.0,
+    ];
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
@@ -107,6 +130,13 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             SQLITE_LOCK_BUCKETS,
         )
         .map_err(|e| anyhow::anyhow!("register sqlite-lock histogram buckets: {e}"))?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "artifacts_object_read_duration_seconds".to_string(),
+            ),
+            OBJECT_READ_BUCKETS,
+        )
+        .map_err(|e| anyhow::anyhow!("register object-read histogram buckets: {e}"))?
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     // Emit a static build_info metric so scrapers can see what's running.

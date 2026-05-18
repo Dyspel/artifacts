@@ -789,6 +789,16 @@ grep -q "rest-initial" "$blob_body" \
     || { echo "FAIL: blob content unexpected:"; cat "$blob_body"; exit 1; }
 echo "    blob → README.md → $(wc -c < "$blob_body") bytes"
 
+# Confirm the blob read incremented the ObjectStore hit counter — pins
+# the contract that production reads route through ObjectStore (not
+# the cat-file subprocess) and that the metric is wired with the
+# expected backend+outcome labels.
+post_blob_metrics="${WORK_DIR}/metrics_after_blob.txt"
+curl -fsS -o "$post_blob_metrics" "$BASE_URL/metrics"
+grep -Eq 'artifacts_object_reads_total\{[^}]*backend="fs"[^}]*outcome="hit"[^}]*\} [1-9]' "$post_blob_metrics" \
+    || { echo "FAIL: artifacts_object_reads_total{backend=fs,outcome=hit} not ≥ 1 after blob read"; grep object_read "$post_blob_metrics" || true; exit 1; }
+echo "    artifacts_object_reads_total{backend=fs,outcome=hit} ≥ 1 after blob read"
+
 # Diff — c2 deletes src/a.txt and adds src/b.txt. Expect two files in
 # the response with the right statuses.
 diff_body="${WORK_DIR}/read_diff.json"

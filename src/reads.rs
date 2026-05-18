@@ -504,6 +504,14 @@ pub async fn get_blob(
         )));
     }
 
+    tracing::debug!(
+        repo = %repo_id,
+        commit = %commit,
+        path = %q.path,
+        bytes = bytes.len(),
+        "blob read via ObjectStore",
+    );
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],

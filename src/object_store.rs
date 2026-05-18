@@ -49,14 +49,12 @@
 //!   doesn't route through this yet.
 
 use crate::error::{Error, Result};
-use std::path::PathBuf;
-// HashMap, RwLock, Path, Arc, Mutex only matter to MemObjectStore +
+use std::path::{Path, PathBuf};
+// HashMap, RwLock, Arc, Mutex only matter to MemObjectStore +
 // SqliteObjectStore, both of which are `#[cfg(test)]`. Importing them
 // at module scope would warn in non-test builds; gate the import too.
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
-use std::path::Path;
 #[cfg(test)]
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -404,32 +402,72 @@ impl ObjectStore for FsObjectStore {
         // database walk both loose + pack stores. gix returns the
         // uncompressed payload directly — no zlib step needed in our
         // code.
-        if !oid_is_valid(oid) {
-            return Ok(None);
-        }
-        let repo_path = self.root.join(format!("{repo_id}.git"));
-        if !repo_path.is_dir() {
-            return Ok(None);
-        }
-        let repo = match gix::open(&repo_path) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
-            Ok(o) => o,
-            Err(_) => return Ok(None),
-        };
-        let result = match repo.find_object(gix_oid) {
-            Ok(obj) => Ok(Some((gix_kind_to_ours(obj.kind), obj.data.clone()))),
-            // `Find::NotFound` for absent objects — translate to None.
-            // Any other error (corruption, IO) bubbles.
-            Err(gix::object::find::existing::Error::Find(_)) => Ok(None),
-            Err(e) => Err(Error::Other(anyhow::anyhow!(
-                "gix find_object({oid}): {e}"
-            ))),
-        };
-        result
+        let start = std::time::Instant::now();
+        let outcome = read_object_fs_inner(&self.root, repo_id, oid);
+        record_read_object_metrics("fs", &outcome, start.elapsed());
+        outcome
     }
+}
+
+fn read_object_fs_inner(
+    root: &Path,
+    repo_id: &str,
+    oid: &str,
+) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    if !oid_is_valid(oid) {
+        return Ok(None);
+    }
+    let repo_path = root.join(format!("{repo_id}.git"));
+    if !repo_path.is_dir() {
+        return Ok(None);
+    }
+    let repo = match gix::open(&repo_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    let result = match repo.find_object(gix_oid) {
+        Ok(obj) => Ok(Some((gix_kind_to_ours(obj.kind), obj.data.clone()))),
+        // `Find::NotFound` for absent objects — translate to None.
+        // Any other error (corruption, IO) bubbles.
+        Err(gix::object::find::existing::Error::Find(_)) => Ok(None),
+        Err(e) => Err(Error::Other(anyhow::anyhow!(
+            "gix find_object({oid}): {e}"
+        ))),
+    };
+    result
+}
+
+/// Emit `artifacts_object_reads_total{backend, outcome}` +
+/// `artifacts_object_read_duration_seconds{backend}` for one
+/// `read_object` call. Centralized so every backend that overrides
+/// the trait method gets identical label semantics — outcome is
+/// derived from the Result the same way for `fs`, a future
+/// chunked-KV impl, or anything else.
+fn record_read_object_metrics(
+    backend: &'static str,
+    outcome: &Result<Option<(ObjectKind, Vec<u8>)>>,
+    elapsed: std::time::Duration,
+) {
+    let outcome_label = match outcome {
+        Ok(Some(_)) => "hit",
+        Ok(None) => "miss",
+        Err(_) => "error",
+    };
+    metrics::counter!(
+        "artifacts_object_reads_total",
+        "backend" => backend,
+        "outcome" => outcome_label,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "artifacts_object_read_duration_seconds",
+        "backend" => backend,
+    )
+    .record(elapsed.as_secs_f64());
 }
 
 fn gix_kind_to_ours(k: gix::object::Kind) -> ObjectKind {
