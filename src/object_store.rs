@@ -49,15 +49,21 @@
 //!   doesn't route through this yet.
 
 use crate::error::{Error, Result};
+use std::path::PathBuf;
+// HashMap, RwLock, Path, Arc, Mutex only matter to MemObjectStore +
+// SqliteObjectStore, both of which are `#[cfg(test)]`. Importing them
+// at module scope would warn in non-test builds; gate the import too.
+#[cfg(test)]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+#[cfg(test)]
 use std::sync::{Arc, Mutex, RwLock};
 
 /// One row of `ObjectStore::list_loose`. Captures the metadata
 /// `gc` needs without an extra round-trip per object — the FS impl
 /// reads stat in the same `read_dir` walk; a future KV impl reads
 /// `oid + length(bytes) + created_at` in one row.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LooseInfo {
     pub oid: String,
@@ -72,11 +78,12 @@ pub struct LooseInfo {
 
 /// Read + write view into a repo's git object database.
 ///
-/// Production paths don't route through this yet — the trait + impls
-/// exist as M2b foundation per the README. Annotated `#[allow(dead_code)]`
-/// so the unused warning doesn't drift into a real signal once
-/// real callers land.
-#[allow(dead_code)]
+/// Production paths route through this for `gc`, the
+/// commits-plumbing parent-exists check, and the native
+/// receive-pack write branch (when `ARTIFACTS_NATIVE_INDEX_PACK=1`).
+/// Other read paths (blob fetch, fetch-side pack generation) still
+/// touch the filesystem directly or go through gix; routing those
+/// is the remaining M2b work.
 pub trait ObjectStore: Send + Sync {
     /// Read a loose object by its 40-char hex SHA-1. Returns the raw
     /// loose-object bytes (zlib-deflated header+payload). `Ok(None)`
@@ -96,6 +103,13 @@ pub trait ObjectStore: Send + Sync {
     /// FS impl writes atomically via tmp-then-rename so a torn
     /// write never leaves a partial file at the canonical path.
     /// Mem impl just inserts into the map.
+    ///
+    /// Currently exercised only by the conformance suite — production
+    /// receive-pack uses `ingest_pack` instead so the FS impl can
+    /// stay in pack-file shape. Held on the trait so a future
+    /// chunked-KV impl that *does* materialize loose-format bytes
+    /// has a contract to satisfy.
+    #[allow(dead_code)]
     fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()>;
 
     /// Enumerate every loose object in the repo. Used by gc to
@@ -153,13 +167,11 @@ pub trait ObjectStore: Send + Sync {
 
 /// Filesystem-backed `ObjectStore`. Reads from
 /// `<root>/<id>.git/objects/<aa>/<bbbb...>`.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct FsObjectStore {
     root: PathBuf,
 }
 
-#[allow(dead_code)]
 impl FsObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -356,12 +368,11 @@ impl ObjectStore for FsObjectStore {
 /// as a fast, deterministic alternative to spinning up a real
 /// `<repo>/objects/` tree.
 ///
-/// Not used in production yet — production reads still go through
-/// the filesystem via `FsObjectStore` (or, more often, directly via
-/// gix). The chunked-KV `Storage` impl is the place this would get
-/// wired up: the trait shape demonstrated here is what M2b's actual
-/// impl will satisfy.
-#[allow(dead_code)]
+/// Only compiled into the test binary — production callers use
+/// `FsObjectStore` or the new `SqliteObjectStore`. Gated this way
+/// rather than carrying `#[allow(dead_code)]` so the production
+/// surface honestly reflects what's deployed.
+#[cfg(test)]
 pub struct MemObjectStore {
     objects: RwLock<HashMap<(String, String), MemEntry>>,
 }
@@ -370,13 +381,14 @@ pub struct MemObjectStore {
 /// impl can satisfy `list_loose`'s `LooseInfo.created_secs` contract
 /// the same way the FS impl does (mtime). Tests that need to control
 /// the timestamp use the `_with_ts` helper.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct MemEntry {
     bytes: Vec<u8>,
     created_secs: i64,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl MemObjectStore {
     pub fn new() -> Self {
         Self {
@@ -384,36 +396,16 @@ impl MemObjectStore {
         }
     }
 
-    /// Test-helper: insert with a chosen timestamp so the gc-prune
-    /// guard tests don't depend on wall-clock. Bypasses the trait's
-    /// validation contract — callers must pass a valid oid.
-    #[cfg(test)]
-    pub(crate) fn write_loose_with_ts(
-        &self,
-        repo_id: &str,
-        oid: &str,
-        bytes: &[u8],
-        created_secs: i64,
-    ) {
-        self.objects
-            .write()
-            .expect("MemObjectStore lock poisoned")
-            .insert(
-                (repo_id.to_string(), oid.to_string()),
-                MemEntry {
-                    bytes: bytes.to_vec(),
-                    created_secs,
-                },
-            );
-    }
 }
 
+#[cfg(test)]
 impl Default for MemObjectStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl ObjectStore for MemObjectStore {
     fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
         if !oid_is_valid(oid) {
@@ -511,11 +503,12 @@ impl ObjectStore for MemObjectStore {
 /// `metrics::lock_sqlite` helper only fits the tokio mutex shape, so
 /// no contention metric on this store yet; if we wire it into
 /// production we should reconsider whether the trait should be async.
-#[allow(dead_code)]
+#[cfg(test)]
 pub struct SqliteObjectStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
+#[cfg(test)]
 const SQLITE_OBJECT_STORE_MIGRATIONS: [crate::db_migrate::Migration; 1] =
     [crate::db_migrate::Migration {
         version: 1,
@@ -534,7 +527,7 @@ const SQLITE_OBJECT_STORE_MIGRATIONS: [crate::db_migrate::Migration; 1] =
         },
     }];
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl SqliteObjectStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
@@ -556,6 +549,7 @@ impl SqliteObjectStore {
     }
 }
 
+#[cfg(test)]
 impl ObjectStore for SqliteObjectStore {
     fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
         if !oid_is_valid(oid) {
