@@ -455,6 +455,10 @@ pub struct BlobQuery {
 /// vs binary detection is the caller's concern: the BFF detects null
 /// bytes and responds as text or base64 accordingly, same heuristic as
 /// gitSyncService uses for REST commits.
+///
+/// Path resolution (`<commit>:<path>` → blob oid) uses gix in a blocking
+/// task; the final byte fetch goes through `ObjectStore::read_object`
+/// so the chunked-KV backend can serve blobs without a filesystem walk.
 pub async fn get_blob(
     State(state): State<RestState>,
     AxumPath(repo_id): AxumPath<String>,
@@ -466,30 +470,76 @@ pub async fn get_blob(
     validate_ref_or_sha(commit)?;
     validate_path(&q.path)?;
 
-    let object = format!("{commit}:{}", q.path);
-    let (rc, stdout, stderr) = run_git(
-        &git_dir,
-        &["cat-file", "blob", &object],
-        &[],
-        None,
-    )
-    .await?;
-    if rc != 0 {
-        let err = String::from_utf8_lossy(&stderr);
-        if err.contains("does not exist") || err.contains("Not a valid object") {
-            return Err(Error::BadRequest(format!(
-                "blob not found: {commit}:{}",
-                q.path
-            )));
-        }
-        return Err(Error::Other(anyhow::anyhow!("cat-file failed: {err}")));
+    // Resolve `<commit>:<path>` → blob oid via gix. spawn_blocking
+    // because gix is sync and the tree walk hits the loose+pack
+    // object stores. Returns a clear `blob not found` for any
+    // resolution failure (bad rev, missing path, non-blob target).
+    let blob_oid = {
+        let git_dir = git_dir.clone();
+        let commit = commit.to_string();
+        let path = q.path.clone();
+        tokio::task::spawn_blocking(move || resolve_blob_oid(&git_dir, &commit, &path))
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("resolve_blob_oid join: {e}")))??
+    };
+
+    // Final byte fetch through the trait. FsObjectStore.read_object
+    // walks loose + pack stores via gix; a future chunked-KV impl
+    // serves from its KV. Wrap in spawn_blocking for the same reason.
+    let objects = state.objects.clone();
+    let repo_id_for_read = repo_id.clone();
+    let read_result = tokio::task::spawn_blocking(move || {
+        objects.read_object(&repo_id_for_read, &blob_oid)
+    })
+    .await
+    .map_err(|e| Error::Other(anyhow::anyhow!("read_object join: {e}")))??;
+
+    let (kind, bytes) = read_result.ok_or_else(|| {
+        Error::BadRequest(format!("blob not found: {commit}:{}", q.path))
+    })?;
+    if kind != crate::object_store::ObjectKind::Blob {
+        return Err(Error::BadRequest(format!(
+            "blob not found: {commit}:{} (resolved to non-blob)",
+            q.path
+        )));
     }
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
-        stdout,
+        bytes,
     )
         .into_response())
+}
+
+/// Resolve `<commit>:<path>` to a blob oid via gix. The function is
+/// `sync` so it can run on a `spawn_blocking` worker; gix's object DB
+/// reads are not async.
+fn resolve_blob_oid(git_dir: &Path, rev: &str, path: &str) -> Result<String> {
+    let repo = gix::open(git_dir)
+        .map_err(|e| Error::BadRequest(format!("repo open failed: {e}")))?;
+    // Resolve the rev (could be HEAD, a ref name, or an OID prefix).
+    let commit_obj = repo
+        .rev_parse_single(rev)
+        .map_err(|e| Error::BadRequest(format!("blob not found: {rev} ({e})")))?
+        .object()
+        .map_err(|e| Error::BadRequest(format!("blob not found: {rev} ({e})")))?
+        .peel_to_kind(gix::object::Kind::Commit)
+        .map_err(|e| Error::BadRequest(format!("not a commit-ish: {rev} ({e})")))?
+        .into_commit();
+    let tree = commit_obj
+        .tree()
+        .map_err(|e| Error::Other(anyhow::anyhow!("read root tree: {e}")))?;
+    let entry = tree
+        .lookup_entry_by_path(path)
+        .map_err(|e| Error::Other(anyhow::anyhow!("lookup_entry_by_path: {e}")))?
+        .ok_or_else(|| Error::BadRequest(format!("blob not found: {rev}:{path}")))?;
+    if entry.mode().is_tree() {
+        return Err(Error::BadRequest(format!(
+            "blob not found: {rev}:{path} (is a directory)"
+        )));
+    }
+    Ok(entry.object_id().to_hex().to_string())
 }
 
 // ── GET /v1/repos/:id/diff ───────────────────────────────────────────

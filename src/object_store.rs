@@ -76,14 +76,25 @@ pub struct LooseInfo {
     pub created_secs: i64,
 }
 
+/// The four git object kinds. Returned alongside the uncompressed
+/// payload from [`ObjectStore::read_object`] so callers can verify
+/// the kind matches what they asked for (a blob read that returns a
+/// tree is a bug, not a malformed body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
+}
+
 /// Read + write view into a repo's git object database.
 ///
 /// Production paths route through this for `gc`, the
-/// commits-plumbing parent-exists check, and the native
-/// receive-pack write branch (when `ARTIFACTS_NATIVE_INDEX_PACK=1`).
-/// Other read paths (blob fetch, fetch-side pack generation) still
-/// touch the filesystem directly or go through gix; routing those
-/// is the remaining M2b work.
+/// commits-plumbing parent-exists check, the native receive-pack
+/// write branch (when `ARTIFACTS_NATIVE_INDEX_PACK=1`), and the
+/// blob-read endpoint. Fetch-side pack generation still touches
+/// gix directly; routing that is the remaining M2b work.
 pub trait ObjectStore: Send + Sync {
     /// Read a loose object by its 40-char hex SHA-1. Returns the raw
     /// loose-object bytes (zlib-deflated header+payload). `Ok(None)`
@@ -161,6 +172,27 @@ pub trait ObjectStore: Send + Sync {
     fn ingest_pack(&self, _repo_id: &str, _pack_bytes: &[u8]) -> Result<usize> {
         Err(Error::Other(anyhow::anyhow!(
             "ingest_pack: not supported by this ObjectStore backend"
+        )))
+    }
+
+    /// Read an object's uncompressed payload + kind, regardless of
+    /// whether the backend stores it loose or packed. `None` means
+    /// the object isn't in this store. Malformed oid returns
+    /// `Ok(None)` — same shape as `read_loose` / `exists`.
+    ///
+    /// Default impl returns an unsupported error. The FS impl
+    /// overrides using gix (which transparently walks both loose +
+    /// pack stores). Test impls (Mem/Sqlite) fall through to the
+    /// default since the production blob-read path doesn't exercise
+    /// them; if a future production KV backend needs it, override
+    /// there too.
+    fn read_object(
+        &self,
+        _repo_id: &str,
+        _oid: &str,
+    ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+        Err(Error::Other(anyhow::anyhow!(
+            "read_object: not supported by this ObjectStore backend"
         )))
     }
 }
@@ -359,6 +391,53 @@ impl ObjectStore for FsObjectStore {
         // shouldn't rely on the return value for anything but a
         // tracing breadcrumb.
         Ok(0)
+    }
+
+    fn read_object(
+        &self,
+        repo_id: &str,
+        oid: &str,
+    ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+        // Override the loose-only default so packed objects resolve
+        // too. Mirrors `exists()`'s shape: cheap path-validity check
+        // first, then open the repo through gix and let its object
+        // database walk both loose + pack stores. gix returns the
+        // uncompressed payload directly — no zlib step needed in our
+        // code.
+        if !oid_is_valid(oid) {
+            return Ok(None);
+        }
+        let repo_path = self.root.join(format!("{repo_id}.git"));
+        if !repo_path.is_dir() {
+            return Ok(None);
+        }
+        let repo = match gix::open(&repo_path) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        let result = match repo.find_object(gix_oid) {
+            Ok(obj) => Ok(Some((gix_kind_to_ours(obj.kind), obj.data.clone()))),
+            // `Find::NotFound` for absent objects — translate to None.
+            // Any other error (corruption, IO) bubbles.
+            Err(gix::object::find::existing::Error::Find(_)) => Ok(None),
+            Err(e) => Err(Error::Other(anyhow::anyhow!(
+                "gix find_object({oid}): {e}"
+            ))),
+        };
+        result
+    }
+}
+
+fn gix_kind_to_ours(k: gix::object::Kind) -> ObjectKind {
+    match k {
+        gix::object::Kind::Commit => ObjectKind::Commit,
+        gix::object::Kind::Tree => ObjectKind::Tree,
+        gix::object::Kind::Blob => ObjectKind::Blob,
+        gix::object::Kind::Tag => ObjectKind::Tag,
     }
 }
 
@@ -648,6 +727,7 @@ impl ObjectStore for SqliteObjectStore {
 fn oid_is_valid(oid: &str) -> bool {
     oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit())
 }
+
 
 /// Conformance contract for any `ObjectStore` impl. Each behavior
 /// here is one assertion both `FsObjectStore` and `MemObjectStore`
