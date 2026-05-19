@@ -38,8 +38,10 @@ use crate::{
     auth::authorize_git,
     config::Config,
     error::{Error, Result},
-    git_proto::{parse_ls_refs_only, parse_receive_pack_body, parse_v2_fetch, RefUpdate, ReceivePackRequest},
-    git_wire_v2::{native_ls_refs_response, native_v2_fetch_response},
+    git_wire::proto::{
+        parse_ls_refs_only, parse_receive_pack_body, parse_v2_fetch, RefUpdate, ReceivePackRequest,
+    },
+    git_wire::v2::{native_ls_refs_response, native_v2_fetch_response},
     pkt_line::{self as pkt},
     refs::RefStore,
     tokens::{Scope, TokenStore},

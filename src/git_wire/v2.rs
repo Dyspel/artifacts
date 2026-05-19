@@ -14,7 +14,7 @@
 //! M1b-3-gix migration will delete this entirely.
 
 use crate::error::{Error, Result};
-use crate::git_proto::{LsRefsArgs, V2FetchRequest};
+use crate::git_wire::proto::{LsRefsArgs, V2FetchRequest};
 use crate::pkt_line as pkt;
 use crate::refs::{HeadState, RefStore};
 use axum::{
