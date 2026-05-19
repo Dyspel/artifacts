@@ -1,3 +1,5 @@
+#![deny(unused)]
+
 mod alternates_cache;
 mod audit;
 mod auth;
