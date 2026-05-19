@@ -49,9 +49,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, process::Stdio};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 /// A file-level change in a single commit. `op` discriminates.
 #[derive(Debug, Deserialize)]
@@ -384,43 +381,7 @@ pub async fn create_commit(
     }))
 }
 
-/// Shell out to `git --git-dir <dir> <args>`, optionally pipe `stdin` in,
-/// collect stdout + stderr, return exit code and both streams.
-pub(crate) async fn run_git(
-    git_dir: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-    stdin: Option<&[u8]>,
-) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-    let mut cmd = Command::new("git");
-    cmd.arg("--git-dir").arg(git_dir);
-    cmd.args(args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    let mut child = cmd.spawn()?;
-    if let (Some(data), Some(mut sin)) = (stdin, child.stdin.take()) {
-        sin.write_all(data).await?;
-        sin.shutdown().await?;
-        drop(sin);
-    }
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout).await?;
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr).await?;
-    }
-    let status = child.wait().await?;
-    Ok((status.code().unwrap_or(-1), stdout, stderr))
-}
+pub(crate) use crate::git_cmd::run_git;
 
 /// Match `git check-ref-format` semantics for a branch-name segment.
 ///
