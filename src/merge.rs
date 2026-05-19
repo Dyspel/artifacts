@@ -101,12 +101,12 @@ pub async fn merge_branches(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Commit)?;
+    state.authn.rate_limit.check(&principal, Class::Commit)?;
     crate::storage::validate_repo_id(&repo_id)?;
-    if !state.storage.exists(&repo_id) {
+    if !state.data.storage.exists(&repo_id) {
         return Err(Error::RepoNotFound(repo_id));
     }
-    enforce_owner(&*state.ownership, &principal, &repo_id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &repo_id).await?;
     if !valid_branch_name(&body.source_branch) {
         return Err(Error::BadRequest(format!(
             "invalid source branch name: {:?}",
@@ -170,8 +170,7 @@ pub async fn merge_branches(
         Some(t) => is_ancestor(&git_dir, t, &source_sha).await?,
     };
     if ff_available && body.strategy != Strategy::Merge {
-        match state
-            .refs
+        match state.data.refs
             .cas_update(&repo_id, &target_ref, target_sha.as_deref(), &source_sha)
             .await?
         {
@@ -180,7 +179,7 @@ pub async fn merge_branches(
                 // FF merge is a ref advance — surface as a commit event so
                 // subscribers see the same shape whether we reach main via
                 // POST /commits or POST /merge.
-                state.events.publish(crate::events::Event::commit(
+                state.observ.events.publish(crate::events::Event::commit(
                     &repo_id,
                     &source_sha,
                     &body.target_branch,
@@ -274,8 +273,7 @@ pub async fn merge_branches(
     let commit_sha = String::from_utf8(stdout)?.trim().to_string();
 
     // 8. CAS the target ref.
-    match state
-        .refs
+    match state.data.refs
         .cas_update(&repo_id, &target_ref, Some(&target_sha), &commit_sha)
         .await?
     {
@@ -296,7 +294,7 @@ pub async fn merge_branches(
 
     // Three-way merge commit — emit under the target branch so the event
     // shape is consistent with a direct commit.
-    state.events.publish(crate::events::Event::commit(
+    state.observ.events.publish(crate::events::Event::commit(
         &repo_id,
         &commit_sha,
         &body.target_branch,

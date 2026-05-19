@@ -1,7 +1,7 @@
 //! Per-repo token endpoints: mint, list, revoke, rotate.
 //!
 //! All four are owner-scoped (admin always passes; users must own the
-//! repo). The store itself lives in `state.tokens`.
+//! repo). The store itself lives in `state.authn.tokens`.
 
 use super::{remote_url, RestState};
 use crate::{
@@ -47,14 +47,13 @@ pub async fn mint_token(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Token)?;
-    if !state.storage.exists(&id) {
+    state.authn.rate_limit.check(&principal, Class::Token)?;
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state
-        .tokens
+    let token = state.authn.tokens
         .mint(&id, body.scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
@@ -65,7 +64,7 @@ pub async fn mint_token(
             .unwrap_or(0)
     });
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "token.mint",
         principal.audit_label(),
         Some(&id),
@@ -109,14 +108,13 @@ pub async fn revoke_token(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Token)?;
+    state.authn.rate_limit.check(&principal, Class::Token)?;
 
     // Resolve the token's bound repo for the audit log + the
     // ownership check. Admins skip the ownership check but we
     // still want the audit field populated; for a stale-or-fake
     // token there's nothing to bind to so log "unknown".
-    let target_repo: Option<String> = state
-        .tokens
+    let target_repo: Option<String> = state.authn.tokens
         .lookup(&body.token)
         .await
         .ok()
@@ -132,12 +130,12 @@ pub async fn revoke_token(
         let repo_id = target_repo
             .as_deref()
             .ok_or(Error::Forbidden("not your token"))?;
-        enforce_owner(&*state.ownership, &principal, repo_id).await?;
+        enforce_owner(&*state.data.ownership, &principal, repo_id).await?;
     }
 
-    let revoked = state.tokens.revoke(&body.token).await?;
+    let revoked = state.authn.tokens.revoke(&body.token).await?;
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "token.revoke",
         principal.audit_label(),
         target_repo.as_deref(),
@@ -188,15 +186,15 @@ pub async fn list_tokens(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    if !state.storage.exists(&id) {
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
     let subject_filter = match &principal {
         crate::auth::Principal::Admin => None,
         crate::auth::Principal::User { subject } => Some(subject.as_str()),
     };
-    let rows = state.tokens.list_for_repo(&id, subject_filter).await?;
+    let rows = state.authn.tokens.list_for_repo(&id, subject_filter).await?;
     Ok(Json(rows))
 }
 
@@ -226,22 +224,21 @@ pub async fn rotate_tokens(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Token)?;
-    if !state.storage.exists(&id) {
+    state.authn.rate_limit.check(&principal, Class::Token)?;
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
 
-    let revoked = state.tokens.revoke_all_for_repo(&id).await?;
+    let revoked = state.authn.tokens.revoke_all_for_repo(&id).await?;
     let scope = body.scope.unwrap_or(Scope::Write);
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state
-        .tokens
+    let token = state.authn.tokens
         .mint(&id, scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "token.rotate",
         principal.audit_label(),
         Some(&id),

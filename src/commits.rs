@@ -124,12 +124,12 @@ pub async fn create_commit(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Commit)?;
+    state.authn.rate_limit.check(&principal, Class::Commit)?;
     crate::storage::validate_repo_id(&repo_id)?;
-    if !state.storage.exists(&repo_id) {
+    if !state.data.storage.exists(&repo_id) {
         return Err(Error::RepoNotFound(repo_id));
     }
-    enforce_owner(&*state.ownership, &principal, &repo_id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &repo_id).await?;
     if !valid_branch_name(&body.branch) {
         return Err(Error::BadRequest(format!("invalid branch name: {:?}", body.branch)));
     }
@@ -173,7 +173,7 @@ pub async fn create_commit(
             // freshly-pushed (loose) and gc'd (packed) parents. A future
             // chunked-KV impl satisfies the same call without a
             // subprocess.
-            if !state.objects.exists(&repo_id, sha)? {
+            if !state.data.objects.exists(&repo_id, sha)? {
                 return Err(Error::BadRequest(format!(
                     "parent commit not found: {sha}"
                 )));
@@ -346,8 +346,7 @@ pub async fn create_commit(
     // RefStore trait so the guts are swappable (M3-proper replaces the
     // single-node FsRefStore with a distributed state machine; this call
     // site stays identical).
-    match state
-        .refs
+    match state.data.refs
         .cas_update(&repo_id, &ref_name, body.parent.as_deref(), &commit_sha)
         .await?
     {
@@ -370,7 +369,7 @@ pub async fn create_commit(
     // to the first line so the event payload stays small regardless of
     // whatever multi-paragraph commit template the caller uses.
     let message_first_line = body.message.split('\n').next().unwrap_or("").to_string();
-    state.events.publish(crate::events::Event::commit(
+    state.observ.events.publish(crate::events::Event::commit(
         repo_id, &commit_sha, &body.branch, message_first_line,
     ));
 

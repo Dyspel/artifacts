@@ -36,7 +36,7 @@ pub async fn admin_list_repos(
     headers: HeaderMap,
 ) -> Result<Response> {
     require_admin(&state, &headers)?;
-    state.rate_limit.check(
+    state.authn.rate_limit.check(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
@@ -47,8 +47,8 @@ pub async fn admin_list_repos(
         .min(LIST_REPOS_MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
 
-    let total = state.ownership.count_all().await?;
-    let rows = state.ownership.list_paginated(limit, offset).await?;
+    let total = state.data.ownership.count_all().await?;
+    let rows = state.data.ownership.list_paginated(limit, offset).await?;
 
     if offset == 0 && total > limit as u64 {
         tracing::warn!(
@@ -62,7 +62,7 @@ pub async fn admin_list_repos(
     let summaries: Vec<AdminRepoSummary> = rows
         .into_iter()
         .map(|r| AdminRepoSummary {
-            source_id: state.alternates_cache.lookup(&repos_dir, &r.id),
+            source_id: state.data.alternates_cache.lookup(&repos_dir, &r.id),
             id: r.id,
             owner: r.owner,
             created_at: r.created_at,
@@ -90,12 +90,12 @@ pub async fn admin_get_repo(
     headers: HeaderMap,
 ) -> Result<Json<AdminRepoDetail>> {
     require_admin(&state, &headers)?;
-    state.rate_limit.check(
+    state.authn.rate_limit.check(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
 
-    let Some(row) = state.ownership.get_row(&id).await? else {
+    let Some(row) = state.data.ownership.get_row(&id).await? else {
         return Err(Error::RepoNotFound(id));
     };
 
@@ -110,7 +110,7 @@ pub async fn admin_get_repo(
 
     Ok(Json(AdminRepoDetail {
         summary: AdminRepoSummary {
-            source_id: state.alternates_cache.lookup(&repos_dir, &id),
+            source_id: state.data.alternates_cache.lookup(&repos_dir, &id),
             id,
             owner: row.owner,
             created_at: row.created_at,
@@ -133,18 +133,18 @@ pub async fn admin_gc_preview(
     headers: HeaderMap,
 ) -> Result<Json<crate::gc::GcPreview>> {
     require_admin(&state, &headers)?;
-    state.rate_limit.check(
+    state.authn.rate_limit.check(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
-    if !state.storage.exists(&id) {
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
     let preview = crate::gc::preview(
         &state.cfg.repos_dir(),
         &id,
-        &state.alternates_cache,
-        &*state.objects,
+        &state.data.alternates_cache,
+        &*state.data.objects,
     )?;
     Ok(Json(preview))
 }
@@ -173,19 +173,19 @@ pub async fn admin_gc_run(
     headers: HeaderMap,
 ) -> Result<Json<crate::gc::GcResult>> {
     require_admin(&state, &headers)?;
-    state.rate_limit.check(
+    state.authn.rate_limit.check(
         &crate::auth::Principal::Admin,
         crate::rate_limit::Class::Default,
     )?;
-    if !state.storage.exists(&id) {
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
     let result = crate::gc::run(
         &state.cfg.repos_dir(),
         &id,
-        &state.alternates_cache,
+        &state.data.alternates_cache,
         q.min_age_secs.unwrap_or(7200),
-        &*state.objects,
+        &*state.data.objects,
     )?;
     Ok(Json(result))
 }
@@ -222,7 +222,7 @@ pub async fn admin_rotate_token(
     let new = crate::random_admin_token();
     state.cfg.rotate_admin_token(new.clone());
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "admin.token.rotate",
         "admin",
         None,
@@ -275,9 +275,9 @@ pub async fn admin_rotate_webhook_key(
     let new_key = Arc::new(crate::secrets::MasterKey::random());
     let new_key_b64 = new_key.to_base64();
 
-    let rotated = state.webhooks.rotate_master_key(new_key.clone())?;
+    let rotated = state.observ.webhooks.rotate_master_key(new_key.clone())?;
 
-    if let Some(path) = state.webhook_key_path.as_deref() {
+    if let Some(path) = state.observ.webhook_key_path.as_deref() {
         if let Err(e) = std::fs::write(path, &new_key_b64) {
             tracing::warn!(
                 error = %e,
@@ -288,7 +288,7 @@ pub async fn admin_rotate_webhook_key(
     }
 
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "admin.webhook_key.rotate",
         "admin",
         None,
@@ -344,7 +344,7 @@ pub async fn admin_audit_stats(
     headers: HeaderMap,
 ) -> Result<Json<AdminAuditStats>> {
     require_admin(&state, &headers)?;
-    let count = state.audit.count().await?;
+    let count = state.observ.audit.count().await?;
     Ok(Json(AdminAuditStats { count }))
 }
 
@@ -363,7 +363,7 @@ pub async fn admin_verify_audit_chain(
     headers: HeaderMap,
 ) -> Result<Json<crate::audit::ChainVerifyOk>> {
     require_admin(&state, &headers)?;
-    let ok = state.audit.verify_chain().await?;
+    let ok = state.observ.audit.verify_chain().await?;
     Ok(Json(ok))
 }
 
@@ -382,8 +382,7 @@ pub async fn admin_list_audit(
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::audit::AuditEvent>>> {
     require_admin(&state, &headers)?;
-    let rows = state
-        .audit
+    let rows = state.observ.audit
         .list(crate::audit::AuditQuery {
             since_ts: q.since,
             until_ts: q.until,

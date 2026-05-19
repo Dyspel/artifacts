@@ -39,10 +39,10 @@ pub async fn health() -> Json<serde_json::Value> {
 pub async fn health_ready(
     State(state): State<RestState>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    if let Some(resp) = drain_response_if_draining(&state.draining) {
+    if let Some(resp) = drain_response_if_draining(&state.runtime.draining) {
         return resp;
     }
-    probe_stores(&*state.tokens, &*state.audit, &*state.ownership).await
+    probe_stores(&*state.authn.tokens, &*state.observ.audit, &*state.data.ownership).await
 }
 
 /// Pure helper: short-circuit readiness with `503 + {draining: true}`

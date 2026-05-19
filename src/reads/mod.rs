@@ -57,12 +57,12 @@ async fn authorize_read(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Default)?;
+    state.authn.rate_limit.check(&principal, Class::Default)?;
     crate::storage::validate_repo_id(repo_id)?;
-    if !state.storage.exists(repo_id) {
+    if !state.data.storage.exists(repo_id) {
         return Err(Error::RepoNotFound(repo_id.to_string()));
     }
-    enforce_owner(&*state.ownership, &principal, repo_id).await?;
+    enforce_owner(&*state.data.ownership, &principal, repo_id).await?;
     Ok(state.cfg.repos_dir().join(format!("{repo_id}.git")))
 }
 
@@ -104,20 +104,19 @@ pub async fn get_repo(
     headers: HeaderMap,
 ) -> Result<Json<RepoDetail>> {
     let git_dir = authorize_read(&state, &headers, &repo_id).await?;
-    let Some(row) = state.ownership.get_row(&repo_id).await? else {
+    let Some(row) = state.data.ownership.get_row(&repo_id).await? else {
         return Err(Error::RepoNotFound(repo_id));
     };
     let refs = list_refs_native(&git_dir).await?;
     let size_bytes = dir_size(&git_dir).unwrap_or(0);
     let head_sha = resolve_ref_sha(&git_dir, "HEAD").await.ok().flatten();
-    let source_id = state
-        .alternates_cache
+    let source_id = state.data.alternates_cache
         .lookup(&state.cfg.repos_dir(), &repo_id);
     let commit_count = count_commits_from_head(&git_dir).await.unwrap_or(0);
     let fork_count = count_forks_of(
         &state.cfg.repos_dir(),
         &repo_id,
-        &state.alternates_cache,
+        &state.data.alternates_cache,
     )
     .unwrap_or(0);
     Ok(Json(RepoDetail {
@@ -487,7 +486,7 @@ pub async fn get_blob(
     // Final byte fetch through the trait. FsObjectStore.read_object
     // walks loose + pack stores via gix; a future chunked-KV impl
     // serves from its KV. Off the tokio pool for the same reason.
-    let objects = state.objects.clone();
+    let objects = state.data.objects.clone();
     let repo_id_for_read = repo_id.clone();
     let read_result = crate::blocking::run_blocking("read_object", move || {
         objects.read_object(&repo_id_for_read, &blob_oid)

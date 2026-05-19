@@ -49,61 +49,85 @@ pub use repos::{create_repo, delete_repo, fork_repo, list_repos};
 pub use tokens::{mint_token, list_tokens, revoke_token, rotate_tokens};
 pub use webhooks::{create_webhook, delete_webhook, list_webhooks};
 
+/// Data plane: every store/cache that holds repo content or metadata.
+/// Grouped so a handler that only reads/writes repos can depend on
+/// `DataState` rather than the full `RestState`.
 #[derive(Clone)]
-pub struct RestState {
-    pub cfg: Arc<Config>,
+pub struct DataState {
     /// Repo lifecycle backend. M0 ships `FsStorage`; future impls
     /// (chunked KV, object-store-backed) drop in behind the same trait.
     pub storage: Arc<dyn Storage>,
-    pub tokens: Arc<dyn TokenStore>,
-    /// Who-owns-what. Populated by `create_repo` / `fork_repo`, read by
-    /// the ownership-enforcing handlers (anything that mutates or mints
-    /// credentials for an existing repo).
+    /// Who-owns-what. Populated by `create_repo` / `fork_repo`, read
+    /// by the ownership-enforcing handlers (anything that mutates or
+    /// mints credentials for an existing repo).
     pub ownership: Arc<dyn OwnershipStore>,
     /// Ref CAS backend. M0 ships `FsRefStore`; M3-proper swaps in a
     /// distributed impl without touching any handler.
     pub refs: Arc<dyn RefStore>,
-    /// Token-bucket rate limiter, keyed by `(subject, class)`. Admin
-    /// bypasses. Enforced per handler by the handler itself so that
-    /// expensive vs cheap endpoints draw from separate classes.
-    pub rate_limit: Arc<RateLimiter>,
-    /// In-process fan-out for commit / fork / status events. Populated
-    /// by the mutating handlers (commit, merge, fork, create). Consumed
-    /// by the SSE endpoint in events.rs and (through there) by the
-    /// backend BFF's live-stream bridge. Lossy by design — slow
-    /// subscribers get a Lagged error instead of blocking the bus.
-    pub events: crate::events::EventBus,
+    /// Object-store backend for loose-object reads / writes / list /
+    /// delete + the blob-read endpoint.
+    pub objects: Arc<dyn crate::object_store::ObjectStore>,
     /// Memoizes `objects/info/alternates` → `source_id` resolution.
-    /// Populated lazily on first admin-list / admin-detail call; keyed
-    /// by repo_id, invalidated on mtime change (and on delete).
     pub alternates_cache: Arc<crate::alternates_cache::AlternatesCache>,
+}
+
+/// Authentication-adjacent state. Handlers that mint, list, revoke,
+/// or rate-limit on per-principal credentials depend on this.
+#[derive(Clone)]
+pub struct AuthnState {
+    pub tokens: Arc<dyn TokenStore>,
+    /// Token-bucket rate limiter, keyed by `(subject, class)`. Admin
+    /// bypasses. Enforced per handler so that expensive vs cheap
+    /// endpoints draw from separate classes.
+    pub rate_limit: Arc<RateLimiter>,
+}
+
+/// Observability + event-bus state. Audit log, webhook registry,
+/// in-process event bus.
+#[derive(Clone)]
+pub struct ObservState {
+    /// Durable audit log. Mirrors the live `tracing!(target: "audit")`
+    /// stream into SQLite so admin tooling can query history after
+    /// the fact. Best-effort — a SQLite hiccup logs but never fails
+    /// the underlying mutation.
+    pub audit: Arc<dyn crate::audit::AuditStore>,
+    /// In-process fan-out for commit / fork / status events. Lossy
+    /// by design — slow subscribers get a Lagged error instead of
+    /// blocking the bus.
+    pub events: crate::events::EventBus,
     /// Webhook subscriptions registry. In-memory `MemRegistry` today;
     /// SQLite-backed when subscriptions need to survive a restart.
     pub webhooks: Arc<dyn crate::webhooks::WebhookRegistry>,
-    /// Durable audit log. Mirrors the live `tracing!(target: "audit")`
-    /// stream into SQLite so admin tooling can query history after the
-    /// fact. Writes are best-effort — a SQLite hiccup logs a warning
-    /// but never fails the underlying mutation.
-    pub audit: Arc<dyn crate::audit::AuditStore>,
-    /// Path to the on-disk webhook master key file, when one is in
-    /// use. `None` for env-var-only deployments. The
-    /// `admin_rotate_webhook_key` handler updates this file (if set)
-    /// after a successful rotation so a restart picks up the new key.
+    /// Path to the on-disk webhook master key file. `None` for
+    /// env-var-only deployments. `admin_rotate_webhook_key` rewrites
+    /// it post-rotation so a restart picks up the new key.
     pub webhook_key_path: Option<std::path::PathBuf>,
-    /// Object-store backend for loose-object reads / writes / list /
-    /// delete. M2b's first production-routing landing — `gc` goes
-    /// through this trait now. A future chunked-KV backend swaps
-    /// in by satisfying the same trait.
-    pub objects: Arc<dyn crate::object_store::ObjectStore>,
+}
+
+/// Process-level runtime signals. Today just the readiness drain
+/// flag; a future config-reload trigger or shutdown-deadline tracker
+/// would land here.
+#[derive(Clone)]
+pub struct RuntimeState {
     /// Set to `true` once a SIGTERM/SIGINT has been received, before
     /// the axum-server graceful drain begins. The readiness probe
     /// short-circuits to 503 when this is set, so an orchestrator
-    /// (k8s, systemd) sees the process leave the load-balancer pool
-    /// *before* it stops accepting new connections. Without this the
-    /// orchestrator could route a fresh request onto a process that's
-    /// about to refuse it at the TCP level. Cheap relaxed atomic load
-    /// per probe — readiness is hit at most every couple of seconds.
+    /// can pull the process out of rotation *before* it stops
+    /// accepting new connections.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Top-level state injected into every REST handler via
+/// `State<RestState>`. The four sub-states group related backends so
+/// future handlers can depend on a focused slice (e.g.
+/// `State<ObservState>`) rather than the whole bag.
+#[derive(Clone)]
+pub struct RestState {
+    pub cfg: Arc<Config>,
+    pub data: DataState,
+    pub authn: AuthnState,
+    pub observ: ObservState,
+    pub runtime: RuntimeState,
 }
 
 #[derive(Debug, Serialize)]
@@ -305,7 +329,7 @@ pub(crate) fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 
 // `source_id` (parent repo) resolution lives in `crate::alternates_cache`
 // so it can memoize across admin-list polls. Handlers call
-// `state.alternates_cache.lookup(...)` instead of reading the file
+// `state.data.alternates_cache.lookup(...)` instead of reading the file
 // directly.
 
 // alternates → source_id resolution is tested in

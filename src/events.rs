@@ -162,7 +162,7 @@ pub async fn sse_stream(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    let rx = state.events.subscribe();
+    let rx = state.observ.events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|r| match r {
         Ok(ev) => {
             // serde_json::to_string is infallible on our types; unwrap is fine.

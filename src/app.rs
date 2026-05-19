@@ -367,18 +367,26 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let rest_state = RestState {
         cfg: cfg.clone(),
-        storage,
-        tokens: tokens.clone(),
-        ownership,
-        refs: refs.clone(),
-        rate_limit,
-        events: event_bus,
-        alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
-        webhooks: webhook_registry,
-        audit,
-        webhook_key_path,
-        objects: objects.clone(),
-        draining: draining.clone(),
+        data: crate::rest::DataState {
+            storage,
+            ownership,
+            refs: refs.clone(),
+            objects: objects.clone(),
+            alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
+        },
+        authn: crate::rest::AuthnState {
+            tokens: tokens.clone(),
+            rate_limit,
+        },
+        observ: crate::rest::ObservState {
+            audit,
+            events: event_bus,
+            webhooks: webhook_registry,
+            webhook_key_path,
+        },
+        runtime: crate::rest::RuntimeState {
+            draining: draining.clone(),
+        },
     };
     // Bench A/B kill-switch. Production never sets this; the bench
     // scripts toggle it to compare native vs subprocess on the same

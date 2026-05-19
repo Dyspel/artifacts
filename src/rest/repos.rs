@@ -43,9 +43,9 @@ pub async fn create_repo(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Create)?;
+    state.authn.rate_limit.check(&principal, Class::Create)?;
     check_repo_quota(
-        &*state.ownership,
+        &*state.data.ownership,
         &principal,
         state.cfg.max_repos_per_user,
     )
@@ -53,20 +53,18 @@ pub async fn create_repo(
     let id = body
         .and_then(|Json(b)| b.id)
         .unwrap_or_else(new_repo_id);
-    state.storage.create(&id)?;
+    state.data.storage.create(&id)?;
     // Record ownership *before* minting the token so a crash between the
     // two leaves a repo we can identify the owner of.
-    state
-        .ownership
+    state.data.ownership
         .record_owner(&id, principal.subject())
         .await?;
-    let token = state
-        .tokens
+    let token = state.authn.tokens
         .mint(&id, Scope::Write, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "repo.create",
         principal.audit_label(),
         Some(&id),
@@ -77,7 +75,7 @@ pub async fn create_repo(
     // Emit a status transition so subscribers pick up brand-new repos
     // without polling. "unknown → idle" matches the repo's initial
     // state in the Fleet UI's RepoStatus enum.
-    state.events.publish(crate::events::Event::status(&id, "unknown", "idle"));
+    state.observ.events.publish(crate::events::Event::status(&id, "unknown", "idle"));
     Ok(Json(RepoHandle { id, remote, token }))
 }
 
@@ -107,13 +105,13 @@ pub async fn fork_repo(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Create)?;
-    if !state.storage.exists(&source_id) {
+    state.authn.rate_limit.check(&principal, Class::Create)?;
+    if !state.data.storage.exists(&source_id) {
         return Err(Error::RepoNotFound(source_id));
     }
-    enforce_owner(&*state.ownership, &principal, &source_id).await?;
+    enforce_owner(&*state.data.ownership, &principal, &source_id).await?;
     check_repo_quota(
-        &*state.ownership,
+        &*state.data.ownership,
         &principal,
         state.cfg.max_repos_per_user,
     )
@@ -122,19 +120,17 @@ pub async fn fork_repo(
         .map(|Json(b)| (b.id, b.read_only))
         .unwrap_or((None, false));
     let fork_id = fork_id.unwrap_or_else(new_repo_id);
-    state.storage.fork(&source_id, &fork_id)?;
-    state
-        .ownership
+    state.data.storage.fork(&source_id, &fork_id)?;
+    state.data.ownership
         .record_owner(&fork_id, principal.subject())
         .await?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
-    let token = state
-        .tokens
+    let token = state.authn.tokens
         .mint(&fork_id, scope, None, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "repo.fork",
         principal.audit_label(),
         Some(&fork_id),
@@ -142,7 +138,7 @@ pub async fn fork_repo(
         None,
     )
     .await;
-    state.events.publish(crate::events::Event::fork(&source_id, &fork_id));
+    state.observ.events.publish(crate::events::Event::fork(&source_id, &fork_id));
     Ok(Json(RepoHandle { id: fork_id, remote, token }))
 }
 
@@ -173,8 +169,8 @@ pub async fn delete_repo(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Default)?;
-    enforce_owner(&*state.ownership, &principal, &id).await?;
+    state.authn.rate_limit.check(&principal, Class::Default)?;
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
 
     let force = q.force.unwrap_or(false);
     let cascade = q.cascade.unwrap_or(false);
@@ -188,22 +184,22 @@ pub async fn delete_repo(
         let order = super::cascade_delete_order(
             &state.cfg.repos_dir(),
             &id,
-            &state.alternates_cache,
+            &state.data.alternates_cache,
         )?;
         for dep in &order {
             if dep != &id {
-                enforce_owner(&*state.ownership, &principal, dep).await?;
+                enforce_owner(&*state.data.ownership, &principal, dep).await?;
             }
         }
         let mut deleted = Vec::with_capacity(order.len());
         for dep in &order {
-            state.storage.delete(dep)?;
-            state.ownership.delete(dep).await?;
-            state.alternates_cache.invalidate(dep);
+            state.data.storage.delete(dep)?;
+            state.data.ownership.delete(dep).await?;
+            state.data.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
         }
         crate::audit::record(
-            &*state.audit,
+            &*state.observ.audit,
             "repo.delete",
             principal.audit_label(),
             Some(&id),
@@ -224,7 +220,7 @@ pub async fn delete_repo(
     let forks = crate::reads::list_forks_of(
         &state.cfg.repos_dir(),
         &id,
-        &state.alternates_cache,
+        &state.data.alternates_cache,
     )?;
     if !forks.is_empty() {
         if force {
@@ -242,12 +238,12 @@ pub async fn delete_repo(
         }
     }
 
-    state.storage.delete(&id)?;
-    state.ownership.delete(&id).await?;
-    state.alternates_cache.invalidate(&id);
+    state.data.storage.delete(&id)?;
+    state.data.ownership.delete(&id).await?;
+    state.data.alternates_cache.invalidate(&id);
     let mode = if force { "force" } else { "default" };
     crate::audit::record(
-        &*state.audit,
+        &*state.observ.audit,
         "repo.delete",
         principal.audit_label(),
         Some(&id),
@@ -282,7 +278,7 @@ pub async fn list_repos(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
+    state.authn.rate_limit.check(&principal, crate::rate_limit::Class::Default)?;
 
     let limit = q
         .limit
@@ -292,15 +288,14 @@ pub async fn list_repos(
 
     let (rows, total) = match &principal {
         crate::auth::Principal::Admin => (
-            state.ownership.list_paginated(limit, offset).await?,
-            state.ownership.count_all().await?,
+            state.data.ownership.list_paginated(limit, offset).await?,
+            state.data.ownership.count_all().await?,
         ),
         crate::auth::Principal::User { subject } => (
-            state
-                .ownership
+            state.data.ownership
                 .list_paginated_by_owner(subject, limit, offset)
                 .await?,
-            state.ownership.count_by_owner(subject).await?,
+            state.data.ownership.count_by_owner(subject).await?,
         ),
     };
 
@@ -316,7 +311,7 @@ pub async fn list_repos(
     let summaries: Vec<AdminRepoSummary> = rows
         .into_iter()
         .map(|r| AdminRepoSummary {
-            source_id: state.alternates_cache.lookup(&repos_dir, &r.id),
+            source_id: state.data.alternates_cache.lookup(&repos_dir, &r.id),
             id: r.id,
             owner: r.owner,
             created_at: r.created_at,

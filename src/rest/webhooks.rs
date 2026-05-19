@@ -1,7 +1,7 @@
 //! Webhook subscription endpoints: create / list / delete.
 //!
 //! Owner-scoped (admin always passes; users must own the repo). The
-//! registry itself is `state.webhooks` — `MemRegistry` or
+//! registry itself is `state.observ.webhooks` — `MemRegistry` or
 //! `SqliteWebhookRegistry` depending on deployment shape.
 
 use super::RestState;
@@ -49,12 +49,12 @@ pub async fn create_webhook(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    state.rate_limit.check(&principal, Class::Token)?;
-    if !state.storage.exists(&id) {
+    state.authn.rate_limit.check(&principal, Class::Token)?;
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
-    let hook_id = state.webhooks.add(crate::webhooks::Subscription {
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
+    let hook_id = state.observ.webhooks.add(crate::webhooks::Subscription {
         id: String::new(),
         repo_id: id,
         url: body.url,
@@ -75,11 +75,11 @@ pub async fn list_webhooks(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    if !state.storage.exists(&id) {
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
-    Ok(Json(state.webhooks.list(&id)))
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
+    Ok(Json(state.observ.webhooks.list(&id)))
 }
 
 /// DELETE /v1/repos/:id/webhooks/:hook_id
@@ -93,10 +93,10 @@ pub async fn delete_webhook(
         &state.cfg.admin_token(),
         state.cfg.jwt_secret.as_deref(),
     )?;
-    if !state.storage.exists(&id) {
+    if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
     }
-    enforce_owner(&*state.ownership, &principal, &id).await?;
-    let removed = state.webhooks.remove(&id, &hook_id);
+    enforce_owner(&*state.data.ownership, &principal, &id).await?;
+    let removed = state.observ.webhooks.remove(&id, &hook_id);
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
