@@ -60,23 +60,16 @@ impl Scope {
     }
 }
 
-/// What a successful lookup tells the caller.
+/// What a successful lookup tells the caller. Carries only the
+/// fields production callers (`authorize_*`) actually consume —
+/// `expires_at` and `subject` are filtered at the SQL layer (the
+/// lookup query rejects expired rows; mint records the subject
+/// directly into the row), so neither needs to surface here. The
+/// listing path returns the full row via [`TokenSummary`].
 #[derive(Debug, Clone)]
 pub struct TokenRecord {
     pub repo_id: String,
     pub scope: Scope,
-    /// Unix epoch seconds. `None` means the token never expires.
-    /// Read-side machinery uses this through derived Debug rather
-    /// than direct field access; `#[allow(dead_code)]` reflects
-    /// that — clippy's reachability check doesn't see Debug uses.
-    #[allow(dead_code)]
-    pub expires_at: Option<u64>,
-    /// JWT subject the token was minted for. `None` for tokens
-    /// minted by the admin path (no per-user binding) and for
-    /// rows that predate the M4b subject column. Same Debug-only
-    /// access pattern as `expires_at`.
-    #[allow(dead_code)]
-    pub subject: Option<String>,
 }
 
 /// One row of the listing surface. Public so REST handlers can return
@@ -347,8 +340,12 @@ impl TokenStore for SqliteTokenStore {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
         let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        // SELECT only the columns we surface. The expired-row filter
+        // is enforced by the predicate, not by reading expires_at into
+        // the struct; the subject column is exposed through the
+        // listing path (TokenSummary), not the auth lookup.
         let mut stmt = conn.prepare_cached(
-            "SELECT repo_id, scope, expires_at, subject FROM tokens
+            "SELECT repo_id, scope FROM tokens
              WHERE token_hash = ?1
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?2)",
@@ -359,13 +356,9 @@ impl TokenStore for SqliteTokenStore {
         };
         let repo_id: String = row.get(0)?;
         let scope: String = row.get(1)?;
-        let expires_at: Option<i64> = row.get(2)?;
-        let subject: Option<String> = row.get(3)?;
         Ok(Some(TokenRecord {
             repo_id,
             scope: Scope::parse(&scope)?,
-            expires_at: expires_at.map(|v| v as u64),
-            subject,
         }))
     }
 
@@ -505,7 +498,12 @@ mod tests {
         let rec = store.lookup(&t).await.unwrap().unwrap();
         assert_eq!(rec.repo_id, "repo-a");
         assert_eq!(rec.scope, Scope::Write);
-        assert!(rec.expires_at.is_none());
+        // expires_at = None round-trips: a row minted without a TTL
+        // is verified via the listing path, which is the surface
+        // that exposes the column to callers.
+        let listed = store.list_for_repo("repo-a", None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].expires_at.is_none());
     }
 
     #[tokio::test]
@@ -619,14 +617,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_records_subject_and_lookup_returns_it() {
+    async fn mint_records_subject_via_listing_surface() {
+        // The subject column is exposed through the listing surface
+        // (TokenSummary), not the auth lookup (TokenRecord). Pin the
+        // round-trip there.
         let (_d, store) = open_store();
-        let t = store
+        let _t = store
             .mint("r-acct", Scope::Read, None, Some("alice@example"))
             .await
             .unwrap();
-        let rec = store.lookup(&t).await.unwrap().unwrap();
-        assert_eq!(rec.subject.as_deref(), Some("alice@example"));
+        let listed = store.list_for_repo("r-acct", None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].subject.as_deref(), Some("alice@example"));
     }
 
     #[tokio::test]
