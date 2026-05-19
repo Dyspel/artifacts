@@ -277,31 +277,23 @@ mod tests {
     /// pkt-line shape.
     #[tokio::test]
     async fn native_ls_refs_response_emits_v2_listing() {
-        use crate::refs::FsRefStore;
-        use crate::storage::{new_repo_id, FsStorage, Storage};
-
-        let tmp = std::env::temp_dir().join(format!("nat-ls-{}", new_repo_id()));
-        let repos_dir = tmp.join("repos");
-        let storage = FsStorage::new(&repos_dir).unwrap();
-        let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
-        let refs = FsRefStore::new(repos_dir.clone());
-        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
 
         // Use refs/test/* (no commit-target requirement) to exercise
         // the path; the response builder is namespace-agnostic.
         let oid = "0123456789abcdef0123456789abcdef01234567";
-        std::fs::create_dir_all(git_dir.join("refs/test")).unwrap();
-        std::fs::write(git_dir.join("refs/test/x"), format!("{oid}\n")).unwrap();
+        std::fs::create_dir_all(repo.git_dir.join("refs/test")).unwrap();
+        std::fs::write(repo.git_dir.join("refs/test/x"), format!("{oid}\n")).unwrap();
         // Symbolic HEAD pointing at our test ref.
-        std::fs::write(git_dir.join("HEAD"), "ref: refs/test/x\n").unwrap();
+        std::fs::write(repo.git_dir.join("HEAD"), "ref: refs/test/x\n").unwrap();
 
         let args = LsRefsArgs {
             peel: false,
             symrefs: true,
             prefixes: vec!["HEAD".into(), "refs/test/".into()],
         };
-        let resp = native_ls_refs_response(&repo_id, &refs, args).await.unwrap();
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
@@ -334,14 +326,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_v2_fetch_response_pack_framing_with_real_repo() {
-        use crate::storage::{new_repo_id, FsStorage, Storage};
-
-        let tmp = std::env::temp_dir().join(format!("nat-fetch-{}", new_repo_id()));
-        let repos_dir = tmp.join("repos");
-        let storage = FsStorage::new(&repos_dir).unwrap();
-        let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
-        let git_dir = repos_dir.join(format!("{repo_id}.git"));
+        let repo = crate::test_support::TestRepo::new();
+        let git_dir = &repo.git_dir;
 
         // Create a minimal commit so we have something to pack.
         // Use git plumbing — same approach as the smoke test, just
@@ -349,19 +335,19 @@ mod tests {
         use std::process::Command as StdCmd;
         StdCmd::new("git")
             .args(["--git-dir"])
-            .arg(&git_dir)
+            .arg(git_dir)
             .args(["config", "user.email", "t@t"])
             .status()
             .unwrap();
         StdCmd::new("git")
             .args(["--git-dir"])
-            .arg(&git_dir)
+            .arg(git_dir)
             .args(["config", "user.name", "t"])
             .status()
             .unwrap();
         let blob_out = StdCmd::new("git")
             .args(["--git-dir"])
-            .arg(&git_dir)
+            .arg(git_dir)
             .args(["hash-object", "-w", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -379,7 +365,7 @@ mod tests {
         let blob = String::from_utf8(blob_out.stdout).unwrap().trim().to_string();
         let mktree_out = StdCmd::new("git")
             .args(["--git-dir"])
-            .arg(&git_dir)
+            .arg(git_dir)
             .args(["mktree"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -398,7 +384,7 @@ mod tests {
         let tree = String::from_utf8(mktree_out.stdout).unwrap().trim().to_string();
         let commit_out = StdCmd::new("git")
             .args(["--git-dir"])
-            .arg(&git_dir)
+            .arg(git_dir)
             .args(["commit-tree", "-m", "initial", &tree])
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -415,7 +401,7 @@ mod tests {
             has_unsupported: false,
             no_progress: true,
         };
-        let resp = native_v2_fetch_response(&git_dir, req).await.unwrap();
+        let resp = native_v2_fetch_response(git_dir, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
@@ -444,15 +430,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_ls_refs_response_unborn_head() {
-        use crate::refs::FsRefStore;
-        use crate::storage::{new_repo_id, FsStorage, Storage};
-
-        let tmp = std::env::temp_dir().join(format!("nat-unborn-{}", new_repo_id()));
-        let repos_dir = tmp.join("repos");
-        let storage = FsStorage::new(&repos_dir).unwrap();
-        let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
-        let refs = FsRefStore::new(repos_dir);
+        let repo = crate::test_support::TestRepo::new();
+        let refs = repo.fs_refs();
 
         // Fresh repo: HEAD = ref: refs/heads/main, but main doesn't exist.
         let args = LsRefsArgs {
@@ -460,7 +439,7 @@ mod tests {
             symrefs: true,
             prefixes: vec!["HEAD".into(), "refs/heads/".into()],
         };
-        let resp = native_ls_refs_response(&repo_id, &refs, args).await.unwrap();
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args).await.unwrap();
         let body = futures::executor::block_on(axum::body::to_bytes(
             resp.into_body(),
             1024 * 1024,

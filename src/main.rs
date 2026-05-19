@@ -28,6 +28,8 @@ mod rest;
 mod secrets;
 mod smart_http;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod tokens;
 mod webhooks;
 
