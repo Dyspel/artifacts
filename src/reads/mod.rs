@@ -803,54 +803,8 @@ pub async fn get_note(
     }))
 }
 
-// ── helpers ──────────────────────────────────────────────────────────
-
-fn validate_ref_or_sha(s: &str) -> Result<()> {
-    // Permissive validator. `git` itself rejects dangerous input; we only
-    // block characters that would break the shell or that refmaps reject.
-    // HEAD and branch/tag paths (refs/heads/..., refs/notes/...) are all OK.
-    if s.is_empty() || s.len() > 512 {
-        return Err(Error::BadRequest("ref/sha empty or too long".into()));
-    }
-    for ch in s.chars() {
-        if ch.is_whitespace() || matches!(ch, '\0' | ':' | '?' | '*' | '[' | '~' | '^' | '\\') {
-            return Err(Error::BadRequest(format!("invalid character in ref: {ch:?}")));
-        }
-    }
-    Ok(())
-}
-
-fn validate_path(p: &str) -> Result<()> {
-    if p.is_empty() || p.len() > 4096 {
-        return Err(Error::BadRequest("path empty or too long".into()));
-    }
-    if p.starts_with('/') || p.contains("..") || p.contains('\0') {
-        return Err(Error::BadRequest(format!("invalid path: {p:?}")));
-    }
-    Ok(())
-}
-
-fn is_valid_notes_ref(s: &str) -> bool {
-    s.starts_with("refs/notes/")
-        && s.len() > "refs/notes/".len()
-        && !s.contains("//")
-        && !s.ends_with('/')
-        && s.chars().all(|c| c > ' ' && c != ':' && c != '?' && c != '*' && c != '~' && c != '^' && c != '[')
-}
-
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            total += dir_size(&entry.path()).unwrap_or(0);
-        } else {
-            total += meta.len();
-        }
-    }
-    Ok(total)
-}
+mod helpers;
+use helpers::{dir_size, is_valid_notes_ref, validate_path, validate_ref_or_sha};
 
 /// `git rev-list --count HEAD` — returns the total number of commits
 /// reachable from HEAD. Empty repos (no HEAD) return 0 cleanly instead
