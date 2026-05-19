@@ -212,12 +212,7 @@ const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
 
 impl SqliteTokenStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
-        )?;
-        crate::db_migrate::run(&conn, "tokens", &MIGRATIONS)?;
+        let conn = crate::db_migrate::open_with_migrations(path, "tokens", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(TokioMutex::new(conn)),
         })

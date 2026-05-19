@@ -156,12 +156,7 @@ impl SqliteWebhookRegistry {
         path: &std::path::Path,
         master_key: Arc<crate::secrets::MasterKey>,
     ) -> crate::error::Result<Self> {
-        let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
-        )?;
-        crate::db_migrate::run(&conn, "webhooks", &MIGRATIONS)?;
+        let conn = crate::db_migrate::open_with_migrations(path, "webhooks", &MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(std::sync::Mutex::new(conn)),
             master_key: std::sync::RwLock::new(master_key),

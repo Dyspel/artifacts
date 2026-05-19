@@ -36,6 +36,7 @@
 
 use crate::error::Result;
 use rusqlite::Connection;
+use std::path::Path;
 
 /// One forward-only schema migration. `version` numbers within a
 /// namespace must be strictly increasing and contiguous; gaps are
@@ -97,6 +98,36 @@ pub fn run(
         );
     }
     Ok(())
+}
+
+/// Open a SQLite database, set the WAL pragmas every store wants,
+/// and apply the given migrations. One helper instead of five
+/// hand-rolled `open()` bodies, each three lines of WAL boilerplate
+/// preceded by `Connection::open` and followed by `db_migrate::run`.
+///
+/// Each store still owns its own `Arc<…Mutex<Connection>>` wrapper —
+/// some pick the tokio mutex (so `metrics::lock_sqlite` can observe
+/// the wait), some pick the std mutex (because the surrounding trait
+/// is sync). The wrapper choice belongs to the store; the open +
+/// pragma + migration sequence is the shared part.
+pub fn open_with_migrations(
+    path: &Path,
+    namespace: &str,
+    migrations: &[Migration],
+) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // WAL gives concurrent readers while a writer is in progress;
+    // synchronous=NORMAL trades a small durability window (you can
+    // lose the last few transactions on power loss, vs FULL which
+    // fsyncs every commit) for ~10× write throughput. Acceptable for
+    // every store today — tokens, audit, ownership, webhooks all
+    // tolerate the loss-of-last-few-txns window.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;",
+    )?;
+    run(&conn, namespace, migrations)?;
+    Ok(conn)
 }
 
 /// Helper for migrations that add a column to an existing table.

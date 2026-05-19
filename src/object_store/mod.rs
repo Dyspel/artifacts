@@ -647,12 +647,11 @@ const SQLITE_OBJECT_STORE_MIGRATIONS: [crate::db_migrate::Migration; 1] =
 #[cfg(test)]
 impl SqliteObjectStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;",
+        let conn = crate::db_migrate::open_with_migrations(
+            path,
+            "object_store",
+            &SQLITE_OBJECT_STORE_MIGRATIONS,
         )?;
-        crate::db_migrate::run(&conn, "object_store", &SQLITE_OBJECT_STORE_MIGRATIONS)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
