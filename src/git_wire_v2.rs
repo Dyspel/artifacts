@@ -41,19 +41,18 @@ pub(crate) async fn native_v2_fetch_response(
     req: V2FetchRequest,
 ) -> Result<Response<Body>> {
     // Prefer the native gix-pack path. It uses no subprocess; just a
-    // commit walk + pack entry iteration in process. Wrap in
-    // spawn_blocking because the gix call is sync and we don't want
-    // to block a tokio worker on disk I/O.
+    // commit walk + pack entry iteration in process. Off the tokio
+    // pool because the gix call is sync and we don't want to block a
+    // tokio worker on disk I/O.
     let pack = {
         let repo_path_buf = repo_path.to_path_buf();
         let wants = req.wants.clone();
         let haves = req.haves.clone();
-        match tokio::task::spawn_blocking(move || {
+        let native = crate::blocking::run_blocking("native_pack", move || {
             crate::native_pack::generate_pack(&repo_path_buf, &wants, &haves)
         })
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("native_pack join: {e}")))?
-        {
+        .await;
+        match native {
             Ok(p) => p,
             Err(e) => {
                 // Keep behavior intact while the gix code matures —

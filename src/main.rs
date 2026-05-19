@@ -3,6 +3,7 @@
 mod alternates_cache;
 mod audit;
 mod auth;
+mod blocking;
 mod commits;
 mod config;
 mod db_migrate;

@@ -470,29 +470,29 @@ pub async fn get_blob(
     validate_ref_or_sha(commit)?;
     validate_path(&q.path)?;
 
-    // Resolve `<commit>:<path>` → blob oid via gix. spawn_blocking
-    // because gix is sync and the tree walk hits the loose+pack
+    // Resolve `<commit>:<path>` → blob oid via gix. Off the tokio
+    // pool because gix is sync and the tree walk hits the loose+pack
     // object stores. Returns a clear `blob not found` for any
     // resolution failure (bad rev, missing path, non-blob target).
     let blob_oid = {
         let git_dir = git_dir.clone();
         let commit = commit.to_string();
         let path = q.path.clone();
-        tokio::task::spawn_blocking(move || resolve_blob_oid(&git_dir, &commit, &path))
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("resolve_blob_oid join: {e}")))??
+        crate::blocking::run_blocking("resolve_blob_oid", move || {
+            resolve_blob_oid(&git_dir, &commit, &path)
+        })
+        .await?
     };
 
     // Final byte fetch through the trait. FsObjectStore.read_object
     // walks loose + pack stores via gix; a future chunked-KV impl
-    // serves from its KV. Wrap in spawn_blocking for the same reason.
+    // serves from its KV. Off the tokio pool for the same reason.
     let objects = state.objects.clone();
     let repo_id_for_read = repo_id.clone();
-    let read_result = tokio::task::spawn_blocking(move || {
+    let read_result = crate::blocking::run_blocking("read_object", move || {
         objects.read_object(&repo_id_for_read, &blob_oid)
     })
-    .await
-    .map_err(|e| Error::Other(anyhow::anyhow!("read_object join: {e}")))??;
+    .await?;
 
     let (kind, bytes) = read_result.ok_or_else(|| {
         Error::BadRequest(format!("blob not found: {commit}:{}", q.path))
