@@ -453,3 +453,106 @@ fn sqlite_reopen_is_idempotent() {
     // Drop _s1's lock by letting it survive (separate Connection).
     let _s2 = SqliteObjectStore::open(&path).unwrap();
 }
+
+/// End-to-end SqliteObjectStore::ingest_pack. Builds a real pack
+/// against a fresh FS repo (one commit → one tree → one blob),
+/// streams its bytes into a fresh SqliteObjectStore via the trait
+/// method, and asserts that every object oid the pack carries is
+/// now resolvable via `exists` / `read_loose`.
+#[test]
+fn sqlite_ingest_pack_round_trips_a_thick_pack() {
+    use crate::native_pack;
+
+    // 1. Build a small repo on disk so we can generate a real pack
+    //    against it via the existing `native_pack::generate_pack`
+    //    helper. Same plumbing the receive-pack tests use.
+    let repo = crate::test_support::TestRepo::new();
+    let git_dir = &repo.git_dir;
+
+    let blob_oid = write_blob(git_dir, b"hello-kv\n");
+    // Build a tree containing the blob.
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut tree_proc = Command::new("git")
+        .args(["--git-dir"])
+        .arg(git_dir)
+        .args(["mktree"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        tree_proc.stdin.as_mut().unwrap(),
+        "100644 blob {blob_oid}\thello.txt"
+    )
+    .unwrap();
+    let tree_out = tree_proc.wait_with_output().unwrap();
+    let tree_oid = String::from_utf8(tree_out.stdout).unwrap().trim().to_string();
+    // Commit pointing at the tree.
+    let commit_out = Command::new("git")
+        .args(["--git-dir"])
+        .arg(git_dir)
+        .args(["commit-tree", "-m", "kv-ingest-test", &tree_oid])
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    let commit_oid = String::from_utf8(commit_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 2. Pack everything reachable from the commit. `generate_pack`
+    //    builds a thick pack — no external base refs needed — so
+    //    our Never resolver in ingest_pack will be satisfied.
+    let pack_bytes =
+        native_pack::generate_pack(git_dir, std::slice::from_ref(&commit_oid), &[]).unwrap();
+    // Sanity: pack header + at least three entries (commit/tree/blob)
+    // + trailer comes out well above the 32-byte short-circuit cap.
+    assert!(pack_bytes.len() > 32, "pack too small: {}", pack_bytes.len());
+
+    // 3. Ingest into a fresh chunked-KV-shaped store.
+    let kv_tmp = tempfile::tempdir().unwrap();
+    let store = SqliteObjectStore::open(&kv_tmp.path().join("objects.db")).unwrap();
+    let count = store.ingest_pack("r", &pack_bytes).unwrap();
+    assert_eq!(count, 3, "expected 3 objects (commit + tree + blob), got {count}");
+
+    // 4. Every oid the pack carried is now resolvable via the trait.
+    //    `read_loose` returns the zlib-deflated loose bytes (the same
+    //    format git puts on disk), so the canonical magic-byte check
+    //    holds — that's the chunked-KV's promise: identical bytes-on-
+    //    the-wire to the FS impl, just sitting in a SQLite row.
+    for oid in [&commit_oid, &tree_oid, &blob_oid] {
+        assert!(
+            store.exists("r", oid).unwrap(),
+            "exists must return true for ingested {oid}"
+        );
+        let bytes = store
+            .read_loose("r", oid)
+            .unwrap()
+            .expect("Some after ingest");
+        // Loose objects start with the zlib magic byte 0x78.
+        assert_eq!(
+            bytes.first(),
+            Some(&0x78),
+            "ingested oid {oid} should be zlib-deflated loose-object bytes",
+        );
+    }
+}
+
+/// Empty / undersized pack bodies (the 32-byte cap) are a no-op:
+/// `ingest_pack` short-circuits without touching the tempdir, the
+/// indexer, or the SQLite store. Mirrors `FsObjectStore::ingest_pack`'s
+/// same-cap behaviour so a delete-only push (no pack payload) keeps
+/// working against the chunked-KV path.
+#[test]
+fn sqlite_ingest_pack_empty_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SqliteObjectStore::open(&tmp.path().join("objects.db")).unwrap();
+    assert_eq!(store.ingest_pack("r", b"").unwrap(), 0);
+    assert_eq!(store.ingest_pack("r", &[0u8; 16]).unwrap(), 0);
+    // Nothing landed in the table.
+    assert!(store.list_loose("r").unwrap().is_empty());
+}

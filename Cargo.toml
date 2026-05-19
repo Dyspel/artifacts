@@ -62,6 +62,10 @@ gix-features = "0.48"
 gix-hash = "0.25"
 gix-odb = "0.80"
 gix-object = "0.51"
+# Already in the dep graph transitively via gix; named here so the
+# SqliteObjectStore::ingest_pack code (loose-object zlib deflate) can
+# import it without going through a private gix module.
+flate2 = "1"
 # sha1 is needed for the empty-pack trailer in native_pack.rs.
 sha1 = "0.10"
 # prodash::Discard is used as the no-op progress sink for

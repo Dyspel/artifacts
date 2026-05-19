@@ -756,6 +756,111 @@ impl ObjectStore for SqliteObjectStore {
         )?;
         Ok(n != 0)
     }
+
+    /// **Stopgap ingest**. The chunked-KV path needs `ingest_pack` to
+    /// work without a filesystem under it, but `gix_pack`'s public
+    /// delta-application surface (`File::decode_entry`) is gated on
+    /// having a real pack file on disk. To bridge the gap, we
+    /// materialize the incoming pack into a tempdir, hand it to
+    /// `gix_pack::Bundle::write_to_directory` for indexing, then
+    /// iterate the indexed pack and copy each fully-resolved object
+    /// into the KV's `loose_objects` table.
+    ///
+    /// **Limitation**: this momentarily touches the local filesystem
+    /// (under `tempfile::tempdir()`, gone the moment `tmp` drops)
+    /// even though the chunked-KV's eventual production answer is
+    /// "no filesystem." For the prototype it's a working seam; the
+    /// honest follow-up is a hand-rolled pack-delta resolver against
+    /// the KV's own rows.
+    ///
+    /// **Thin packs**: we pass `gix_object::find::Never` as the base
+    /// resolver, so any ref-delta whose base lives outside the pack
+    /// fails the index step. Receive-pack today produces thick packs
+    /// in the cases the chunked-KV path needs to cover; we'd revisit
+    /// if/when fetch-side thin packs land on this backend.
+    fn ingest_pack(&self, repo_id: &str, pack_bytes: &[u8]) -> Result<usize> {
+        if pack_bytes.len() <= 32 {
+            return Ok(0);
+        }
+        let tmp = tempfile::tempdir()
+            .map_err(|e| Error::Other(anyhow::anyhow!("ingest_pack tempdir: {e}")))?;
+        let pack_dir = tmp.path();
+        let mut cursor = std::io::Cursor::new(pack_bytes);
+        let mut progress = prodash::progress::Discard;
+        let interrupt = std::sync::atomic::AtomicBool::new(false);
+        let outcome = gix_pack::Bundle::write_to_directory(
+            &mut cursor,
+            Some(pack_dir),
+            &mut progress,
+            &interrupt,
+            // The Never resolver matches the `gix_object::Find` version
+            // that gix-pack expects (the umbrella `gix` crate's, not
+            // our direct `gix-object = "0.51"` dep). Re-routes through
+            // `gix::objs` so the types line up.
+            None::<gix::objs::find::Never>,
+            gix_pack::bundle::write::Options {
+                thread_limit: Some(1),
+                iteration_mode: gix_pack::data::input::Mode::Verify,
+                index_version: gix_pack::index::Version::default(),
+                object_hash: gix_hash::Kind::Sha1,
+            },
+        )
+        .map_err(|e| Error::Other(anyhow::anyhow!("ingest_pack write_to_directory: {e}")))?;
+        let index_path = outcome
+            .index_path
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("ingest_pack: write produced no index")))?;
+        let bundle = gix_pack::Bundle::at(&index_path, gix_hash::Kind::Sha1)
+            .map_err(|e| Error::Other(anyhow::anyhow!("ingest_pack Bundle::at: {e}")))?;
+
+        let num_objects = bundle.index.num_objects();
+        let mut decode_buf = Vec::new();
+        let mut inflate = gix_features::zlib::Inflate::default();
+        let mut cache = gix_pack::cache::Never;
+        let mut count = 0usize;
+        for idx in 0..num_objects {
+            let oid_hex = bundle.index.oid_at_index(idx).to_hex().to_string();
+            decode_buf.clear();
+            let (data, _location) = bundle
+                .get_object_by_index(idx, &mut decode_buf, &mut inflate, &mut cache)
+                .map_err(|e| {
+                    Error::Other(anyhow::anyhow!("decode pack entry {oid_hex}: {e}"))
+                })?;
+            // Re-encode as the canonical loose-object format
+            // (`<kind> <size>\0<payload>`, zlib-deflated) so a future
+            // `read_object` impl can inflate + parse the header the
+            // same way as for FsObjectStore-shaped backends.
+            let kind_str = match data.kind {
+                gix::object::Kind::Commit => "commit",
+                gix::object::Kind::Tree => "tree",
+                gix::object::Kind::Blob => "blob",
+                gix::object::Kind::Tag => "tag",
+            };
+            let mut header_and_payload = Vec::with_capacity(20 + data.data.len());
+            header_and_payload
+                .extend_from_slice(format!("{kind_str} {}\0", data.data.len()).as_bytes());
+            header_and_payload.extend_from_slice(data.data);
+            let compressed = zlib_deflate_loose(&header_and_payload)?;
+            self.write_loose(repo_id, &oid_hex, &compressed)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+/// Compress `input` as zlib (the same shape git's loose-object files
+/// use). Used by `SqliteObjectStore::ingest_pack`; not exposed
+/// publicly because the only caller is one level above.
+#[cfg(test)]
+fn zlib_deflate_loose(input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(input)
+        .map_err(|e| Error::Other(anyhow::anyhow!("zlib write: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| Error::Other(anyhow::anyhow!("zlib finish: {e}")))
 }
 
 /// 40-char lowercase hex. The validation contract both impls share —

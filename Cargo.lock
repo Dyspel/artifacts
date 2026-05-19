@@ -303,6 +303,7 @@ dependencies = [
  "dashmap",
  "eframe",
  "egui_plot",
+ "flate2",
  "futures",
  "gix",
  "gix-features 0.48.0",
