@@ -1,0 +1,455 @@
+//! Integration tests for the three `ObjectStore` impls. Wires each
+//! impl through the shared `conformance` helpers + backend-specific
+//! assertions (e.g. FsObjectStore's zlib loose-object format, the
+//! pack-index walk in `exists`, SQLite's BLOB-column round-trip).
+
+#![cfg(test)]
+
+use super::*;
+use crate::storage::{new_repo_id, FsStorage, Storage};
+use std::path::Path;
+
+fn write_blob(git_dir: &Path, bytes: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+// ─── FsObjectStore conformance ─────────────────────────────────
+
+fn fs_fixture() -> (tempfile::TempDir, FsObjectStore, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let storage = FsStorage::new(&repos).unwrap();
+    let repo_id = new_repo_id();
+    storage.create(&repo_id).unwrap();
+    let git_dir = repos.join(format!("{repo_id}.git"));
+    let oid = write_blob(&git_dir, b"hello\n");
+    let store = FsObjectStore::new(&repos);
+    (tmp, store, repo_id, oid)
+}
+
+#[test]
+fn fs_read_after_write_round_trips() {
+    let (_t, store, repo_id, oid) = fs_fixture();
+    conformance::read_after_write_round_trips(&store, &repo_id, &oid);
+}
+
+#[test]
+fn fs_missing_oid_returns_none() {
+    let (_t, store, repo_id, _) = fs_fixture();
+    conformance::missing_oid_returns_none(&store, &repo_id);
+}
+
+#[test]
+fn fs_malformed_oid_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::malformed_oid_returns_none(&store);
+}
+
+/// FS-specific contract that doesn't apply to Mem: returned bytes
+/// are git's actual zlib-deflated loose-object format. The Mem
+/// impl stores whatever the test puts in, so it can't satisfy
+/// this — that's fine, `read_loose`'s contract is only "return
+/// the bytes that were stored", not "return zlib".
+#[test]
+fn fs_returns_zlib_deflated_payload() {
+    let (_t, store, repo_id, oid) = fs_fixture();
+    let bytes = store.read_loose(&repo_id, &oid).unwrap().expect("found");
+    // Loose objects start with the zlib magic byte 0x78 (low-nibble
+    // = 0x8 means deflate at the default window size).
+    assert_eq!(bytes[0], 0x78);
+    assert!(bytes.len() > 2);
+}
+
+#[test]
+fn fs_exists_agrees_with_read_for_loose() {
+    let (_t, store, repo_id, oid) = fs_fixture();
+    conformance::exists_agrees_with_read(&store, &repo_id, &oid);
+}
+
+/// FS-specific: an object that's been packed (no longer loose) is
+/// still visible to `exists` via the gix pack-index walk. This is
+/// the contract the commits-plumbing existence check depends on
+/// — without it, a `cat-file -e` -> `exists()` swap would break
+/// commits-after-gc.
+#[test]
+fn fs_exists_finds_packed_objects() {
+    use std::process::Command;
+    let (_t, store, repo_id, oid) = fs_fixture();
+    let git_dir = store.root.join(format!("{repo_id}.git"));
+    // Need a ref pointing at the object so `git repack` keeps
+    // it. Blobs aren't reachable from a ref on their own, so
+    // wrap it in a commit. Reuse hash-object → write-tree → commit-tree.
+    let tree_oid = {
+        let out = Command::new("git")
+            .arg("--git-dir").arg(&git_dir)
+            .args(["mktree"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        use std::io::Write as _;
+        let mut out = out;
+        writeln!(out.stdin.as_mut().unwrap(), "100644 blob {oid}\thello.txt").unwrap();
+        let o = out.wait_with_output().unwrap();
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    };
+    let commit_oid = {
+        let out = Command::new("git")
+            .arg("--git-dir").arg(&git_dir)
+            .args(["commit-tree", &tree_oid, "-m", "t"])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    Command::new("git")
+        .arg("--git-dir").arg(&git_dir)
+        .args(["update-ref", "refs/heads/main", &commit_oid])
+        .status().unwrap();
+    // Repack + prune: blob moves from objects/<aa>/<bb...> into a packfile.
+    Command::new("git")
+        .arg("--git-dir").arg(&git_dir)
+        .args(["repack", "-ad"])
+        .status().unwrap();
+    // The loose path is gone now.
+    let loose_path = store.loose_path(&repo_id, &oid).unwrap();
+    assert!(
+        !loose_path.exists(),
+        "test setup broken: blob should have been packed away",
+    );
+    // …but exists() still finds it through the pack-index walk.
+    assert!(
+        store.exists(&repo_id, &oid).unwrap(),
+        "exists must find packed objects, not just loose ones",
+    );
+}
+
+// ─── MemObjectStore conformance ────────────────────────────────
+
+/// Synthesize a deterministic 40-hex oid for a Mem fixture. The
+/// store doesn't validate the oid against the bytes (the FS impl
+/// doesn't either — it's a key-value lookup), so any 40-hex
+/// string is fine for round-trip testing.
+fn mem_oid(seed: u8) -> String {
+    let mut s = String::with_capacity(40);
+    for _ in 0..40 {
+        s.push(char::from_digit((seed % 16) as u32, 16).unwrap());
+    }
+    s
+}
+
+fn mem_fixture() -> (MemObjectStore, String, String) {
+    let store = MemObjectStore::new();
+    let repo_id = "mem-repo".to_string();
+    let oid = mem_oid(0xa);
+    store
+        .write_loose(&repo_id, &oid, b"any-bytes-stand-in")
+        .unwrap();
+    (store, repo_id, oid)
+}
+
+#[test]
+fn mem_read_after_write_round_trips() {
+    let (store, repo_id, oid) = mem_fixture();
+    conformance::read_after_write_round_trips(&store, &repo_id, &oid);
+}
+
+#[test]
+fn mem_missing_oid_returns_none() {
+    let (store, repo_id, _) = mem_fixture();
+    conformance::missing_oid_returns_none(&store, &repo_id);
+}
+
+#[test]
+fn mem_malformed_oid_returns_none() {
+    let store = MemObjectStore::new();
+    conformance::malformed_oid_returns_none(&store);
+}
+
+#[test]
+fn mem_write_then_read_round_trips() {
+    let store = MemObjectStore::new();
+    conformance::write_then_read_round_trips(&store);
+}
+
+#[test]
+fn mem_write_loose_idempotent_on_repeat() {
+    let store = MemObjectStore::new();
+    conformance::write_loose_idempotent_on_repeat(&store);
+}
+
+#[test]
+fn mem_write_loose_rejects_malformed_oid() {
+    let store = MemObjectStore::new();
+    conformance::write_loose_rejects_malformed_oid(&store);
+}
+
+#[test]
+fn mem_exists_agrees_with_read() {
+    let (store, repo_id, oid) = mem_fixture();
+    conformance::exists_agrees_with_read(&store, &repo_id, &oid);
+}
+
+#[test]
+fn mem_read_returns_exact_bytes_written() {
+    // Mem-specific: returned bytes are *exactly* what was stored.
+    // The FS impl can't make this assertion because git rewrites
+    // its loose-object format on write.
+    let store = MemObjectStore::new();
+    let oid = mem_oid(0x3);
+    let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    store.write_loose("r", &oid, &payload).unwrap();
+    let got = store.read_loose("r", &oid).unwrap().unwrap();
+    assert_eq!(got, payload);
+}
+
+// ─── FsObjectStore — write conformance ─────────────────────────
+
+#[test]
+fn fs_write_then_read_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::write_then_read_round_trips(&store);
+}
+
+#[test]
+fn fs_write_loose_idempotent_on_repeat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::write_loose_idempotent_on_repeat(&store);
+}
+
+#[test]
+fn fs_write_loose_rejects_malformed_oid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::write_loose_rejects_malformed_oid(&store);
+}
+
+#[test]
+fn fs_list_loose_enumerates_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::list_loose_enumerates_writes(&store);
+}
+
+#[test]
+fn fs_list_loose_empty_returns_empty_vec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::list_loose_empty_returns_empty_vec(&store);
+}
+
+#[test]
+fn fs_delete_loose_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::delete_loose_round_trips(&store);
+}
+
+#[test]
+fn fs_delete_loose_rejects_malformed_oid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    conformance::delete_loose_rejects_malformed_oid(&store);
+}
+
+#[test]
+fn mem_list_loose_enumerates_writes() {
+    let store = MemObjectStore::new();
+    conformance::list_loose_enumerates_writes(&store);
+}
+
+#[test]
+fn mem_list_loose_empty_returns_empty_vec() {
+    let store = MemObjectStore::new();
+    conformance::list_loose_empty_returns_empty_vec(&store);
+}
+
+#[test]
+fn mem_delete_loose_round_trips() {
+    let store = MemObjectStore::new();
+    conformance::delete_loose_round_trips(&store);
+}
+
+#[test]
+fn mem_delete_loose_rejects_malformed_oid() {
+    let store = MemObjectStore::new();
+    conformance::delete_loose_rejects_malformed_oid(&store);
+}
+
+/// FS-specific: `write_loose` is atomic via tmp+rename. After a
+/// successful write the canonical path exists; no `.tmp-*` files
+/// remain in the parent dir.
+#[test]
+fn fs_write_loose_leaves_no_tmp_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FsObjectStore::new(tmp.path().join("repos"));
+    let oid = "9999999999999999999999999999999999999999";
+    store.write_loose("r", oid, b"payload").unwrap();
+    // Walk the parent dir; only the canonical 38-hex name should
+    // remain. Any `.tmp-*` entry means the cleanup is broken.
+    let parent = tmp.path().join("repos/r.git/objects/99");
+    let entries: Vec<String> = std::fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().into_string().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        entries,
+        vec!["9".repeat(38)],
+        "expected only the canonical loose-object file, got {entries:?}"
+    );
+}
+
+// ─── SqliteObjectStore conformance ──────────────────────────────
+//
+// Runs the same conformance helpers as Fs/Mem against a fresh
+// SQLite-backed impl. Each test opens its own tempfile so cases
+// don't share state. The trait contract is the only contract;
+// an impl that can't satisfy it is broken regardless of backend.
+
+fn sqlite_fixture() -> (tempfile::TempDir, SqliteObjectStore) {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("objects.db");
+    let store = SqliteObjectStore::open(&path).unwrap();
+    (tmp, store)
+}
+
+fn sqlite_oid(seed: u8) -> String {
+    let mut s = String::with_capacity(40);
+    for _ in 0..40 {
+        s.push(char::from_digit((seed % 16) as u32, 16).unwrap());
+    }
+    s
+}
+
+#[test]
+fn sqlite_read_after_write_round_trips() {
+    let (_t, store) = sqlite_fixture();
+    let oid = sqlite_oid(0x1);
+    store.write_loose("r", &oid, b"hello-kv").unwrap();
+    conformance::read_after_write_round_trips(&store, "r", &oid);
+}
+
+#[test]
+fn sqlite_missing_oid_returns_none() {
+    let (_t, store) = sqlite_fixture();
+    conformance::missing_oid_returns_none(&store, "r");
+}
+
+#[test]
+fn sqlite_malformed_oid_returns_none() {
+    let (_t, store) = sqlite_fixture();
+    conformance::malformed_oid_returns_none(&store);
+}
+
+#[test]
+fn sqlite_write_then_read_round_trips() {
+    let (_t, store) = sqlite_fixture();
+    conformance::write_then_read_round_trips(&store);
+}
+
+#[test]
+fn sqlite_write_loose_idempotent_on_repeat() {
+    let (_t, store) = sqlite_fixture();
+    conformance::write_loose_idempotent_on_repeat(&store);
+}
+
+#[test]
+fn sqlite_write_loose_rejects_malformed_oid() {
+    let (_t, store) = sqlite_fixture();
+    conformance::write_loose_rejects_malformed_oid(&store);
+}
+
+#[test]
+fn sqlite_list_loose_enumerates_writes() {
+    let (_t, store) = sqlite_fixture();
+    conformance::list_loose_enumerates_writes(&store);
+}
+
+#[test]
+fn sqlite_list_loose_empty_returns_empty_vec() {
+    let (_t, store) = sqlite_fixture();
+    conformance::list_loose_empty_returns_empty_vec(&store);
+}
+
+#[test]
+fn sqlite_delete_loose_round_trips() {
+    let (_t, store) = sqlite_fixture();
+    conformance::delete_loose_round_trips(&store);
+}
+
+#[test]
+fn sqlite_delete_loose_rejects_malformed_oid() {
+    let (_t, store) = sqlite_fixture();
+    conformance::delete_loose_rejects_malformed_oid(&store);
+}
+
+#[test]
+fn sqlite_exists_agrees_with_read() {
+    let (_t, store) = sqlite_fixture();
+    let oid = sqlite_oid(0x7);
+    store.write_loose("r", &oid, b"present").unwrap();
+    conformance::exists_agrees_with_read(&store, "r", &oid);
+}
+
+/// SQLite-specific: bytes round-trip with byte-exact fidelity.
+/// A BLOB column shouldn't transform the payload (UTF-8 cast,
+/// NUL truncation, etc.) — same shape as the Mem-impl
+/// "exact bytes" assertion.
+#[test]
+fn sqlite_read_returns_exact_bytes_written() {
+    let (_t, store) = sqlite_fixture();
+    let oid = sqlite_oid(0x3);
+    let payload: Vec<u8> = (0..=255).cycle().take(4096).collect();
+    store.write_loose("r", &oid, &payload).unwrap();
+    let got = store.read_loose("r", &oid).unwrap().unwrap();
+    assert_eq!(got, payload);
+}
+
+/// SQLite-specific: rows from one repo don't leak into another's
+/// `list_loose`. Trivial for Fs (directory scoping) and Mem
+/// (HashMap key tuple), but worth pinning for SQLite — the
+/// `WHERE repo_id = ?1` clause is the only thing keeping the
+/// scope honest.
+#[test]
+fn sqlite_list_loose_is_repo_scoped() {
+    let (_t, store) = sqlite_fixture();
+    let oid_a = sqlite_oid(0xa);
+    let oid_b = sqlite_oid(0xb);
+    store.write_loose("repo-a", &oid_a, b"a-bytes").unwrap();
+    store.write_loose("repo-b", &oid_b, b"b-bytes").unwrap();
+    let listed_a = store.list_loose("repo-a").unwrap();
+    let listed_b = store.list_loose("repo-b").unwrap();
+    assert_eq!(listed_a.len(), 1);
+    assert_eq!(listed_a[0].oid, oid_a);
+    assert_eq!(listed_b.len(), 1);
+    assert_eq!(listed_b[0].oid, oid_b);
+}
+
+/// SQLite-specific: migrations are idempotent. Open the same
+/// file twice (with two store instances) — both should succeed
+/// without re-applying v1. Mirrors the contract proved by
+/// `db_migrate::tests::second_run_skips_already_applied`.
+#[test]
+fn sqlite_reopen_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("objects.db");
+    let _s1 = SqliteObjectStore::open(&path).unwrap();
+    // Drop _s1's lock by letting it survive (separate Connection).
+    let _s2 = SqliteObjectStore::open(&path).unwrap();
+}
