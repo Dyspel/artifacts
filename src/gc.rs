@@ -270,11 +270,7 @@ pub fn run(
 /// descendants via the same scan `list_forks_of` uses but inlined
 /// here so we can keep the call inside the same `read_dir` we'd
 /// otherwise issue once per repo.
-fn network_around(
-    repos_dir: &Path,
-    seed: &str,
-    cache: &AlternatesCache,
-) -> Result<Vec<String>> {
+fn network_around(repos_dir: &Path, seed: &str, cache: &AlternatesCache) -> Result<Vec<String>> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = vec![seed.to_string()];
 
@@ -565,7 +561,11 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        p.stdin.as_mut().unwrap().write_all(b"young-orphan").unwrap();
+        p.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"young-orphan")
+            .unwrap();
         let dangler = String::from_utf8(p.wait_with_output().unwrap().stdout)
             .unwrap()
             .trim()

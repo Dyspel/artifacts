@@ -53,7 +53,9 @@ pub async fn mint_token(
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state.authn.tokens
+    let token = state
+        .authn
+        .tokens
         .mint(&id, body.scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
@@ -75,7 +77,11 @@ pub async fn mint_token(
         None,
     )
     .await;
-    Ok(Json(TokenMinted { token, remote, expires_at }))
+    Ok(Json(TokenMinted {
+        token,
+        remote,
+        expires_at,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +120,9 @@ pub async fn revoke_token(
     // ownership check. Admins skip the ownership check but we
     // still want the audit field populated; for a stale-or-fake
     // token there's nothing to bind to so log "unknown".
-    let target_repo: Option<String> = state.authn.tokens
+    let target_repo: Option<String> = state
+        .authn
+        .tokens
         .lookup(&body.token)
         .await
         .ok()
@@ -194,7 +202,11 @@ pub async fn list_tokens(
         crate::auth::Principal::Admin => None,
         crate::auth::Principal::User { subject } => Some(subject.as_str()),
     };
-    let rows = state.authn.tokens.list_for_repo(&id, subject_filter).await?;
+    let rows = state
+        .authn
+        .tokens
+        .list_for_repo(&id, subject_filter)
+        .await?;
     Ok(Json(rows))
 }
 
@@ -233,7 +245,9 @@ pub async fn rotate_tokens(
     let revoked = state.authn.tokens.revoke_all_for_repo(&id).await?;
     let scope = body.scope.unwrap_or(Scope::Write);
     let ttl = body.ttl_seconds.map(std::time::Duration::from_secs);
-    let token = state.authn.tokens
+    let token = state
+        .authn
+        .tokens
         .mint(&id, scope, ttl, principal.subject())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);

@@ -110,7 +110,9 @@ pub async fn get_repo(
     let refs = list_refs_native(&git_dir).await?;
     let size_bytes = dir_size(&git_dir).unwrap_or(0);
     let head_sha = resolve_ref_sha(&git_dir, "HEAD").await.ok().flatten();
-    let source_id = state.data.alternates_cache
+    let source_id = state
+        .data
+        .alternates_cache
         .lookup(&state.cfg.repos_dir(), &repo_id);
     let commit_count = count_commits_from_head(&git_dir).await.unwrap_or(0);
     let fork_count = count_forks_of(
@@ -183,7 +185,10 @@ pub async fn list_commits(
     headers: HeaderMap,
 ) -> Result<Json<Vec<CommitSummary>>> {
     let git_dir = authorize_read(&state, &headers, &repo_id).await?;
-    let limit = q.limit.unwrap_or(COMMITS_LIMIT_DEFAULT).min(COMMITS_LIMIT_MAX);
+    let limit = q
+        .limit
+        .unwrap_or(COMMITS_LIMIT_DEFAULT)
+        .min(COMMITS_LIMIT_MAX);
     let skip = q.skip.unwrap_or(0);
     let start = q.r#ref.as_deref().unwrap_or("HEAD");
     validate_ref_or_sha(start)?;
@@ -245,8 +250,14 @@ fn parse_log_records(bytes: &[u8]) -> Result<Vec<CommitSummary>> {
         out.push(CommitSummary {
             sha,
             parents,
-            author: Signature { name: author_name, email: author_email },
-            committer: Signature { name: committer_name, email: committer_email },
+            author: Signature {
+                name: author_name,
+                email: author_email,
+            },
+            committer: Signature {
+                name: committer_name,
+                email: committer_email,
+            },
             message,
             timestamp,
         });
@@ -354,13 +365,8 @@ pub async fn get_tree(
 
     // `ls-tree -r -l -z` recurses, emits sizes for blobs, and NUL-delims
     // the records so paths containing spaces or newlines parse correctly.
-    let (rc, stdout, stderr) = run_git(
-        &git_dir,
-        &["ls-tree", "-r", "-l", "-z", start],
-        &[],
-        None,
-    )
-    .await?;
+    let (rc, stdout, stderr) =
+        run_git(&git_dir, &["ls-tree", "-r", "-l", "-z", start], &[], None).await?;
     if rc != 0 {
         let err = String::from_utf8_lossy(&stderr);
         if err.contains("not a valid object name") || err.contains("Not a valid object name") {
@@ -493,9 +499,8 @@ pub async fn get_blob(
     })
     .await?;
 
-    let (kind, bytes) = read_result.ok_or_else(|| {
-        Error::BadRequest(format!("blob not found: {commit}:{}", q.path))
-    })?;
+    let (kind, bytes) = read_result
+        .ok_or_else(|| Error::BadRequest(format!("blob not found: {commit}:{}", q.path)))?;
     if kind != crate::object_store::ObjectKind::Blob {
         return Err(Error::BadRequest(format!(
             "blob not found: {commit}:{} (resolved to non-blob)",
@@ -523,8 +528,8 @@ pub async fn get_blob(
 /// `sync` so it can run on a `spawn_blocking` worker; gix's object DB
 /// reads are not async.
 fn resolve_blob_oid(git_dir: &Path, rev: &str, path: &str) -> Result<String> {
-    let repo = gix::open(git_dir)
-        .map_err(|e| Error::BadRequest(format!("repo open failed: {e}")))?;
+    let repo =
+        gix::open(git_dir).map_err(|e| Error::BadRequest(format!("repo open failed: {e}")))?;
     // Resolve the rev (could be HEAD, a ref name, or an OID prefix).
     let commit_obj = repo
         .rev_parse_single(rev)
@@ -695,11 +700,15 @@ fn parse_diff(numstat: &str, patch: &str) -> Vec<FileDiff> {
             continue;
         }
         if line.starts_with("new file mode") {
-            if let Some(ix) = current_file { files[ix].status = DiffStatus::Added; }
+            if let Some(ix) = current_file {
+                files[ix].status = DiffStatus::Added;
+            }
             continue;
         }
         if line.starts_with("deleted file mode") {
-            if let Some(ix) = current_file { files[ix].status = DiffStatus::Deleted; }
+            if let Some(ix) = current_file {
+                files[ix].status = DiffStatus::Deleted;
+            }
             continue;
         }
         if let Some(hdr) = line.strip_prefix("@@ ") {
@@ -712,21 +721,34 @@ fn parse_diff(numstat: &str, patch: &str) -> Vec<FileDiff> {
             let (old_start, old_lines) = parse_hunk_range(parts.first().copied().unwrap_or(""));
             let (new_start, new_lines) = parse_hunk_range(parts.get(1).copied().unwrap_or(""));
             current_hunk = Some(DiffHunk {
-                old_start, old_lines, new_start, new_lines, lines: Vec::new(),
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+                lines: Vec::new(),
             });
             continue;
         }
         if let Some(h) = current_hunk.as_mut() {
             if let Some(text) = line.strip_prefix('+') {
                 if !line.starts_with("+++") {
-                    h.lines.push(DiffLine { kind: DiffLineKind::Add, text: text.to_string() });
+                    h.lines.push(DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: text.to_string(),
+                    });
                 }
             } else if let Some(text) = line.strip_prefix('-') {
                 if !line.starts_with("---") {
-                    h.lines.push(DiffLine { kind: DiffLineKind::Del, text: text.to_string() });
+                    h.lines.push(DiffLine {
+                        kind: DiffLineKind::Del,
+                        text: text.to_string(),
+                    });
                 }
             } else if let Some(text) = line.strip_prefix(' ') {
-                h.lines.push(DiffLine { kind: DiffLineKind::Ctx, text: text.to_string() });
+                h.lines.push(DiffLine {
+                    kind: DiffLineKind::Ctx,
+                    text: text.to_string(),
+                });
             }
         }
     }
@@ -773,7 +795,9 @@ pub async fn get_note(
     validate_sha(&q.commit)?;
     let notes_ref = q.r#ref.as_deref().unwrap_or("refs/notes/commits");
     if !is_valid_notes_ref(notes_ref) {
-        return Err(Error::BadRequest(format!("invalid notes ref: {notes_ref:?}")));
+        return Err(Error::BadRequest(format!(
+            "invalid notes ref: {notes_ref:?}"
+        )));
     }
     let (rc, stdout, stderr) = run_git(
         &git_dir,
@@ -810,13 +834,8 @@ use helpers::{dir_size, is_valid_notes_ref, validate_path, validate_ref_or_sha};
 /// of an error; a repo with orphan branches but no HEAD is rare enough
 /// that we don't count those.
 async fn count_commits_from_head(git_dir: &Path) -> Result<u64> {
-    let (rc, stdout, _stderr) = run_git(
-        git_dir,
-        &["rev-list", "--count", "HEAD"],
-        &[],
-        None,
-    )
-    .await?;
+    let (rc, stdout, _stderr) =
+        run_git(git_dir, &["rev-list", "--count", "HEAD"], &[], None).await?;
     if rc != 0 {
         return Ok(0);
     }
@@ -874,4 +893,3 @@ fn count_forks_of(
 ) -> std::io::Result<u64> {
     Ok(list_forks_of(repos_dir, repo_id, cache)?.len() as u64)
 }
-

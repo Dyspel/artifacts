@@ -5,9 +5,7 @@
 //! y starts at 0 so quiet idle stays visible at the baseline rather
 //! than auto-ranging and rescaling every frame.
 
-use crate::metrics::{
-    fmt_ms, interval_percentile_points, last_interval_percentiles, rate_points,
-};
+use crate::metrics::{fmt_ms, interval_percentile_points, last_interval_percentiles, rate_points};
 use crate::state::{Sample, StateSnapshot, HISTORY_WINDOW_SECS};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};

@@ -152,7 +152,9 @@ impl FsRefStore {
 impl RefStore for FsRefStore {
     async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
         let git_dir = self.repo_path(repo_id);
-        let (rc, stdout, _) = crate::commits::run_git(&git_dir, &["rev-parse", "--verify", ref_name], &[], None).await?;
+        let (rc, stdout, _) =
+            crate::commits::run_git(&git_dir, &["rev-parse", "--verify", ref_name], &[], None)
+                .await?;
         if rc != 0 {
             return Ok(None);
         }
@@ -224,8 +226,7 @@ impl RefStore for FsRefStore {
             crate::commits::run_git(&git_dir, &["update-ref", "-d", ref_name, exp], &[], None)
                 .await?
         } else {
-            crate::commits::run_git(&git_dir, &["update-ref", "-d", ref_name], &[], None)
-                .await?
+            crate::commits::run_git(&git_dir, &["update-ref", "-d", ref_name], &[], None).await?
         };
         if rc == 0 {
             return Ok(CasOutcome::Updated);
@@ -313,7 +314,9 @@ impl MemRefStore {
 impl RefStore for MemRefStore {
     async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
         let g = self.lock();
-        Ok(g.refs.get(&(repo_id.to_string(), ref_name.to_string())).cloned())
+        Ok(g.refs
+            .get(&(repo_id.to_string(), ref_name.to_string()))
+            .cloned())
     }
 
     async fn cas_update(
@@ -602,7 +605,10 @@ mod tests {
         let git_dir = refs.repo_path(&repo);
         let sha = write_blob(&git_dir, b"hello");
 
-        let out = refs.cas_update(&repo, "refs/test/t", None, &sha).await.unwrap();
+        let out = refs
+            .cas_update(&repo, "refs/test/t", None, &sha)
+            .await
+            .unwrap();
         assert_eq!(out, CasOutcome::Updated);
         let r = refs.read(&repo, "refs/test/t").await.unwrap();
         assert_eq!(r.as_deref(), Some(sha.as_str()));
@@ -620,7 +626,14 @@ mod tests {
             let s = MemRefStore::new();
             // create
             assert_eq!(
-                s.cas_update("r", "refs/heads/x", None, "0123456789012345678901234567890123456789").await.unwrap(),
+                s.cas_update(
+                    "r",
+                    "refs/heads/x",
+                    None,
+                    "0123456789012345678901234567890123456789"
+                )
+                .await
+                .unwrap(),
                 CasOutcome::Updated,
             );
             // update under matching expected
@@ -703,11 +716,19 @@ mod tests {
             let s = MemRefStore::new();
             let oid_old = "0".repeat(40);
             let oid_new = "1".repeat(40);
-            s.cas_update("r", "refs/heads/x", None, &oid_old).await.unwrap();
-            s.cas_update("r", "refs/heads/x", Some(&oid_old), &oid_new).await.unwrap();
+            s.cas_update("r", "refs/heads/x", None, &oid_old)
+                .await
+                .unwrap();
+            s.cas_update("r", "refs/heads/x", Some(&oid_old), &oid_new)
+                .await
+                .unwrap();
             // Try deleting with the stale oid — should conflict and
             // return current.
-            match s.cas_delete("r", "refs/heads/x", Some(&oid_old)).await.unwrap() {
+            match s
+                .cas_delete("r", "refs/heads/x", Some(&oid_old))
+                .await
+                .unwrap()
+            {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_deref(), Some(oid_new.as_str()));
                 }
@@ -747,16 +768,12 @@ mod tests {
                 let h1 = tokio::spawn({
                     let r = ref_name.clone();
                     let oid = oid_a.clone();
-                    async move {
-                        s1.cas_update("r", &r, None, &oid).await.unwrap()
-                    }
+                    async move { s1.cas_update("r", &r, None, &oid).await.unwrap() }
                 });
                 let h2 = tokio::spawn({
                     let r = ref_name.clone();
                     let oid = oid_b.clone();
-                    async move {
-                        s2.cas_update("r", &r, None, &oid).await.unwrap()
-                    }
+                    async move { s2.cas_update("r", &r, None, &oid).await.unwrap() }
                 });
                 let r1 = h1.await.unwrap();
                 let r2 = h2.await.unwrap();
@@ -798,10 +815,7 @@ mod tests {
             assert!(w[0].name <= w[1].name, "list not sorted: {:?}", names);
         }
         // Filter by prefix.
-        let only_test = refs
-            .list(&repo, &["refs/test/".to_string()])
-            .await
-            .unwrap();
+        let only_test = refs.list(&repo, &["refs/test/".to_string()]).await.unwrap();
         assert!(only_test.iter().all(|e| e.name.starts_with("refs/test/")));
         assert_eq!(only_test.len(), 2);
     }
@@ -856,15 +870,17 @@ mod tests {
         std::fs::write(git_dir.join("packed-refs"), packed_text).unwrap();
         // Loose conflict overrides the packed entry.
         std::fs::create_dir_all(git_dir.join("refs/test")).unwrap();
-        std::fs::write(git_dir.join("refs/test/conflict"), format!("{s_loose}\n"))
-            .unwrap();
+        std::fs::write(git_dir.join("refs/test/conflict"), format!("{s_loose}\n")).unwrap();
 
         let all = refs.list(&repo, &[]).await.unwrap();
         let by_name: std::collections::HashMap<&str, &str> = all
             .iter()
             .map(|e| (e.name.as_str(), e.oid.as_str()))
             .collect();
-        assert_eq!(by_name.get("refs/test/packed-only"), Some(&s_packed.as_str()));
+        assert_eq!(
+            by_name.get("refs/test/packed-only"),
+            Some(&s_packed.as_str())
+        );
         assert_eq!(by_name.get("refs/test/conflict"), Some(&s_loose.as_str()));
     }
 
@@ -900,16 +916,24 @@ mod tests {
 
         // create
         assert_eq!(
-            refs.cas_update(&repo, "refs/test/x", None, &s1).await.unwrap(),
+            refs.cas_update(&repo, "refs/test/x", None, &s1)
+                .await
+                .unwrap(),
             CasOutcome::Updated
         );
         // expected=s1 -> succeeds, now at s2
         assert_eq!(
-            refs.cas_update(&repo, "refs/test/x", Some(&s1), &s2).await.unwrap(),
+            refs.cas_update(&repo, "refs/test/x", Some(&s1), &s2)
+                .await
+                .unwrap(),
             CasOutcome::Updated
         );
         // expected=s1 (stale) -> conflict, current should be s2
-        match refs.cas_update(&repo, "refs/test/x", Some(&s1), &s3).await.unwrap() {
+        match refs
+            .cas_update(&repo, "refs/test/x", Some(&s1), &s3)
+            .await
+            .unwrap()
+        {
             CasOutcome::Conflict { current } => {
                 assert_eq!(current.as_deref(), Some(s2.as_str()));
             }

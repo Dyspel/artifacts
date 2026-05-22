@@ -39,7 +39,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     git_wire::proto::{
-        parse_ls_refs_only, parse_receive_pack_body, parse_v2_fetch, RefUpdate, ReceivePackRequest,
+        parse_ls_refs_only, parse_receive_pack_body, parse_v2_fetch, ReceivePackRequest, RefUpdate,
     },
     git_wire::v2::{native_ls_refs_response, native_v2_fetch_response},
     pkt_line::{self as pkt},
@@ -115,13 +115,7 @@ pub async fn git_handler(
             // we always serve it natively unless the kill-switch
             // is on, in which case we shell out for parity with
             // the v0/v1 path.
-            info_refs(
-                &repo_path,
-                service,
-                request.headers(),
-                state.disable_native,
-            )
-            .await
+            info_refs(&repo_path, service, request.headers(), state.disable_native).await
         }
         ("POST", "git-upload-pack") => {
             pack_handler(&repo_path, "upload-pack", request, native_ctx).await
@@ -166,9 +160,7 @@ fn service_from_query(query: &str) -> Result<&'static str> {
             return match v {
                 "git-upload-pack" => Ok("git-upload-pack"),
                 "git-receive-pack" => Ok("git-receive-pack"),
-                other => Err(Error::BadRequest(format!(
-                    "unsupported service {other:?}"
-                ))),
+                other => Err(Error::BadRequest(format!("unsupported service {other:?}"))),
             };
         }
     }
@@ -256,7 +248,8 @@ async fn info_refs(
         .expect("service validated by service_from_query");
 
     let mut cmd = Command::new("git");
-    cmd.args([sub, "--stateless-rpc", "--advertise-refs"]).arg(repo_path);
+    cmd.args([sub, "--stateless-rpc", "--advertise-refs"])
+        .arg(repo_path);
     if let Some(gp) = headers.get("git-protocol").and_then(|v| v.to_str().ok()) {
         cmd.env("GIT_PROTOCOL", gp);
     }
@@ -351,10 +344,8 @@ async fn pack_handler(
                         pack_bytes = req.pack.len(),
                         "native receive-pack (no subprocess)"
                     );
-                    return native_receive_pack_response(
-                        repo_path, repo_id, refs, objects, req,
-                    )
-                    .await;
+                    return native_receive_pack_response(repo_path, repo_id, refs, objects, req)
+                        .await;
                 }
                 Some(req) => {
                     tracing::debug!(
@@ -561,7 +552,10 @@ async fn native_receive_pack_response(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-receive-pack-result")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-result",
+        )
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(body))
         .map_err(|e| Error::Other(anyhow::anyhow!("build response: {e}")))
@@ -578,7 +572,8 @@ async fn apply_ref_update(
         // CAS delete with the client's expected old-OID. If the ref
         // moved between the client's last fetch and this push,
         // RefStore returns Conflict and we report non-fast-forward.
-        refs.cas_delete(repo_id, &u.name, Some(u.old.as_str())).await
+        refs.cas_delete(repo_id, &u.name, Some(u.old.as_str()))
+            .await
     } else {
         let expected = if u.is_create() {
             None
@@ -603,10 +598,7 @@ async fn apply_ref_update(
 /// each contained object as a loose object under `<git-dir>/objects/`.
 /// Used for the pack-side of native receive-pack until M1b-3-gix
 /// swaps in `gix-pack`'s native pack-indexing.
-async fn unpack_objects_via_subprocess(
-    repo_path: &Path,
-    pack_bytes: &[u8],
-) -> Result<()> {
+async fn unpack_objects_via_subprocess(repo_path: &Path, pack_bytes: &[u8]) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("--git-dir")
         .arg(repo_path)
@@ -753,20 +745,21 @@ mod tests {
         );
         // Extract the body synchronously; response was built from a Vec<u8>
         // so we know it's fully in memory.
-        let body = futures::executor::block_on(axum::body::to_bytes(
-            resp.into_body(),
-            1024 * 1024,
-        ))
-        .unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         // Preamble.
-        assert!(s.starts_with("001e# service=git-upload-pack\n0000"),
-            "unexpected preamble, got: {:?}", &s[..40.min(s.len())]);
+        assert!(
+            s.starts_with("001e# service=git-upload-pack\n0000"),
+            "unexpected preamble, got: {:?}",
+            &s[..40.min(s.len())]
+        );
         // Version line + terminating flush-pkt.
-        assert!(s.contains("000eversion 2\n"),
-            "missing v2 version line in {s:?}");
-        assert!(s.ends_with("0000"),
-            "missing trailing flush-pkt in {s:?}");
+        assert!(
+            s.contains("000eversion 2\n"),
+            "missing v2 version line in {s:?}"
+        );
+        assert!(s.ends_with("0000"), "missing trailing flush-pkt in {s:?}");
         // Fetch capability must be present so clients actually negotiate
         // a fetch with us (without this the client errors out).
         assert!(s.contains("fetch=shallow\n"));
@@ -787,5 +780,4 @@ mod tests {
         assert!(service_from_query("service=git-unknown").is_err());
         assert!(service_from_query("nothing=here").is_err());
     }
-
 }

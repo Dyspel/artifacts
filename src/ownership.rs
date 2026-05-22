@@ -146,21 +146,20 @@ pub struct SqliteOwnershipStore {
     conn: Arc<TokioMutex<Connection>>,
 }
 
-const MIGRATIONS: [crate::db_migrate::Migration; 1] =
-    [crate::db_migrate::Migration {
-        version: 1,
-        name: "init",
-        up: |c| {
-            c.execute_batch(
-                "CREATE TABLE IF NOT EXISTS repos (
+const MIGRATIONS: [crate::db_migrate::Migration; 1] = [crate::db_migrate::Migration {
+    version: 1,
+    name: "init",
+    up: |c| {
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS repos (
                      id             TEXT PRIMARY KEY,
                      owner_subject  TEXT,
                      created_at     INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_subject);",
-            )
-        },
-    }];
+        )
+    },
+}];
 
 impl SqliteOwnershipStore {
     pub fn open(path: &Path) -> Result<Self> {
@@ -192,8 +191,7 @@ impl OwnershipStore for SqliteOwnershipStore {
 
     async fn get_owner(&self, repo_id: &str) -> Result<Option<Option<String>>> {
         let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
-        let mut stmt =
-            conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -211,8 +209,8 @@ impl OwnershipStore for SqliteOwnershipStore {
 
     async fn count_by_owner(&self, subject: &str) -> Result<u64> {
         let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
-        let mut stmt = conn
-            .prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
         let mut rows = stmt.query(params![subject])?;
         let row = rows.next()?.expect("COUNT(*) always returns one row");
         let n: i64 = row.get(0)?;
@@ -307,16 +305,13 @@ impl OwnershipStore for SqliteOwnershipStore {
              ORDER BY created_at DESC
              LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(
-            params![subject, limit as i64, offset as i64],
-            |row| {
-                Ok(RepoRow {
-                    id: row.get(0)?,
-                    owner: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![subject, limit as i64, offset as i64], |row| {
+            Ok(RepoRow {
+                id: row.get(0)?,
+                owner: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -326,9 +321,8 @@ impl OwnershipStore for SqliteOwnershipStore {
 
     async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>> {
         let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, owner_subject, created_at FROM repos WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT id, owner_subject, created_at FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -568,14 +562,18 @@ mod tests {
         for i in 0..5 {
             store.record_owner(&format!("r{i}"), None).await.unwrap();
         }
-        check_repo_quota(&store, &Principal::Admin, 0).await.unwrap();
+        check_repo_quota(&store, &Principal::Admin, 0)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn quota_user_allowed_under_limit() {
         let (_d, store) = fresh_store();
         store.record_owner("r1", Some("alice")).await.unwrap();
-        let alice = Principal::User { subject: "alice".into() };
+        let alice = Principal::User {
+            subject: "alice".into(),
+        };
         check_repo_quota(&store, &alice, 5).await.unwrap();
     }
 
@@ -583,9 +581,14 @@ mod tests {
     async fn quota_user_rejected_at_limit() {
         let (_d, store) = fresh_store();
         for i in 0..3u32 {
-            store.record_owner(&format!("r{i}"), Some("alice")).await.unwrap();
+            store
+                .record_owner(&format!("r{i}"), Some("alice"))
+                .await
+                .unwrap();
         }
-        let alice = Principal::User { subject: "alice".into() };
+        let alice = Principal::User {
+            subject: "alice".into(),
+        };
         let r = check_repo_quota(&store, &alice, 3).await;
         assert!(matches!(
             r,
@@ -853,8 +856,8 @@ mod tests {
         //! the parameter space — small N, large N, L > N, L equal to N,
         //! and so on. Case count is capped low so the SQLite-per-case
         //! cost doesn't blow up the test runtime.
-        use super::super::SqliteOwnershipStore;
         use super::super::OwnershipStore;
+        use super::super::SqliteOwnershipStore;
         use proptest::prelude::*;
         use std::collections::HashSet;
         use tempfile::TempDir;

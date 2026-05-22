@@ -76,7 +76,9 @@ pub fn basic_token(headers: &HeaderMap) -> Result<String> {
         .ok_or(Error::UnauthorizedBasic)?
         .to_str()
         .map_err(|_| Error::UnauthorizedBasic)?;
-    let b64 = value.strip_prefix("Basic ").ok_or(Error::UnauthorizedBasic)?;
+    let b64 = value
+        .strip_prefix("Basic ")
+        .ok_or(Error::UnauthorizedBasic)?;
     let decoded = STANDARD.decode(b64).map_err(|_| Error::UnauthorizedBasic)?;
     let decoded = std::str::from_utf8(&decoded).map_err(|_| Error::UnauthorizedBasic)?;
     // username:password — we accept any username; the password is the token.
@@ -139,9 +141,7 @@ pub fn authorize_rest(
         .ok_or(Error::Unauthorized)?
         .to_str()
         .map_err(|_| Error::Unauthorized)?;
-    let presented = value
-        .strip_prefix("Bearer ")
-        .ok_or(Error::Unauthorized)?;
+    let presented = value.strip_prefix("Bearer ").ok_or(Error::Unauthorized)?;
 
     // Admin path: constant-time compare, with length-gating so ct_eq
     // doesn't immediately fail on length mismatch.
@@ -256,11 +256,7 @@ mod tests {
         // A git-client-style Basic credential should not authorize REST,
         // even if the password half matches the admin token.
         let b64 = STANDARD.encode("x:sekret");
-        let r = authorize_rest(
-            &headers(Some(&format!("Basic {b64}"))),
-            "sekret",
-            None,
-        );
+        let r = authorize_rest(&headers(Some(&format!("Basic {b64}"))), "sekret", None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -277,5 +273,4 @@ mod tests {
             Err(Error::Unauthorized)
         ));
     }
-
 }

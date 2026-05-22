@@ -184,11 +184,7 @@ pub trait ObjectStore: Send + Sync {
     /// default since the production blob-read path doesn't exercise
     /// them; if a future production KV backend needs it, override
     /// there too.
-    fn read_object(
-        &self,
-        _repo_id: &str,
-        _oid: &str,
-    ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    fn read_object(&self, _repo_id: &str, _oid: &str) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         Err(Error::Other(anyhow::anyhow!(
             "read_object: not supported by this ObjectStore backend"
         )))
@@ -240,9 +236,9 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.loose_path(repo_id, oid).ok_or_else(|| {
-            Error::Other(anyhow::anyhow!("write_loose: invalid oid {oid:?}"))
-        })?;
+        let path = self
+            .loose_path(repo_id, oid)
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("write_loose: invalid oid {oid:?}")))?;
         // Idempotent — content-addressed storage means the same oid
         // implies the same bytes. Skip the rewrite to save the syscall
         // and avoid the rename race that brief existence would imply.
@@ -259,7 +255,12 @@ impl ObjectStore for FsObjectStore {
         // suffix so concurrent writers of the same object don't
         // collide on the tmp path.
         let parent = path.parent().expect("loose_path has 2-component prefix");
-        let tmp_name = format!(".tmp-{}-{}-{}", std::process::id(), rand::random::<u32>(), oid);
+        let tmp_name = format!(
+            ".tmp-{}-{}-{}",
+            std::process::id(),
+            rand::random::<u32>(),
+            oid
+        );
         let tmp = parent.join(tmp_name);
         std::fs::write(&tmp, bytes)?;
         match std::fs::rename(&tmp, &path) {
@@ -328,9 +329,9 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        let path = self.loose_path(repo_id, oid).ok_or_else(|| {
-            Error::Other(anyhow::anyhow!("delete_loose: invalid oid {oid:?}"))
-        })?;
+        let path = self
+            .loose_path(repo_id, oid)
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("delete_loose: invalid oid {oid:?}")))?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -391,11 +392,7 @@ impl ObjectStore for FsObjectStore {
         Ok(0)
     }
 
-    fn read_object(
-        &self,
-        repo_id: &str,
-        oid: &str,
-    ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    fn read_object(&self, repo_id: &str, oid: &str) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         // Override the loose-only default so packed objects resolve
         // too. Mirrors `exists()`'s shape: cheap path-validity check
         // first, then open the repo through gix and let its object
@@ -434,9 +431,7 @@ fn read_object_fs_inner(
         // `Find::NotFound` for absent objects — translate to None.
         // Any other error (corruption, IO) bubbles.
         Err(gix::object::find::existing::Error::Find(_)) => Ok(None),
-        Err(e) => Err(Error::Other(anyhow::anyhow!(
-            "gix find_object({oid}): {e}"
-        ))),
+        Err(e) => Err(Error::Other(anyhow::anyhow!("gix find_object({oid}): {e}"))),
     };
     result
 }
@@ -512,7 +507,6 @@ impl MemObjectStore {
             objects: RwLock::new(HashMap::new()),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -822,9 +816,7 @@ impl ObjectStore for SqliteObjectStore {
             decode_buf.clear();
             let (data, _location) = bundle
                 .get_object_by_index(idx, &mut decode_buf, &mut inflate, &mut cache)
-                .map_err(|e| {
-                    Error::Other(anyhow::anyhow!("decode pack entry {oid_hex}: {e}"))
-                })?;
+                .map_err(|e| Error::Other(anyhow::anyhow!("decode pack entry {oid_hex}: {e}")))?;
             // Re-encode as the canonical loose-object format
             // (`<kind> <size>\0<payload>`, zlib-deflated) so a future
             // `read_object` impl can inflate + parse the header the
@@ -853,8 +845,7 @@ impl ObjectStore for SqliteObjectStore {
 #[cfg(test)]
 fn zlib_deflate_loose(input: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write as _;
-    let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(input)
         .map_err(|e| Error::Other(anyhow::anyhow!("zlib write: {e}")))?;

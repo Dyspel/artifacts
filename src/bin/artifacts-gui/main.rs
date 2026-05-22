@@ -170,9 +170,7 @@ impl eframe::App for App {
                         self.select_repo(clicked);
                     }
                 }
-                View::Detail => {
-                    detail::render_detail(ui, &snapshot, self.selected_repo.as_deref())
-                }
+                View::Detail => detail::render_detail(ui, &snapshot, self.selected_repo.as_deref()),
             }
         });
     }

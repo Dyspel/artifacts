@@ -170,7 +170,9 @@ pub async fn merge_branches(
         Some(t) => is_ancestor(&git_dir, t, &source_sha).await?,
     };
     if ff_available && body.strategy != Strategy::Merge {
-        match state.data.refs
+        match state
+            .data
+            .refs
             .cas_update(&repo_id, &target_ref, target_sha.as_deref(), &source_sha)
             .await?
         {
@@ -273,7 +275,9 @@ pub async fn merge_branches(
     let commit_sha = String::from_utf8(stdout)?.trim().to_string();
 
     // 8. CAS the target ref.
-    match state.data.refs
+    match state
+        .data
+        .refs
         .cas_update(&repo_id, &target_ref, Some(&target_sha), &commit_sha)
         .await?
     {
@@ -315,8 +319,13 @@ pub async fn merge_branches(
 async fn resolve_ref(git_dir: &std::path::Path, ref_name: &str) -> Result<Option<String>> {
     // `show-ref --verify --hash <ref>` prints the SHA if the ref exists,
     // exits 1 if it doesn't. We treat exit 1 as "missing" (normal flow).
-    let (rc, stdout, stderr) =
-        run_git(git_dir, &["show-ref", "--verify", "--hash", ref_name], &[], None).await?;
+    let (rc, stdout, stderr) = run_git(
+        git_dir,
+        &["show-ref", "--verify", "--hash", ref_name],
+        &[],
+        None,
+    )
+    .await?;
     if rc == 0 {
         return Ok(Some(String::from_utf8(stdout)?.trim().to_string()));
     }
@@ -403,7 +412,9 @@ async fn run_merge_tree(
             "merge-tree produced no NUL-terminated tree sha"
         ))
     })?;
-    let tree = String::from_utf8(stdout[..nul].to_vec())?.trim().to_string();
+    let tree = String::from_utf8(stdout[..nul].to_vec())?
+        .trim()
+        .to_string();
 
     if rc == 0 {
         return Ok(MergeTreeOutcome::Clean { tree });

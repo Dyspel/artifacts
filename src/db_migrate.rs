@@ -55,11 +55,7 @@ pub struct Migration {
 /// owner. Two owners can share one SQLite file (tokens.db has both
 /// `tokens` and `ownership` namespaces today); the version counter is
 /// per-namespace.
-pub fn run(
-    conn: &Connection,
-    namespace: &str,
-    migrations: &[Migration],
-) -> Result<()> {
+pub fn run(conn: &Connection, namespace: &str, migrations: &[Migration]) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
              namespace  TEXT    NOT NULL,
@@ -176,9 +172,7 @@ mod tests {
             Migration {
                 version: 1,
                 name: "init",
-                up: |c| {
-                    c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-                },
+                up: |c| c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"),
             },
             Migration {
                 version: 2,
@@ -195,9 +189,13 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(rows, vec![(1, "init".to_string()), (2, "add_col".to_string())]);
+        assert_eq!(
+            rows,
+            vec![(1, "init".to_string()), (2, "add_col".to_string())]
+        );
         // Schema is the expected shape.
-        conn.execute("INSERT INTO t (v, extra) VALUES ('a', 'b')", []).unwrap();
+        conn.execute("INSERT INTO t (v, extra) VALUES ('a', 'b')", [])
+            .unwrap();
     }
 
     #[test]
@@ -217,7 +215,8 @@ mod tests {
     #[test]
     fn add_column_if_missing_is_idempotent() {
         let conn = open_mem();
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
         // Both calls succeed; second is the "already there" branch.
         add_column_if_missing(&conn, "t", "c", "TEXT").unwrap();
         add_column_if_missing(&conn, "t", "c", "TEXT").unwrap();

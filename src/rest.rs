@@ -40,13 +40,12 @@ use std::sync::Arc;
 // Re-exports so existing `crate::rest::name` imports (main.rs router,
 // other handler modules) keep working after the split.
 pub use admin::{
-    admin_audit_stats, admin_gc_preview, admin_gc_run, admin_get_repo,
-    admin_list_audit, admin_list_repos, admin_rotate_token,
-    admin_rotate_webhook_key, admin_verify_audit_chain,
+    admin_audit_stats, admin_gc_preview, admin_gc_run, admin_get_repo, admin_list_audit,
+    admin_list_repos, admin_rotate_token, admin_rotate_webhook_key, admin_verify_audit_chain,
 };
 pub use health::{health, health_ready};
 pub use repos::{create_repo, delete_repo, fork_repo, list_repos};
-pub use tokens::{mint_token, list_tokens, revoke_token, rotate_tokens};
+pub use tokens::{list_tokens, mint_token, revoke_token, rotate_tokens};
 pub use webhooks::{create_webhook, delete_webhook, list_webhooks};
 
 /// Data plane: every store/cache that holds repo content or metadata.
@@ -207,7 +206,9 @@ pub(crate) fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()
         state.cfg.jwt_secret.as_deref(),
     )?;
     if !matches!(principal, crate::auth::Principal::Admin) {
-        return Err(Error::Forbidden("admin inspection endpoints require admin auth"));
+        return Err(Error::Forbidden(
+            "admin inspection endpoints require admin auth",
+        ));
     }
     Ok(())
 }
@@ -281,11 +282,7 @@ pub(crate) fn list_refs(repo_path: &std::path::Path) -> std::io::Result<Vec<RefE
     Ok(out)
 }
 
-fn walk_refs(
-    dir: &std::path::Path,
-    prefix: &str,
-    out: &mut Vec<RefEntry>,
-) -> std::io::Result<()> {
+fn walk_refs(dir: &std::path::Path, prefix: &str, out: &mut Vec<RefEntry>) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }

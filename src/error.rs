@@ -122,14 +122,17 @@ impl IntoResponse for Error {
                         "retryAfter": retry_after_secs,
                     }
                 }));
-                let mut resp =
-                    (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
                 if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
                     resp.headers_mut().insert(header::RETRY_AFTER, v);
                 }
                 return resp;
             }
-            Error::RefConflict { branch, expected, current } => {
+            Error::RefConflict {
+                branch,
+                expected,
+                current,
+            } => {
                 // Dedicated 409 with the current + expected SHAs so callers
                 // can re-read and retry without a second round trip.
                 let body = Json(json!({
@@ -162,7 +165,11 @@ impl IntoResponse for Error {
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
             }
-            Error::MergeConflict { target_branch, source_branch, conflict_paths } => {
+            Error::MergeConflict {
+                target_branch,
+                source_branch,
+                conflict_paths,
+            } => {
                 // 409 with the paths that failed to merge so the caller can
                 // surface them directly in a UI or resolve server-side by
                 // re-issuing with explicit content.
@@ -215,10 +222,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let mut headers = serde_json::Map::new();
         for (k, val) in parts.headers.iter() {
-            headers.insert(
-                k.as_str().to_string(),
-                json!(val.to_str().unwrap_or("")),
-            );
+            headers.insert(k.as_str().to_string(), json!(val.to_str().unwrap_or("")));
         }
         json!({
             "status": parts.status.as_u16(),
@@ -229,7 +233,10 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_emits_429_and_retry_after_header() {
-        let resp = Error::RateLimited { retry_after_secs: 30 }.into_response();
+        let resp = Error::RateLimited {
+            retry_after_secs: 30,
+        }
+        .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["status"], 429);
         assert_eq!(v["headers"]["retry-after"], "30");

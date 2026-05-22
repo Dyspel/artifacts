@@ -54,10 +54,7 @@ use std::sync::atomic::AtomicBool;
 /// already handled before this function is called; defensive here
 /// so a future caller doesn't accidentally feed us 32 bytes and
 /// get a confusing "wrote a pack with zero objects" file.
-pub fn index_pack_into_repo(
-    repo_path: &Path,
-    pack_bytes: &[u8],
-) -> Result<()> {
+pub fn index_pack_into_repo(repo_path: &Path, pack_bytes: &[u8]) -> Result<()> {
     if pack_bytes.len() <= 32 {
         return Ok(());
     }
@@ -104,11 +101,7 @@ pub fn index_pack_into_repo(
 
 /// Build a packfile containing every object reachable from `wants`
 /// but not from `haves`, suitable for the v2 fetch response.
-pub fn generate_pack(
-    repo_path: &Path,
-    wants: &[String],
-    haves: &[String],
-) -> Result<Vec<u8>> {
+pub fn generate_pack(repo_path: &Path, wants: &[String], haves: &[String]) -> Result<Vec<u8>> {
     if wants.is_empty() {
         return Ok(empty_pack_bytes());
     }
@@ -160,8 +153,7 @@ pub fn generate_pack(
         // win is marginal.
         thread_limit: Some(1),
         chunk_size: 16,
-        input_object_expansion:
-            output::count::objects::ObjectExpansion::TreeContents,
+        input_object_expansion: output::count::objects::ObjectExpansion::TreeContents,
     };
     let progress = prodash::progress::Discard;
     let ids_iter: Box<
@@ -183,14 +175,9 @@ pub fn generate_pack(
     // "BUG: handle must be configured to prevent_pack_unload()".
     let mut db = repo.objects.clone().into_inner();
     db.prevent_pack_unload();
-    let (counts, _outcome) = output::count::objects(
-        db.clone(),
-        ids_iter,
-        &progress,
-        &interrupt,
-        count_options,
-    )
-    .map_err(|e| Error::Other(anyhow::anyhow!("pack count: {e}")))?;
+    let (counts, _outcome) =
+        output::count::objects(db.clone(), ids_iter, &progress, &interrupt, count_options)
+            .map_err(|e| Error::Other(anyhow::anyhow!("pack count: {e}")))?;
 
     if counts.is_empty() {
         return Ok(empty_pack_bytes());

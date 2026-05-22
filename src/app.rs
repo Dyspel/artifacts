@@ -16,8 +16,9 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::{
-    alternates_cache, audit, commits, config::Config, events, ip_rate_limit, merge, metrics,
-    object_store,
+    alternates_cache, audit, commits,
+    config::Config,
+    events, ip_rate_limit, merge, metrics, object_store,
     ownership::{self, OwnershipStore, SqliteOwnershipStore},
     rate_limit::{self, RateLimiter},
     reads,
@@ -205,8 +206,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // runs (startup-time gauges, middleware). Fallible because
     // registration can fail (duplicate name, bad matcher) — surface a
     // clean error instead of a panic.
-    let prom_handle =
-        metrics::init().map_err(|e| anyhow::anyhow!("metrics init failed: {e:#}"))?;
+    let prom_handle = metrics::init().map_err(|e| anyhow::anyhow!("metrics init failed: {e:#}"))?;
     std::fs::create_dir_all(&data_dir)?;
     let storage: Arc<dyn Storage> = Arc::new(FsStorage::new(cfg.repos_dir())?);
     // Object-store seam: gc reads/writes/lists/deletes loose objects
@@ -248,7 +248,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // fail the underlying mutation).
     let audit_db_path = data_dir.join("audit.db");
     tracing::info!(path = %audit_db_path.display(), "opening audit db");
-    let audit: Arc<dyn audit::AuditStore> = Arc::new(audit::SqliteAuditStore::open(&audit_db_path)?);
+    let audit: Arc<dyn audit::AuditStore> =
+        Arc::new(audit::SqliteAuditStore::open(&audit_db_path)?);
     // Hourly retention sweep — same cadence as the token-prune task.
     // `0` days from the CLI flag disables pruning, which
     // `spawn_prune_task` honors by not spawning at all.
@@ -424,7 +425,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let rest_router = Router::new()
         .merge(health_router)
         .route("/v1/repos", post(rest::create_repo).get(rest::list_repos))
-        .route("/v1/repos/:id", delete(rest::delete_repo).get(reads::get_repo))
+        .route(
+            "/v1/repos/:id",
+            delete(rest::delete_repo).get(reads::get_repo),
+        )
         .route("/v1/repos/:id/forks", post(rest::fork_repo))
         .route(
             "/v1/repos/:id/tokens",
@@ -475,7 +479,10 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     let metrics_route = {
         let handle = prom_handle.clone();
-        Router::new().route("/metrics", get(move || async move { metrics::render(&handle) }))
+        Router::new().route(
+            "/metrics",
+            get(move || async move { metrics::render(&handle) }),
+        )
     };
 
     let app = rest_router
@@ -643,8 +650,7 @@ async fn shutdown_signal(
         );
         tokio::time::sleep(drain_delay).await;
     }
-    *drain_started.lock().expect("drain_started mutex poisoned") =
-        Some(std::time::Instant::now());
+    *drain_started.lock().expect("drain_started mutex poisoned") = Some(std::time::Instant::now());
 }
 
 /// Classify the drain outcome for the `server.shutdown` audit event.
@@ -777,7 +783,10 @@ mod bind_safety_tests {
         let r = check_bind_safety("0.0.0.0:8787", "http://0.0.0.0:8787", false, false);
         assert!(r.is_err(), "expected refusal, got {r:?}");
         let msg = r.unwrap_err().to_string();
-        assert!(msg.contains("--tls-cert"), "error should mention TLS path: {msg}");
+        assert!(
+            msg.contains("--tls-cert"),
+            "error should mention TLS path: {msg}"
+        );
     }
 
     #[test]
@@ -796,7 +805,10 @@ mod shutdown_classification_tests {
 
     #[test]
     fn no_drain_started_is_graceful() {
-        assert_eq!(classify_shutdown_kind(None, Duration::from_secs(30)), "graceful");
+        assert_eq!(
+            classify_shutdown_kind(None, Duration::from_secs(30)),
+            "graceful"
+        );
     }
 
     #[test]

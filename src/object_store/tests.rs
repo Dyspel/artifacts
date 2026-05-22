@@ -93,11 +93,13 @@ fn fs_exists_finds_packed_objects() {
     // wrap it in a commit. Reuse hash-object → write-tree → commit-tree.
     let tree_oid = {
         let out = Command::new("git")
-            .arg("--git-dir").arg(&git_dir)
+            .arg("--git-dir")
+            .arg(&git_dir)
             .args(["mktree"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
         use std::io::Write as _;
         let mut out = out;
         writeln!(out.stdin.as_mut().unwrap(), "100644 blob {oid}\thello.txt").unwrap();
@@ -106,24 +108,30 @@ fn fs_exists_finds_packed_objects() {
     };
     let commit_oid = {
         let out = Command::new("git")
-            .arg("--git-dir").arg(&git_dir)
+            .arg("--git-dir")
+            .arg(&git_dir)
             .args(["commit-tree", &tree_oid, "-m", "t"])
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output().unwrap();
+            .output()
+            .unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     };
     Command::new("git")
-        .arg("--git-dir").arg(&git_dir)
+        .arg("--git-dir")
+        .arg(&git_dir)
         .args(["update-ref", "refs/heads/main", &commit_oid])
-        .status().unwrap();
+        .status()
+        .unwrap();
     // Repack + prune: blob moves from objects/<aa>/<bb...> into a packfile.
     Command::new("git")
-        .arg("--git-dir").arg(&git_dir)
+        .arg("--git-dir")
+        .arg(&git_dir)
         .args(["repack", "-ad"])
-        .status().unwrap();
+        .status()
+        .unwrap();
     // The loose path is gone now.
     let loose_path = store.loose_path(&repo_id, &oid).unwrap();
     assert!(
@@ -487,7 +495,10 @@ fn sqlite_ingest_pack_round_trips_a_thick_pack() {
     )
     .unwrap();
     let tree_out = tree_proc.wait_with_output().unwrap();
-    let tree_oid = String::from_utf8(tree_out.stdout).unwrap().trim().to_string();
+    let tree_oid = String::from_utf8(tree_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     // Commit pointing at the tree.
     let commit_out = Command::new("git")
         .args(["--git-dir"])
@@ -511,13 +522,20 @@ fn sqlite_ingest_pack_round_trips_a_thick_pack() {
         native_pack::generate_pack(git_dir, std::slice::from_ref(&commit_oid), &[]).unwrap();
     // Sanity: pack header + at least three entries (commit/tree/blob)
     // + trailer comes out well above the 32-byte short-circuit cap.
-    assert!(pack_bytes.len() > 32, "pack too small: {}", pack_bytes.len());
+    assert!(
+        pack_bytes.len() > 32,
+        "pack too small: {}",
+        pack_bytes.len()
+    );
 
     // 3. Ingest into a fresh chunked-KV-shaped store.
     let kv_tmp = tempfile::tempdir().unwrap();
     let store = SqliteObjectStore::open(&kv_tmp.path().join("objects.db")).unwrap();
     let count = store.ingest_pack("r", &pack_bytes).unwrap();
-    assert_eq!(count, 3, "expected 3 objects (commit + tree + blob), got {count}");
+    assert_eq!(
+        count, 3,
+        "expected 3 objects (commit + tree + blob), got {count}"
+    );
 
     // 4. Every oid the pack carried is now resolvable via the trait.
     //    `read_loose` returns the zlib-deflated loose bytes (the same

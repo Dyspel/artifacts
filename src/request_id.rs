@@ -55,10 +55,8 @@ pub async fn instrument(req: Request, next: Next) -> Response {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if let Ok(v) = HeaderValue::from_str(&id) {
-            resp.headers_mut().insert(
-                axum::http::HeaderName::from_static("x-request-id"),
-                v,
-            );
+            resp.headers_mut()
+                .insert(axum::http::HeaderName::from_static("x-request-id"), v);
         }
 
         // One-line structured summary. info! at ERROR for 5xx so ops
@@ -88,7 +86,10 @@ fn extract_or_generate_id(req: &Request) -> String {
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty() && s.len() <= 128)
-        .filter(|s| s.chars().all(|c| c.is_ascii_graphic() || c == '-' || c == '_'))
+        .filter(|s| {
+            s.chars()
+                .all(|c| c.is_ascii_graphic() || c == '-' || c == '_')
+        })
         .map(str::to_string);
     provided.unwrap_or_else(|| Uuid::new_v4().simple().to_string())
 }
@@ -96,8 +97,8 @@ fn extract_or_generate_id(req: &Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue as HV, Method, Uri};
     use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue as HV, Method, Uri};
 
     fn req_with(header: Option<&str>) -> Request {
         let mut req = Request::builder()
@@ -106,10 +107,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         if let Some(v) = header {
-            req.headers_mut().insert(
-                "x-request-id",
-                HV::from_str(v).unwrap(),
-            );
+            req.headers_mut()
+                .insert("x-request-id", HV::from_str(v).unwrap());
         }
         req
     }

@@ -42,7 +42,11 @@ use clap::{Parser, Subcommand};
 /// `main.rs` stays a stable launching pad for whatever subcommands
 /// land next.
 #[derive(Parser)]
-#[command(name = "artifacts", version, about = "Versioned filesystem that speaks Git")]
+#[command(
+    name = "artifacts",
+    version,
+    about = "Versioned filesystem that speaks Git"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

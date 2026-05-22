@@ -5,11 +5,7 @@
 //! catches a server that's running but can't serve traffic.
 
 use super::RestState;
-use crate::{
-    audit::AuditStore,
-    ownership::OwnershipStore,
-    tokens::TokenStore,
-};
+use crate::{audit::AuditStore, ownership::OwnershipStore, tokens::TokenStore};
 use axum::{extract::State, Json};
 
 /// GET /v1/health
@@ -42,7 +38,12 @@ pub async fn health_ready(
     if let Some(resp) = drain_response_if_draining(&state.runtime.draining) {
         return resp;
     }
-    probe_stores(&*state.authn.tokens, &*state.observ.audit, &*state.data.ownership).await
+    probe_stores(
+        &*state.authn.tokens,
+        &*state.observ.audit,
+        &*state.data.ownership,
+    )
+    .await
 }
 
 /// Pure helper: short-circuit readiness with `503 + {draining: true}`
@@ -106,7 +107,9 @@ async fn probe_stores(
         StatusCode::OK
     } else {
         tracing::warn!(
-            tokens_ok, audit_ok, ownership_ok,
+            tokens_ok,
+            audit_ok,
+            ownership_ok,
             "/v1/health/ready failing — orchestrator should refuse traffic"
         );
         StatusCode::SERVICE_UNAVAILABLE
@@ -143,14 +146,22 @@ mod tests {
 
     #[async_trait]
     impl TokenStore for StubTokenStore {
-        async fn mint(&self, _: &str, _: Scope, _: Option<Duration>, _: Option<&str>) -> Result<String> {
+        async fn mint(
+            &self,
+            _: &str,
+            _: Scope,
+            _: Option<Duration>,
+            _: Option<&str>,
+        ) -> Result<String> {
             unreachable!("health_ready does not mint")
         }
         async fn lookup(&self, _: &str) -> Result<Option<TokenRecord>> {
             if self.lookup_succeeds {
                 Ok(None)
             } else {
-                Err(Error::Other(anyhow::anyhow!("simulated tokens-store failure")))
+                Err(Error::Other(anyhow::anyhow!(
+                    "simulated tokens-store failure"
+                )))
             }
         }
         async fn revoke(&self, _: &str) -> Result<bool> {
@@ -171,7 +182,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn count(&self) -> Result<u64> {
-            Err(Error::Other(anyhow::anyhow!("simulated audit-store failure")))
+            Err(Error::Other(anyhow::anyhow!(
+                "simulated audit-store failure"
+            )))
         }
         async fn prune_older_than(&self, _: i64) -> Result<u64> {
             Ok(0)
@@ -227,8 +240,7 @@ mod tests {
     #[test]
     fn drain_response_short_circuits_when_flag_set() {
         let flag = AtomicBool::new(true);
-        let (status, body) =
-            drain_response_if_draining(&flag).expect("expected Some response");
+        let (status, body) = drain_response_if_draining(&flag).expect("expected Some response");
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["draining"], serde_json::json!(true));
@@ -250,9 +262,13 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stores_returns_200_when_all_ok() {
-        let tokens = StubTokenStore { lookup_succeeds: true };
+        let tokens = StubTokenStore {
+            lookup_succeeds: true,
+        };
         let audit = NoopAuditStore;
-        let ownership = StubOwnershipStore { count_succeeds: true };
+        let ownership = StubOwnershipStore {
+            count_succeeds: true,
+        };
         let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body.0["ok"], serde_json::json!(true));
@@ -263,9 +279,13 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stores_returns_503_when_tokens_fails() {
-        let tokens = StubTokenStore { lookup_succeeds: false };
+        let tokens = StubTokenStore {
+            lookup_succeeds: false,
+        };
         let audit = NoopAuditStore;
-        let ownership = StubOwnershipStore { count_succeeds: true };
+        let ownership = StubOwnershipStore {
+            count_succeeds: true,
+        };
         let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
@@ -276,9 +296,13 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stores_returns_503_when_audit_fails() {
-        let tokens = StubTokenStore { lookup_succeeds: true };
+        let tokens = StubTokenStore {
+            lookup_succeeds: true,
+        };
         let audit = FailingAuditStore;
-        let ownership = StubOwnershipStore { count_succeeds: true };
+        let ownership = StubOwnershipStore {
+            count_succeeds: true,
+        };
         let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
@@ -289,9 +313,13 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stores_returns_503_when_ownership_fails() {
-        let tokens = StubTokenStore { lookup_succeeds: true };
+        let tokens = StubTokenStore {
+            lookup_succeeds: true,
+        };
         let audit = NoopAuditStore;
-        let ownership = StubOwnershipStore { count_succeeds: false };
+        let ownership = StubOwnershipStore {
+            count_succeeds: false,
+        };
         let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));

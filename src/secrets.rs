@@ -88,9 +88,7 @@ impl MasterKey {
         // Try standard then URL-safe alphabet.
         let raw = B64
             .decode(trimmed)
-            .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed)
-            })
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
             .map_err(|e| Error::Other(anyhow::anyhow!("invalid base64 webhook key: {e}")))?;
         if raw.len() != 32 {
             return Err(Error::Other(anyhow::anyhow!(
@@ -141,8 +139,7 @@ impl MasterKey {
     }
 
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new_from_slice(&self.bytes)
-            .expect("32-byte key is the AES-256-GCM contract")
+        Aes256Gcm::new_from_slice(&self.bytes).expect("32-byte key is the AES-256-GCM contract")
     }
 }
 

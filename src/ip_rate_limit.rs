@@ -69,8 +69,8 @@ impl IpRateLimiter {
         });
 
         let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
-        entry.tokens = (entry.tokens + elapsed * self.budget.refill_per_sec)
-            .min(self.budget.capacity as f64);
+        entry.tokens =
+            (entry.tokens + elapsed * self.budget.refill_per_sec).min(self.budget.capacity as f64);
         entry.last_refill = now;
 
         if entry.tokens < 1.0 {
@@ -145,7 +145,10 @@ mod tests {
     async fn refill_returns_tokens() {
         // Test-local limiter with fast refill for determinism.
         let rl = IpRateLimiter {
-            budget: Budget { capacity: 2, refill_per_sec: 50.0 },
+            budget: Budget {
+                capacity: 2,
+                refill_per_sec: 50.0,
+            },
             buckets: DashMap::new(),
         };
         let ip = ip4("192.0.2.1");

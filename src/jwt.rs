@@ -180,6 +180,9 @@ mod tests {
 
     #[test]
     fn rejects_malformed_token() {
-        assert!(matches!(verify("sec", "not-a-jwt"), Err(Error::Unauthorized)));
+        assert!(matches!(
+            verify("sec", "not-a-jwt"),
+            Err(Error::Unauthorized)
+        ));
     }
 }

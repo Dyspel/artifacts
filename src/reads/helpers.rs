@@ -20,7 +20,9 @@ pub(super) fn validate_ref_or_sha(s: &str) -> Result<()> {
     }
     for ch in s.chars() {
         if ch.is_whitespace() || matches!(ch, '\0' | ':' | '?' | '*' | '[' | '~' | '^' | '\\') {
-            return Err(Error::BadRequest(format!("invalid character in ref: {ch:?}")));
+            return Err(Error::BadRequest(format!(
+                "invalid character in ref: {ch:?}"
+            )));
         }
     }
     Ok(())
@@ -45,7 +47,9 @@ pub(super) fn is_valid_notes_ref(s: &str) -> bool {
         && s.len() > "refs/notes/".len()
         && !s.contains("//")
         && !s.ends_with('/')
-        && s.chars().all(|c| c > ' ' && c != ':' && c != '?' && c != '*' && c != '~' && c != '^' && c != '[')
+        && s.chars().all(|c| {
+            c > ' ' && c != ':' && c != '?' && c != '*' && c != '~' && c != '^' && c != '['
+        })
 }
 
 /// Recursive on-disk size of a directory in bytes. Used by the

@@ -22,11 +22,7 @@
 //! endpoint handler and in the BFF layer above — centralizing the
 //! filter downstream means new filters don't require a schema change.
 
-use crate::{
-    auth::authorize_rest,
-    error::Result,
-    rest::RestState,
-};
+use crate::{auth::authorize_rest, error::Result, rest::RestState};
 use axum::{
     extract::State,
     http::HeaderMap,
@@ -34,7 +30,10 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::Serialize;
-use std::{convert::Infallible, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    convert::Infallible,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -72,7 +71,9 @@ impl EventBus {
 }
 
 impl Default for EventBus {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// All the event types the bus carries. Flat, self-describing, designed
@@ -113,7 +114,12 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn commit(repo_id: impl Into<String>, commit_id: impl Into<String>, branch: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn commit(
+        repo_id: impl Into<String>,
+        commit_id: impl Into<String>,
+        branch: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Commit {
             repo_id: repo_id.into(),
             commit_id: commit_id.into(),
@@ -129,7 +135,11 @@ impl Event {
             t: now_ms(),
         }
     }
-    pub fn status(repo_id: impl Into<String>, from: impl Into<String>, to: impl Into<String>) -> Self {
+    pub fn status(
+        repo_id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+    ) -> Self {
         Self::Status {
             repo_id: repo_id.into(),
             from: from.into(),

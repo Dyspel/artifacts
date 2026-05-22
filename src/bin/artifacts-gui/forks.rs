@@ -235,7 +235,12 @@ pub(crate) fn render_forks(
                 egui::Color32::from_rgb(160, 160, 170),
             ),
         };
-        painter.rect(rect, 4.0 * *zoom, fill, egui::Stroke::new(1.0, stroke_color));
+        painter.rect(
+            rect,
+            4.0 * *zoom,
+            fill,
+            egui::Stroke::new(1.0, stroke_color),
+        );
 
         // Node text: short-id first line, owner second.
         let short: String = r.id.chars().take(12).collect();
@@ -280,11 +285,7 @@ pub(crate) fn render_forks(
         (egui::Color32::from_rgb(160, 160, 170), "fork"),
         (egui::Color32::from_rgb(220, 160, 60), "orphan"),
     ] {
-        painter.circle_filled(
-            egui::pos2(legend_rect.left() + 16.0, y + 6.0),
-            5.0,
-            *color,
-        );
+        painter.circle_filled(egui::pos2(legend_rect.left() + 16.0, y + 6.0), 5.0, *color);
         painter.text(
             egui::pos2(legend_rect.left() + 28.0, y),
             egui::Align2::LEFT_TOP,

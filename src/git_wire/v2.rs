@@ -293,18 +293,17 @@ mod tests {
             symrefs: true,
             prefixes: vec!["HEAD".into(), "refs/test/".into()],
         };
-        let resp = native_ls_refs_response(&repo.repo_id, &refs, args).await.unwrap();
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/x-git-upload-pack-result"
         );
 
-        let body = futures::executor::block_on(axum::body::to_bytes(
-            resp.into_body(),
-            1024 * 1024,
-        ))
-        .unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
         let s = std::str::from_utf8(&body).unwrap();
 
         // First pkt-line should be HEAD with symref-target annotation.
@@ -354,15 +353,14 @@ mod tests {
             .spawn()
             .map(|mut c| {
                 use std::io::Write as _;
-                c.stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(b"hello\n")
-                    .unwrap();
+                c.stdin.as_mut().unwrap().write_all(b"hello\n").unwrap();
                 c.wait_with_output().unwrap()
             })
             .unwrap();
-        let blob = String::from_utf8(blob_out.stdout).unwrap().trim().to_string();
+        let blob = String::from_utf8(blob_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         let mktree_out = StdCmd::new("git")
             .args(["--git-dir"])
             .arg(git_dir)
@@ -381,7 +379,10 @@ mod tests {
                 c.wait_with_output().unwrap()
             })
             .unwrap();
-        let tree = String::from_utf8(mktree_out.stdout).unwrap().trim().to_string();
+        let tree = String::from_utf8(mktree_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         let commit_out = StdCmd::new("git")
             .args(["--git-dir"])
             .arg(git_dir)
@@ -392,7 +393,10 @@ mod tests {
             .env("GIT_COMMITTER_EMAIL", "t@t")
             .output()
             .unwrap();
-        let commit = String::from_utf8(commit_out.stdout).unwrap().trim().to_string();
+        let commit = String::from_utf8(commit_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         let req = V2FetchRequest {
             wants: vec![commit.clone()],
@@ -408,11 +412,9 @@ mod tests {
             "application/x-git-upload-pack-result"
         );
 
-        let body = futures::executor::block_on(axum::body::to_bytes(
-            resp.into_body(),
-            16 * 1024 * 1024,
-        ))
-        .unwrap();
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024))
+                .unwrap();
         // Header pkt-line is "packfile\n" (9 bytes) → "000Dpackfile\n".
         assert!(body.starts_with(b"000dpackfile\n"));
         // Trailing flush.
@@ -439,12 +441,11 @@ mod tests {
             symrefs: true,
             prefixes: vec!["HEAD".into(), "refs/heads/".into()],
         };
-        let resp = native_ls_refs_response(&repo.repo_id, &refs, args).await.unwrap();
-        let body = futures::executor::block_on(axum::body::to_bytes(
-            resp.into_body(),
-            1024 * 1024,
-        ))
-        .unwrap();
+        let resp = native_ls_refs_response(&repo.repo_id, &refs, args)
+            .await
+            .unwrap();
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 1024 * 1024))
+            .unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         // Per spec, unborn HEAD with symref-target arrives as
         //   "unborn HEAD symref-target:refs/heads/main\n"

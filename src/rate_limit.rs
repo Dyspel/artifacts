@@ -73,13 +73,14 @@ impl Budget {
 /// Default budgets tuned for Dyspel's expected shape:
 /// a legitimate heavy user doesn't hit these; a misbehaving loop does
 /// within seconds.
-const DEFAULT_CREATE: Budget = Budget::per_min(20, 10);     // burst 20, sustain 10/min
-const DEFAULT_TOKEN: Budget = Budget::per_min(120, 120);    // burst 120, sustain 2/sec
-const DEFAULT_COMMIT: Budget = Budget {                     // burst 600, sustain 10/sec
+const DEFAULT_CREATE: Budget = Budget::per_min(20, 10); // burst 20, sustain 10/min
+const DEFAULT_TOKEN: Budget = Budget::per_min(120, 120); // burst 120, sustain 2/sec
+const DEFAULT_COMMIT: Budget = Budget {
+    // burst 600, sustain 10/sec
     capacity: 600,
     refill_per_sec: 10.0,
 };
-const DEFAULT_DEFAULT: Budget = Budget::per_min(300, 300);  // burst 300, sustain 5/sec
+const DEFAULT_DEFAULT: Budget = Budget::per_min(300, 300); // burst 300, sustain 5/sec
 
 struct Bucket {
     tokens: f64,
@@ -128,8 +129,7 @@ impl RateLimiter {
 
         // Refill from the last-touched-at based on elapsed real time.
         let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
-        entry.tokens = (entry.tokens + elapsed * budget.refill_per_sec)
-            .min(budget.capacity as f64);
+        entry.tokens = (entry.tokens + elapsed * budget.refill_per_sec).min(budget.capacity as f64);
         entry.last_refill = now;
 
         if entry.tokens < 1.0 {
@@ -148,8 +148,7 @@ impl RateLimiter {
     /// the map from growing unboundedly if subjects come and go.
     pub fn evict_stale(&self, stale_after: Duration) {
         let cutoff = Instant::now() - stale_after;
-        self.buckets
-            .retain(|_, bucket| bucket.last_refill > cutoff);
+        self.buckets.retain(|_, bucket| bucket.last_refill > cutoff);
     }
 
     /// For tests: peek at the current token count of a bucket. Returns
@@ -224,7 +223,9 @@ mod tests {
     #[test]
     fn separate_subjects_have_separate_buckets() {
         let rl = RateLimiter::with_defaults();
-        let bob = Principal::User { subject: "bob".into() };
+        let bob = Principal::User {
+            subject: "bob".into(),
+        };
         for _ in 0..20 {
             rl.check(&alice(), Class::Create).unwrap();
         }
@@ -241,7 +242,10 @@ mod tests {
         let rl = RateLimiter {
             // A small, fast-refilling bucket for deterministic testing.
             budgets: [
-                Budget { capacity: 2, refill_per_sec: 50.0 }, // Create
+                Budget {
+                    capacity: 2,
+                    refill_per_sec: 50.0,
+                }, // Create
                 DEFAULT_TOKEN,
                 DEFAULT_COMMIT,
                 DEFAULT_DEFAULT,

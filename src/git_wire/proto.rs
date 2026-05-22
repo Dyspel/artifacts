@@ -352,14 +352,14 @@ pub(crate) fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest>
                                     req.has_report_status = true;
                                 }
                                 "side-band-64k" => req.has_sideband_64k = true,
-                                "ofs-delta" | "delete-refs" | "no-thin"
-                                | "quiet" => {}
+                                "ofs-delta" | "delete-refs" | "no-thin" | "quiet" => {}
                                 "atomic" | "push-options" | "push-cert" => {
                                     req.has_unsupported = true;
                                 }
-                                other if other.starts_with("agent=")
-                                    || other.starts_with("session-id=")
-                                    || other.starts_with("object-format=") =>
+                                other
+                                    if other.starts_with("agent=")
+                                        || other.starts_with("session-id=")
+                                        || other.starts_with("object-format=") =>
                                 {
                                     // Informational, ignore.
                                 }
@@ -458,10 +458,7 @@ mod tests {
     fn parse_ls_refs_only_rejects_unknown_argument() {
         // Unfamiliar args force fallthrough to subprocess so we never
         // serve a stale-spec response for a feature we haven't audited.
-        let body = build_ls_refs_body(
-            &["agent=git/2.43.0"],
-            &["peel", "future-flag-we-dont-know"],
-        );
+        let body = build_ls_refs_body(&["agent=git/2.43.0"], &["peel", "future-flag-we-dont-know"]);
         assert!(parse_ls_refs_only(&body).is_none());
     }
 
@@ -478,11 +475,7 @@ mod tests {
         assert!(args.prefixes.is_empty());
     }
 
-    fn build_receive_pack_body(
-        updates: &[(&str, &str, &str)],
-        caps: &str,
-        pack: &[u8],
-    ) -> Vec<u8> {
+    fn build_receive_pack_body(updates: &[(&str, &str, &str)], caps: &str, pack: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         for (i, (old, new, name)) in updates.iter().enumerate() {
             let mut line = format!("{old} {new} {name}");

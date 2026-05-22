@@ -131,7 +131,10 @@ pub async fn create_commit(
     }
     enforce_owner(&*state.data.ownership, &principal, &repo_id).await?;
     if !valid_branch_name(&body.branch) {
-        return Err(Error::BadRequest(format!("invalid branch name: {:?}", body.branch)));
+        return Err(Error::BadRequest(format!(
+            "invalid branch name: {:?}",
+            body.branch
+        )));
     }
     for change in &body.changes {
         let (path, mode) = match change {
@@ -174,13 +177,16 @@ pub async fn create_commit(
             // chunked-KV impl satisfies the same call without a
             // subprocess.
             if !state.data.objects.exists(&repo_id, sha)? {
-                return Err(Error::BadRequest(format!(
-                    "parent commit not found: {sha}"
-                )));
+                return Err(Error::BadRequest(format!("parent commit not found: {sha}")));
             }
             // Get its tree.
-            let (rc, stdout, stderr) =
-                run_git(&git_dir, &["rev-parse", &format!("{sha}^{{tree}}")], &[], None).await?;
+            let (rc, stdout, stderr) = run_git(
+                &git_dir,
+                &["rev-parse", &format!("{sha}^{{tree}}")],
+                &[],
+                None,
+            )
+            .await?;
             if rc != 0 {
                 return Err(Error::Other(anyhow::anyhow!(
                     "rev-parse tree failed: {}",
@@ -207,7 +213,10 @@ pub async fn create_commit(
 
     let index_env_owned: Vec<(String, String)> = vec![
         ("GIT_INDEX_FILE".into(), index_path.to_string_lossy().into()),
-        ("GIT_WORK_TREE".into(), worktree_path.to_string_lossy().into()),
+        (
+            "GIT_WORK_TREE".into(),
+            worktree_path.to_string_lossy().into(),
+        ),
     ];
     let index_env: Vec<(&str, &str)> = index_env_owned
         .iter()
@@ -216,7 +225,8 @@ pub async fn create_commit(
 
     // 3. Seed the index with the base tree.
     if base_tree != EMPTY_TREE_SHA {
-        let (rc, _, stderr) = run_git(&git_dir, &["read-tree", &base_tree], &index_env, None).await?;
+        let (rc, _, stderr) =
+            run_git(&git_dir, &["read-tree", &base_tree], &index_env, None).await?;
         if rc != 0 {
             return Err(Error::Other(anyhow::anyhow!(
                 "read-tree failed: {}",
@@ -228,7 +238,12 @@ pub async fn create_commit(
     // 4. Apply changes in order.
     for change in &body.changes {
         match change {
-            Change::Write { path, content, content_base64, mode } => {
+            Change::Write {
+                path,
+                content,
+                content_base64,
+                mode,
+            } => {
                 let bytes = match (content, content_base64) {
                     (Some(_), Some(_)) => {
                         return Err(Error::BadRequest(format!(
@@ -317,7 +332,10 @@ pub async fn create_commit(
     // depending on the bare repo's (almost always absent) local git config.
     let (author_name, author_email) = match &body.author {
         Some(a) => (a.name.clone(), a.email.clone()),
-        None => ("Artifacts".to_string(), "artifacts@noreply.local".to_string()),
+        None => (
+            "Artifacts".to_string(),
+            "artifacts@noreply.local".to_string(),
+        ),
     };
     let commit_env: Vec<(&str, &str)> = vec![
         ("GIT_AUTHOR_NAME", &author_name),
@@ -346,7 +364,9 @@ pub async fn create_commit(
     // RefStore trait so the guts are swappable (M3-proper replaces the
     // single-node FsRefStore with a distributed state machine; this call
     // site stays identical).
-    match state.data.refs
+    match state
+        .data
+        .refs
         .cas_update(&repo_id, &ref_name, body.parent.as_deref(), &commit_sha)
         .await?
     {
@@ -370,7 +390,10 @@ pub async fn create_commit(
     // whatever multi-paragraph commit template the caller uses.
     let message_first_line = body.message.split('\n').next().unwrap_or("").to_string();
     state.observ.events.publish(crate::events::Event::commit(
-        repo_id, &commit_sha, &body.branch, message_first_line,
+        repo_id,
+        &commit_sha,
+        &body.branch,
+        message_first_line,
     ));
 
     Ok(Json(CommitResult {
@@ -554,7 +577,7 @@ mod tests {
         assert!(!valid_path(".git"));
         assert!(!valid_path(".git/config"));
         assert!(!valid_path("subdir/.git/HEAD"));
-        assert!(!valid_path(".GIT"));  // case-insensitive on git itself
+        assert!(!valid_path(".GIT")); // case-insensitive on git itself
     }
 
     #[test]

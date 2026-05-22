@@ -60,16 +60,11 @@ impl AlternatesCache {
     /// pure memoization — a panic under lock can't violate an invariant).
     pub fn lookup(&self, repos_dir: &Path, repo_id: &str) -> Option<String> {
         let alt_path = repos_dir.join(format!("{repo_id}.git/objects/info/alternates"));
-        let mtime = std::fs::metadata(&alt_path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = std::fs::metadata(&alt_path).and_then(|m| m.modified()).ok();
 
         // Fast path: cached entry with matching mtime.
         {
-            let guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(e) = guard.get(repo_id) {
                 if e.mtime == mtime {
                     return e.source_id.clone();
@@ -79,10 +74,7 @@ impl AlternatesCache {
 
         // Miss: do the full resolve, then update the cache.
         let resolved = resolve(&alt_path, repos_dir);
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(
             repo_id.to_string(),
             Entry {
@@ -96,10 +88,7 @@ impl AlternatesCache {
     /// Forget a repo_id. Called when a repo is deleted, so the cache
     /// doesn't grow unboundedly across the lifetime of the process.
     pub fn invalidate(&self, repo_id: &str) {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.remove(repo_id);
     }
 }
@@ -204,9 +193,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let new_source = tmp.path().join("new-source-5678.git/objects");
         fs::create_dir_all(&new_source).unwrap();
-        let alt = tmp
-            .path()
-            .join("fork-abc-9999.git/objects/info/alternates");
+        let alt = tmp.path().join("fork-abc-9999.git/objects/info/alternates");
         fs::write(&alt, new_source.to_string_lossy().as_bytes()).unwrap();
 
         assert_eq!(

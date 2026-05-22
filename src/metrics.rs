@@ -112,8 +112,7 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
     // the 1s top-end catches "something fell off a cliff" without
     // wasting buckets on the request-level 10s timeout.
     const OBJECT_READ_BUCKETS: &[f64] = &[
-        0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.002, 0.005, 0.010, 0.025, 0.100,
-        1.0,
+        0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.002, 0.005, 0.010, 0.025, 0.100, 1.0,
     ];
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
@@ -140,8 +139,7 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
         .install_recorder()
         .map_err(|e| anyhow::anyhow!("install prometheus recorder: {e}"))?;
     // Emit a static build_info metric so scrapers can see what's running.
-    metrics::gauge!("artifacts_build_info", "version" => env!("CARGO_PKG_VERSION"))
-        .set(1.0);
+    metrics::gauge!("artifacts_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
     Ok(handle)
 }
 

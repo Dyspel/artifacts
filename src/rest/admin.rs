@@ -382,7 +382,9 @@ pub async fn admin_list_audit(
     headers: HeaderMap,
 ) -> Result<Json<Vec<crate::audit::AuditEvent>>> {
     require_admin(&state, &headers)?;
-    let rows = state.observ.audit
+    let rows = state
+        .observ
+        .audit
         .list(crate::audit::AuditQuery {
             since_ts: q.since,
             until_ts: q.until,

@@ -43,13 +43,17 @@ pub fn new_repo_id() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::thread_rng();
-    (0..24).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    (0..24)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 pub fn validate_repo_id(id: &str) -> Result<()> {
     if id.len() < 4
         || id.len() > 64
-        || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         return Err(Error::InvalidRepoId(id.to_string()));
     }
@@ -460,38 +464,40 @@ mod tests {
         let src_path = storage.repo_path(&a);
         // Create an empty-tree + commit pointing at it.
         let status = std::process::Command::new("git")
-            .arg("--git-dir").arg(&src_path)
+            .arg("--git-dir")
+            .arg(&src_path)
             .args(["-c", "user.email=t@test", "-c", "user.name=t"])
-            .args(["commit-tree", "-m", "seed",
-                   "4b825dc642cb6eb9a060e54bf8d69288fbee4904"])
+            .args([
+                "commit-tree",
+                "-m",
+                "seed",
+                "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            ])
             .output()
             .unwrap();
         let commit_sha = String::from_utf8(status.stdout).unwrap().trim().to_string();
         assert_eq!(commit_sha.len(), 40);
         // update-ref to put the commit on refs/heads/main.
         let st = std::process::Command::new("git")
-            .arg("--git-dir").arg(&src_path)
+            .arg("--git-dir")
+            .arg(&src_path)
             .args(["update-ref", "refs/heads/main", &commit_sha])
-            .status().unwrap();
+            .status()
+            .unwrap();
         assert!(st.success());
 
         storage.fork(&a, &b).unwrap();
 
         // alternates file points back at source.
-        let alt = std::fs::read_to_string(
-            storage.repo_path(&b).join("objects/info/alternates"),
-        )
-        .unwrap();
+        let alt =
+            std::fs::read_to_string(storage.repo_path(&b).join("objects/info/alternates")).unwrap();
         assert!(alt.contains(&a));
 
         // Refs went to packed-refs, not loose. Absence of the loose
         // file is part of the fix: the fork shouldn't write the
         // torn-loose-file shape the old copy_refs did.
         assert!(!storage.repo_path(&b).join("refs/heads/main").exists());
-        let packed = std::fs::read_to_string(
-            storage.repo_path(&b).join("packed-refs"),
-        )
-        .unwrap();
+        let packed = std::fs::read_to_string(storage.repo_path(&b).join("packed-refs")).unwrap();
         assert!(packed.contains(&commit_sha));
         assert!(packed.contains("refs/heads/main"));
     }

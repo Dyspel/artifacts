@@ -31,8 +31,8 @@
 use crate::events::Event;
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -73,10 +73,7 @@ pub trait WebhookRegistry: Send + Sync {
     /// secrets have nothing to do, but the rotation endpoint still
     /// generates and installs a fresh key for the next `add()`. The
     /// SQLite impl overrides; Mem inherits the default.
-    fn rotate_master_key(
-        &self,
-        _new: Arc<crate::secrets::MasterKey>,
-    ) -> crate::error::Result<u64> {
+    fn rotate_master_key(&self, _new: Arc<crate::secrets::MasterKey>) -> crate::error::Result<u64> {
         Ok(0)
     }
 
@@ -203,10 +200,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         let key = self.current_key();
         let (secret_b64, nonce_blob): (Option<String>, Option<Vec<u8>>) = match &sub.secret {
             Some(plaintext) => match crate::secrets::seal(&key, plaintext.as_bytes()) {
-                Ok((ct, nonce)) => (
-                    Some(BASE64_STD.encode(ct)),
-                    Some(nonce.to_vec()),
-                ),
+                Ok((ct, nonce)) => (Some(BASE64_STD.encode(ct)), Some(nonce.to_vec())),
                 Err(e) => {
                     tracing::warn!(error = %e, "webhook secret seal failed; storing NULL");
                     (None, None)
@@ -218,7 +212,15 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         let _ = self.lock().execute(
             "INSERT INTO webhooks (id, repo_id, url, secret, secret_nonce, events_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![sub.id, sub.repo_id, sub.url, secret_b64, nonce_blob, events, now],
+            rusqlite::params![
+                sub.id,
+                sub.repo_id,
+                sub.url,
+                secret_b64,
+                nonce_blob,
+                events,
+                now
+            ],
         );
         sub.id
     }
@@ -234,9 +236,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             Err(_) => return Vec::new(),
         };
         let key = self.current_key();
-        let rows = stmt.query_map(rusqlite::params![repo_id], move |row| {
-            row_to_sub(row, &key)
-        });
+        let rows = stmt.query_map(rusqlite::params![repo_id], move |row| row_to_sub(row, &key));
         let rows = match rows {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -295,10 +295,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
     ///
     /// Returns the count of rows actually re-encrypted (0 if no
     /// encrypted rows exist; the swap still happens).
-    fn rotate_master_key(
-        &self,
-        new: Arc<crate::secrets::MasterKey>,
-    ) -> crate::error::Result<u64> {
+    fn rotate_master_key(&self, new: Arc<crate::secrets::MasterKey>) -> crate::error::Result<u64> {
         use rusqlite::params;
         let mut conn = self.lock();
         let old = self.current_key();
@@ -344,10 +341,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         // Swap the in-memory key while we still hold the conn mutex so
         // concurrent `add` calls — which take the same mutex — wake up
         // using the new key in lockstep with the on-disk re-encryption.
-        *self
-            .master_key
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = new;
+        *self.master_key.write().unwrap_or_else(|p| p.into_inner()) = new;
         Ok(count)
     }
 }
@@ -383,14 +377,26 @@ fn row_to_sub(
                 Ok(n) => n,
                 Err(_) => {
                     tracing::warn!(hook_id = %id, "webhook nonce wrong length; treating as unsigned");
-                    return Ok(Subscription { id, repo_id, url, secret: None, events });
+                    return Ok(Subscription {
+                        id,
+                        repo_id,
+                        url,
+                        secret: None,
+                        events,
+                    });
                 }
             };
             let ct = match BASE64_STD.decode(ct_b64.as_bytes()) {
                 Ok(b) => b,
                 Err(_) => {
                     tracing::warn!(hook_id = %id, "webhook ciphertext base64 decode failed; treating as unsigned");
-                    return Ok(Subscription { id, repo_id, url, secret: None, events });
+                    return Ok(Subscription {
+                        id,
+                        repo_id,
+                        url,
+                        secret: None,
+                        events,
+                    });
                 }
             };
             match crate::secrets::unseal(key, &ct, &nonce) {
@@ -485,10 +491,7 @@ pub fn refresh_active_webhook_gauge(registry: &dyn WebhookRegistry) {
 /// shape as `tokens::spawn_active_gauge_refresher`; both run in
 /// parallel so the metrics surface tracks real activity within a
 /// minute.
-pub fn spawn_active_gauge_refresher(
-    registry: Arc<dyn WebhookRegistry>,
-    tick: std::time::Duration,
-) {
+pub fn spawn_active_gauge_refresher(registry: Arc<dyn WebhookRegistry>, tick: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         ticker.tick().await;
@@ -503,10 +506,7 @@ pub fn spawn_active_gauge_refresher(
 /// each event to every matching subscription. Owns its own broadcast
 /// receiver; the registry handle is shared with the REST endpoints
 /// so add/list/remove see the same set the dispatcher walks.
-pub fn spawn_dispatcher(
-    registry: Arc<dyn WebhookRegistry>,
-    bus: crate::events::EventBus,
-) {
+pub fn spawn_dispatcher(registry: Arc<dyn WebhookRegistry>, bus: crate::events::EventBus) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         loop {
@@ -1018,8 +1018,7 @@ mod tests {
         // newly-installed key — same plaintexts, since we re-encrypted
         // the same secrets under the new key.
         let listed = r.list("r1");
-        let mut plaintexts: Vec<&str> =
-            listed.iter().filter_map(|s| s.secret.as_deref()).collect();
+        let mut plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
         plaintexts.sort();
         assert_eq!(plaintexts, vec!["alpha", "beta"]);
 
@@ -1097,7 +1096,10 @@ mod tests {
             events: vec![],
         });
         let rotated = r.rotate_master_key(test_master_key()).unwrap();
-        assert_eq!(rotated, 1, "legacy row should be skipped, only the encrypted row touched");
+        assert_eq!(
+            rotated, 1,
+            "legacy row should be skipped, only the encrypted row touched"
+        );
         // Legacy row still readable as plaintext.
         let listed = r.list("r1");
         let plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();

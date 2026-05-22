@@ -42,21 +42,17 @@ pub fn missing_oid_returns_none<S: ObjectStore>(store: &S, repo_id: &str) {
 /// path-safety contract.
 pub fn malformed_oid_returns_none<S: ObjectStore>(store: &S) {
     // Path-traversal attempt.
-    assert!(
-        store
-            .read_loose("repo", "../something/with/slash/and/some/more/x")
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .read_loose("repo", "../something/with/slash/and/some/more/x")
+        .unwrap()
+        .is_none());
     // Wrong length.
     assert!(store.read_loose("repo", "abc").unwrap().is_none());
     // Non-hex (uppercase Z).
-    assert!(
-        store
-            .read_loose("repo", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .read_loose("repo", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ")
+        .unwrap()
+        .is_none());
 }
 
 /// `write_loose` round-trips through `read_loose` with byte-exact
@@ -102,7 +98,10 @@ pub fn write_loose_rejects_malformed_oid<S: ObjectStore>(store: &S) {
     ];
     for bad in cases {
         let r = store.write_loose("repo", bad, b"x");
-        assert!(r.is_err(), "expected write_loose({bad:?}) to error, got {r:?}");
+        assert!(
+            r.is_err(),
+            "expected write_loose({bad:?}) to error, got {r:?}"
+        );
     }
 }
 
@@ -147,7 +146,10 @@ pub fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
     let oid = "4444444444444444444444444444444444444444";
     store.write_loose("conf-repo", oid, b"to-delete").unwrap();
     assert!(store.read_loose("conf-repo", oid).unwrap().is_some());
-    assert!(store.delete_loose("conf-repo", oid).unwrap(), "first delete must report true");
+    assert!(
+        store.delete_loose("conf-repo", oid).unwrap(),
+        "first delete must report true"
+    );
     assert!(store.read_loose("conf-repo", oid).unwrap().is_none());
     assert!(
         !store.delete_loose("conf-repo", oid).unwrap(),
@@ -159,9 +161,16 @@ pub fn delete_loose_round_trips<S: ObjectStore>(store: &S) {
 /// shape as `write_loose`. We won't computed-path-escape on
 /// the way out any more than on the way in.
 pub fn delete_loose_rejects_malformed_oid<S: ObjectStore>(store: &S) {
-    for bad in ["../something", "abc", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"] {
+    for bad in [
+        "../something",
+        "abc",
+        "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ] {
         let r = store.delete_loose("repo", bad);
-        assert!(r.is_err(), "expected delete_loose({bad:?}) to error, got {r:?}");
+        assert!(
+            r.is_err(),
+            "expected delete_loose({bad:?}) to error, got {r:?}"
+        );
     }
 }
 
@@ -178,9 +187,9 @@ pub fn exists_agrees_with_read<S: ObjectStore>(store: &S, repo_id: &str, present
         !store.exists(repo_id, absent).unwrap(),
         "exists must return false for a never-written oid",
     );
-// Malformed oid: same shape as read_loose — false, not an error.
-assert!(
-    !store.exists(repo_id, "not-a-real-oid").unwrap(),
-    "exists must return false for a malformed oid",
-);
+    // Malformed oid: same shape as read_loose — false, not an error.
+    assert!(
+        !store.exists(repo_id, "not-a-real-oid").unwrap(),
+        "exists must return false for a malformed oid",
+    );
 }

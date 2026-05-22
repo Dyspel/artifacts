@@ -256,11 +256,7 @@ impl SqliteTokenStore {
 /// need a separate metrics-publishing task. The startup-time
 /// `refresh_active_token_gauge` populates the initial value so the
 /// gauge isn't reported as 0 until the first tick fires.
-pub fn spawn_prune_task(
-    store: Arc<SqliteTokenStore>,
-    tick: Duration,
-    expiry_grace: Duration,
-) {
+pub fn spawn_prune_task(store: Arc<SqliteTokenStore>, tick: Duration, expiry_grace: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // Skip the first tick so we don't fire immediately on startup.
@@ -421,19 +417,18 @@ impl TokenStore for SqliteTokenStore {
                AND (?3 IS NULL OR subject = ?3)
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(
-            params![repo_id, now, subject_filter],
-            |row| {
-                let token_hash: String = row.get(0)?;
-                let repo_id: String = row.get(1)?;
-                let scope: String = row.get(2)?;
-                let created_at: i64 = row.get(3)?;
-                let expires_at: Option<i64> = row.get(4)?;
-                let revoked_at: Option<i64> = row.get(5)?;
-                let subject: Option<String> = row.get(6)?;
-                Ok((token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject))
-            },
-        )?;
+        let rows = stmt.query_map(params![repo_id, now, subject_filter], |row| {
+            let token_hash: String = row.get(0)?;
+            let repo_id: String = row.get(1)?;
+            let scope: String = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            let expires_at: Option<i64> = row.get(4)?;
+            let revoked_at: Option<i64> = row.get(5)?;
+            let subject: Option<String> = row.get(6)?;
+            Ok((
+                token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject,
+            ))
+        })?;
         let mut out = Vec::new();
         for row in rows {
             let (hash, repo_id, scope_s, created, expires, revoked, subject) = row?;
@@ -489,7 +484,10 @@ mod tests {
     #[tokio::test]
     async fn mint_then_lookup_roundtrip() {
         let (_d, store) = open_store();
-        let t = store.mint("repo-a", Scope::Write, None, None).await.unwrap();
+        let t = store
+            .mint("repo-a", Scope::Write, None, None)
+            .await
+            .unwrap();
         let rec = store.lookup(&t).await.unwrap().unwrap();
         assert_eq!(rec.repo_id, "repo-a");
         assert_eq!(rec.scope, Scope::Write);
@@ -523,7 +521,10 @@ mod tests {
         let (_d, store) = open_store();
         // TTL of zero seconds means "expires_at = created_at", and the
         // lookup predicate is `expires_at > now`, so it's immediately dead.
-        let t = store.mint("r", Scope::Read, Some(Duration::from_secs(0)), None).await.unwrap();
+        let t = store
+            .mint("r", Scope::Read, Some(Duration::from_secs(0)), None)
+            .await
+            .unwrap();
         assert!(
             store.lookup(&t).await.unwrap().is_none(),
             "expected TTL=0 token to be unresolvable"
@@ -536,7 +537,9 @@ mod tests {
         let path = dir.path().join("tokens.db");
         let t = {
             let s = SqliteTokenStore::open(&path).unwrap();
-            s.mint("persistent", Scope::Write, None, None).await.unwrap()
+            s.mint("persistent", Scope::Write, None, None)
+                .await
+                .unwrap()
         };
         // Drop the first store, reopen on the same path.
         let s2 = SqliteTokenStore::open(&path).unwrap();
@@ -570,7 +573,8 @@ mod tests {
 
     fn count_rows(path: &std::path::Path) -> i64 {
         let conn = Connection::open(path).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0)).unwrap()
+        conn.query_row("SELECT COUNT(*) FROM tokens", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -597,7 +601,10 @@ mod tests {
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
         // Ttl=0 → immediately expired (rows' expires_at == created_at).
-        let _t = store.mint("r", Scope::Read, Some(Duration::from_secs(0)), None).await.unwrap();
+        let _t = store
+            .mint("r", Scope::Read, Some(Duration::from_secs(0)), None)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&path), 1);
 
         // With a generous grace, the row survives.

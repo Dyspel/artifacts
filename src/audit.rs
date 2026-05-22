@@ -227,7 +227,6 @@ impl SqliteAuditStore {
             conn: Arc::new(TokioMutex::new(conn)),
         })
     }
-
 }
 
 /// Result of a successful `verify_chain` run.
@@ -340,10 +339,8 @@ impl AuditStore for SqliteAuditStore {
 
     async fn prune_older_than(&self, cutoff_ts: i64) -> Result<u64> {
         let conn = crate::metrics::lock_sqlite(&self.conn, "audit").await;
-        let affected = conn.execute(
-            "DELETE FROM audit_events WHERE ts < ?1",
-            params![cutoff_ts],
-        )?;
+        let affected =
+            conn.execute("DELETE FROM audit_events WHERE ts < ?1", params![cutoff_ts])?;
         Ok(affected as u64)
     }
 
@@ -458,10 +455,7 @@ pub async fn refresh_events_stored_gauge(store: &dyn AuditStore) {
 /// Same shape as the token / webhook / repo gauges — 60s tick keeps
 /// the value fresh enough for capacity dashboards while a SQLite
 /// `SELECT COUNT(*)` against an indexed table stays cheap.
-pub fn spawn_events_stored_gauge_refresher(
-    store: Arc<dyn AuditStore>,
-    tick: std::time::Duration,
-) {
+pub fn spawn_events_stored_gauge_refresher(store: Arc<dyn AuditStore>, tick: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // The caller populates the gauge synchronously at startup, so
@@ -519,8 +513,7 @@ async fn record_silent(
     // Always-on (cardinality is bounded by the audit-event vocabulary,
     // currently 7 kinds), and incremented up front so a SQLite hiccup
     // doesn't drop the count.
-    metrics::counter!("artifacts_audit_events_total", "event" => event.to_string())
-        .increment(1);
+    metrics::counter!("artifacts_audit_events_total", "event" => event.to_string()).increment(1);
     let evt = AuditEvent {
         id: 0,
         ts: now_unix_secs(),
@@ -575,8 +568,12 @@ mod tests {
     #[tokio::test]
     async fn record_then_list_round_trips() {
         let (_d, s) = store();
-        s.record(evt("repo.create", "admin", Some("r1"))).await.unwrap();
-        s.record(evt("token.mint", "u-42", Some("r1"))).await.unwrap();
+        s.record(evt("repo.create", "admin", Some("r1")))
+            .await
+            .unwrap();
+        s.record(evt("token.mint", "u-42", Some("r1")))
+            .await
+            .unwrap();
         let rows = s.list(AuditQuery::default()).await.unwrap();
         assert_eq!(rows.len(), 2);
         // Newest-first ordering: token.mint inserted last, listed first.
@@ -589,9 +586,15 @@ mod tests {
     #[tokio::test]
     async fn list_filters_by_event_actor_repo() {
         let (_d, s) = store();
-        s.record(evt("repo.create", "admin", Some("r1"))).await.unwrap();
-        s.record(evt("repo.create", "u-1", Some("r2"))).await.unwrap();
-        s.record(evt("token.mint", "u-1", Some("r2"))).await.unwrap();
+        s.record(evt("repo.create", "admin", Some("r1")))
+            .await
+            .unwrap();
+        s.record(evt("repo.create", "u-1", Some("r2")))
+            .await
+            .unwrap();
+        s.record(evt("token.mint", "u-1", Some("r2")))
+            .await
+            .unwrap();
 
         let by_event = s
             .list(AuditQuery {
@@ -654,7 +657,9 @@ mod tests {
     async fn limit_caps_returned_rows() {
         let (_d, s) = store();
         for i in 0..50 {
-            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
         }
         let lim = s
             .list(AuditQuery {
@@ -674,7 +679,9 @@ mod tests {
         // depend on: page N+1 starts where page N ended.
         let (_d, s) = store();
         for i in 0..5 {
-            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
         }
         let page = s
             .list(AuditQuery {
@@ -707,7 +714,9 @@ mod tests {
     async fn list_default_limit_is_one_hundred() {
         let (_d, s) = store();
         for i in 0..150 {
-            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
         }
         let rows = s.list(AuditQuery::default()).await.unwrap();
         assert_eq!(rows.len(), 100);
@@ -717,7 +726,9 @@ mod tests {
     async fn list_limit_capped_at_one_thousand() {
         let (_d, s) = store();
         for i in 0..1500 {
-            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
         }
         let rows = s
             .list(AuditQuery {
@@ -735,7 +746,9 @@ mod tests {
         let path = dir.path().join("audit.db");
         {
             let s = SqliteAuditStore::open(&path).unwrap();
-            s.record(evt("repo.create", "admin", Some("r1"))).await.unwrap();
+            s.record(evt("repo.create", "admin", Some("r1")))
+                .await
+                .unwrap();
         }
         let s = SqliteAuditStore::open(&path).unwrap();
         let rows = s.list(AuditQuery::default()).await.unwrap();
@@ -809,7 +822,9 @@ mod tests {
     async fn fresh_inserts_chain_correctly() {
         let (_d, s) = store();
         for i in 0..3 {
-            s.record(evt(&format!("e{i}"), "admin", None)).await.unwrap();
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
         }
         let ok = s.verify_chain().await.unwrap();
         assert_eq!(ok.verified, 3);

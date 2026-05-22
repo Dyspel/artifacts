@@ -8,7 +8,9 @@
 //! instead of propagating).
 
 use crate::metrics::parse_metrics;
-use crate::state::{AppState, MetricsSnapshot, RepoDetail, RepoSummary, Sample, HISTORY_WINDOW_SECS};
+use crate::state::{
+    AppState, MetricsSnapshot, RepoDetail, RepoSummary, Sample, HISTORY_WINDOW_SECS,
+};
 use crate::Cli;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -57,9 +59,7 @@ fn fetch_all_repos(base: &str, token: &str) -> Result<Vec<RepoSummary>> {
         let total = resp
             .header("x-total-count")
             .and_then(|h| h.parse::<u64>().ok());
-        let page: Vec<RepoSummary> = resp
-            .into_json()
-            .context("parse admin/repos response")?;
+        let page: Vec<RepoSummary> = resp.into_json().context("parse admin/repos response")?;
         Ok((page, total))
     })
 }
