@@ -46,12 +46,15 @@
 //! re-compute at write time is the cryptographic check that matters
 //! for storage.
 
-// D1 stages helpers + the non-delta storage entry point; D2/D3 add
-// delta resolution and D4 wires it all into `SqliteObjectStore::ingest_pack`.
-// Until D4 lands the production callers, the parser is reachable
-// only from #[cfg(test)] — silence the unused-code lints crate-wide
-// for this module rather than scattering #[allow] attrs on every
-// item that lands across two more commits.
+// Most of the parser's internal helpers (`apply_delta`,
+// `loose_oid_hex`, `loose_format_bytes`, `store_with_ref_delta_resolution`,
+// etc.) are reachable only from this module's tests — the production
+// entry point is `store_with_full_resolution`, which
+// `SqliteObjectStore::ingest_pack` calls into directly. Silencing the
+// crate-root `deny(unused)` here keeps the per-item set tight without
+// scattering `#[allow]` attrs across a dozen places that are
+// load-bearing for tests + would re-light if a future backend wants
+// the smaller surfaces.
 #![allow(dead_code)]
 
 use crate::error::{Error, Result};

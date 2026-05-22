@@ -120,7 +120,7 @@ end-to-end in a day, not a quarter.
 
 | Feature                                                          | Status |
 | ---------------------------------------------------------------- | ------ |
-| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait (read + write + list + delete + exists + ingest_pack) + `MemObjectStore` + atomic-write `FsObjectStore` + `SqliteObjectStore` (the KV-shaped second backend) + conformance suite + `gc` / commits-parent-exists / native receive-pack writes all routed through trait; remaining: blob-read endpoint routing + KV-shaped `ingest_pack` impl (needs a delta resolver) | 🟡 M2b |
+| Chunked-KV / object-store `Storage` impl — `ObjectStore` trait + `MemObjectStore` + atomic-write `FsObjectStore` + `SqliteObjectStore` (KV-shaped second backend) + conformance suite. `gc` / commits-parent-exists / blob-read / native receive-pack writes all routed through the trait. `SqliteObjectStore::ingest_pack` resolves Direct + REF_DELTA + OFS_DELTA against the KV — no filesystem touch on the push path. | ✅ M2b |
 | Multi-node distributed `RefStore` impl — trait + `MemRefStore` conformance ready, consensus log remains | 🟡 M3b |
 | Per-token self-revocation, bulk rotate, account-level credentials, listing | ✅ M4b |
 | Admin-token rotation (in-process) | ✅ M4b-key-rotation |
@@ -150,21 +150,20 @@ when subprocess isn't an option.
 
 Remaining, in order:
 
-1. **M2b — chunked-KV `Storage` impl.** `ObjectStore` trait
+1. **M2b — chunked-KV `Storage` impl** ✅. `ObjectStore` trait
    (`read_loose` + `write_loose` + `list_loose` + `delete_loose` +
    `exists` + `ingest_pack` + `read_object`) + three impls —
    `FsObjectStore` with atomic tmp+rename writes, `MemObjectStore`,
    and `SqliteObjectStore` (the KV-shaped second backend matching
    the DO+SQLite production target). Shared conformance suite covers
-   all three, **plus `SqliteObjectStore::ingest_pack` now lands
-   end-to-end via a tempdir + `gix_pack::Bundle::write_to_directory`
-   stopgap** (write pack to a temp dir, index it via gix, iterate
-   the indexed entries, store each decoded object as zlib-deflated
-   loose-format bytes in SQLite). The tempdir touch is local-only;
-   the honest follow-up is a hand-rolled KV-targeted delta
-   resolver. **Four production paths now go through the trait**:
-   `admin_gc_preview` / `admin_gc_run` enumerate and delete loose
-   objects; `create_commit`'s parent-exists check goes through
+   all three. `SqliteObjectStore::ingest_pack` runs through a
+   hand-rolled pack parser + delta resolver
+   (`src/native_pack/parse.rs`) that handles Direct, REF_DELTA, and
+   OFS_DELTA entries against the KV directly — no filesystem touch,
+   no tempdir, no gix-pack dependency on the push path.
+   **Four production paths go through the trait**: `admin_gc_preview`
+   / `admin_gc_run` enumerate and delete loose objects;
+   `create_commit`'s parent-exists check goes through
    `ObjectStore::exists` (replacing a `cat-file -e` subprocess —
    FS impl stats the loose path first, falls back to a gix-driven
    pack-index walk); the **native receive-pack** branch (enabled
@@ -1121,7 +1120,7 @@ for the full operator notes.
 | **M1b-2c** | ✅ done | Native pack generation via `gix-pack` (`rev_walk → count → entry::iter → bytes::FromEntriesIter`). The pack-objects subprocess is gone; remains as a fallback if the gix path errors. | pack-objects subprocess |
 | **M1b-3**  | ✅ done | Native receive-pack — ref-update parsing + sideband-1 report-status framing in-process; native CAS via `RefStore`. Native ref deletes (`push :branch`) included. | receive-pack subprocess |
 | **M1b-3-gix** | 🟡 opt-in | Native pack indexing via `gix-pack` (`Bundle::write_to_directory`). Available behind `ARTIFACTS_NATIVE_INDEX_PACK=1`; the bench (see Push latency above) showed `gix-pack` is ~4× slower than `git unpack-objects` on typical small pushes, so the default is the subprocess until the crossover improves upstream. The dispatch + helper are wired so a future chunked-KV `Storage` impl (which can't shell out) gets a working native path on day one. | n/a (default subprocess) |
-| **M2b**     | 🟡 | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait (`read_loose` + `write_loose` + `list_loose` + `delete_loose` + `exists` + `ingest_pack` + `read_object`) + atomic-write `FsObjectStore` + `MemObjectStore` + `SqliteObjectStore` + shared conformance suite landed. **Production routing**: `gc` enumerates/deletes through the trait; `create_commit`'s parent-exists goes through `ObjectStore::exists`; native receive-pack (when `ARTIFACTS_NATIVE_INDEX_PACK=1`) writes through `ObjectStore::ingest_pack`; blob-read fetches bytes through `ObjectStore::read_object`. `SqliteObjectStore::ingest_pack` lands end-to-end via a tempdir+gix stopgap (write pack to local temp dir, index via `gix_pack::Bundle::write_to_directory`, iterate entries, store each decoded object as zlib-deflated loose-format bytes). The tempdir is local-only and gone the moment the call returns; a hand-rolled KV-targeted delta resolver (true "no filesystem" purity) is the next layer. | bare repos on disk |
+| **M2b**     | ✅ done | second `Storage` impl — objects chunked into a KV, matching the DO+SQLite shape. `ObjectStore` trait (`read_loose` + `write_loose` + `list_loose` + `delete_loose` + `exists` + `ingest_pack` + `read_object`) + atomic-write `FsObjectStore` + `MemObjectStore` + `SqliteObjectStore` + shared conformance suite. **Production routing**: `gc` enumerates/deletes through the trait; `create_commit`'s parent-exists goes through `ObjectStore::exists`; native receive-pack (when `ARTIFACTS_NATIVE_INDEX_PACK=1`) writes through `ObjectStore::ingest_pack`; blob-read fetches bytes through `ObjectStore::read_object`. `SqliteObjectStore::ingest_pack` resolves pack bytes via a hand-rolled parser + delta engine (`src/native_pack/parse.rs`) — Direct, REF_DELTA, and OFS_DELTA all resolve against the KV directly, no filesystem touch. | bare repos on disk |
 | **M3b**     | 🟡 | distributed `RefStore` impl (per-repo state machine / Raft / DO). `MemRefStore` + concurrent-CAS conformance suite landed; the consensus log itself (openraft etc.) is the remaining work. | single-node CAS |
 | **M4b**     | ✅ done | Owner-scoped token self-revoke + bulk rotate (`POST /v1/repos/:id/tokens/rotate`). Account-level credentials (token-subject column + listing) is the remaining slice. | admin-only token management |
 | **M4b-key-rotation** | ✅ done | In-process admin-token rotation (`POST /v1/admin/token/rotate`). `Config::admin_token` is a runtime `RwLock<String>`; rotation atomically swaps the cell, the previous token stops authorizing on the next request, and the event lands on the `audit` tracing target. | env-var-on-restart only |
