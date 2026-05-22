@@ -33,6 +33,12 @@ pub struct Config {
     /// hash-object` per file, which pins memory proportional to blob
     /// size during its run.
     pub max_commit_blob_bytes: usize,
+
+    /// Maximum on-disk size of a single repo's bare git dir in bytes.
+    /// Enforced on REST commits + receive-pack at the dispatch
+    /// boundary. `0` means unlimited (default). Set via
+    /// `--max-repo-bytes` / `ARTIFACTS_MAX_REPO_BYTES`.
+    pub max_repo_bytes: u64,
 }
 
 impl Config {
@@ -43,6 +49,7 @@ impl Config {
         jwt_secret: Option<String>,
         max_repos_per_user: u64,
         max_commit_blob_bytes: usize,
+        max_repo_bytes: u64,
     ) -> Self {
         Self {
             data_dir,
@@ -51,6 +58,7 @@ impl Config {
             jwt_secret: RwLock::new(jwt_secret),
             max_repos_per_user,
             max_commit_blob_bytes,
+            max_repo_bytes,
         }
     }
 
@@ -108,6 +116,7 @@ mod tests {
             None,
             16,
             1024,
+            0,
         )
     }
 

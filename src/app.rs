@@ -113,6 +113,12 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_MAX_COMMIT_BLOB_BYTES", default_value_t = 8 * 1024 * 1024)]
     pub max_commit_blob_bytes: usize,
 
+    /// Maximum on-disk size of a single repo (bare git dir) in bytes.
+    /// Enforced on REST commits + receive-pack at the dispatch
+    /// boundary. `0` means unlimited (default).
+    #[arg(long, env = "ARTIFACTS_MAX_REPO_BYTES", default_value_t = 0)]
+    pub max_repo_bytes: u64,
+
     /// PEM-encoded TLS certificate. Pair with `--tls-key`.
     #[arg(long, env = "ARTIFACTS_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -164,6 +170,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         token_db,
         max_repos_per_user,
         max_commit_blob_bytes,
+        max_repo_bytes,
         tls_cert,
         tls_key,
         shutdown_timeout_secs,
@@ -237,6 +244,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         jwt_secret,
         max_repos_per_user,
         max_commit_blob_bytes,
+        max_repo_bytes,
     ));
     tracing::info!(
         max_repos_per_user,

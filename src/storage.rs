@@ -17,6 +17,31 @@
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
+/// Enforce the per-repo byte quota at a mutation boundary. Walks the
+/// bare repo's on-disk size and refuses the request if the current
+/// usage is at or above `limit`. `limit == 0` means unlimited (the
+/// default; the quota is opt-in via `ARTIFACTS_MAX_REPO_BYTES`).
+///
+/// Race semantics match the per-user repo-count quota: the check is
+/// non-transactional; concurrent writers can push the repo a little
+/// over before the next check sees it. That's acceptable for a soft
+/// quota — the next request lands the 413.
+pub fn check_repo_byte_quota(repos_dir: &Path, repo_id: &str, limit: u64) -> Result<()> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let git_dir = repos_dir.join(format!("{repo_id}.git"));
+    let bytes_used = crate::rest::dir_size(&git_dir).unwrap_or(0);
+    if bytes_used >= limit {
+        return Err(Error::RepoByteQuotaExceeded {
+            repo_id: repo_id.to_string(),
+            bytes_used,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 /// Repo lifecycle. Implementations are free to back repos with any
 /// storage medium as long as they can honor create / fork / delete /
 /// exists semantics. `FsStorage` is the one impl today.
@@ -382,6 +407,43 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim(),
             "true",
             "git didn't recognize our layout as bare"
+        );
+    }
+
+    #[test]
+    fn byte_quota_zero_means_unlimited() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = new_repo_id();
+        storage.create(&id).unwrap();
+        // `limit = 0` always allows, regardless of size.
+        assert!(check_repo_byte_quota(&tmp.join("repos"), &id, 0).is_ok());
+    }
+
+    #[test]
+    fn byte_quota_under_limit_passes() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = new_repo_id();
+        storage.create(&id).unwrap();
+        // Fresh bare-repo layout is a few hundred bytes; 100 MiB is
+        // generous headroom.
+        assert!(check_repo_byte_quota(&tmp.join("repos"), &id, 100 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn byte_quota_over_limit_errors_with_quota_variant() {
+        let tmp = tempdir();
+        let storage = FsStorage::new(tmp.join("repos")).unwrap();
+        let id = new_repo_id();
+        storage.create(&id).unwrap();
+        // Limit of 1 byte will fail — every fresh repo has at least
+        // a HEAD file (~20 bytes) on disk.
+        let err = check_repo_byte_quota(&tmp.join("repos"), &id, 1).unwrap_err();
+        assert!(
+            matches!(err, Error::RepoByteQuotaExceeded { ref repo_id, limit, .. }
+                if repo_id == &id && limit == 1),
+            "got: {err}"
         );
     }
 

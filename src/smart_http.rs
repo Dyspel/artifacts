@@ -120,6 +120,14 @@ pub async fn git_handler(
             pack_handler(&repo_path, "upload-pack", request, native_ctx).await
         }
         ("POST", "git-receive-pack") => {
+            // Soft per-repo byte quota. Cheap dir walk before we
+            // burn the request body's bandwidth + the pack-index
+            // CPU; same shape as the REST-commits enforcement.
+            crate::storage::check_repo_byte_quota(
+                &state.cfg.repos_dir(),
+                &repo_id,
+                state.cfg.max_repo_bytes,
+            )?;
             // Native receive-pack is gated behind the same `refs_for_native`
             // tuple as upload-pack — both want a `&dyn RefStore` to do CAS
             // (push) or read (fetch). The function then decides per-request

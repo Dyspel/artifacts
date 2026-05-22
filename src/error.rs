@@ -59,6 +59,13 @@ pub enum Error {
     #[error("repo quota exceeded for {subject} (limit: {limit})")]
     QuotaExceeded { subject: String, limit: u64 },
 
+    #[error("repo {repo_id} byte quota exceeded ({bytes_used} ≥ {limit})")]
+    RepoByteQuotaExceeded {
+        repo_id: String,
+        bytes_used: u64,
+        limit: u64,
+    },
+
     #[error("rate limited; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
@@ -109,6 +116,27 @@ impl IntoResponse for Error {
                     }
                 }));
                 return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            }
+            Error::RepoByteQuotaExceeded {
+                repo_id,
+                bytes_used,
+                limit,
+            } => {
+                // 413 Payload Too Large — the next push/commit would
+                // exceed the per-repo byte quota. Distinct counter from
+                // the per-user repo-count quota (`quota_exceeded`) so
+                // dashboards can chart them separately.
+                metrics::counter!("artifacts_repo_byte_quota_exceeded_total").increment(1);
+                let body = Json(json!({
+                    "error": {
+                        "code": "repo_byte_quota_exceeded",
+                        "message": format!("repo {repo_id} byte quota exceeded ({bytes_used} >= {limit})"),
+                        "repoId": repo_id,
+                        "bytesUsed": bytes_used,
+                        "limit": limit,
+                    }
+                }));
+                return (StatusCode::PAYLOAD_TOO_LARGE, body).into_response();
             }
             Error::RateLimited { retry_after_secs } => {
                 // 429 + Retry-After. Distinct `code` from `quota_exceeded`

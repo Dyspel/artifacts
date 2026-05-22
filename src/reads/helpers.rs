@@ -53,9 +53,11 @@ pub(super) fn is_valid_notes_ref(s: &str) -> bool {
 }
 
 /// Recursive on-disk size of a directory in bytes. Used by the
-/// repo-detail endpoint to surface a size hint; the walk is best-
-/// effort and silently skips entries it can't stat.
-pub(super) fn dir_size(path: &Path) -> std::io::Result<u64> {
+/// repo-detail endpoint to surface a size hint, and by the per-repo
+/// byte-quota check (`Config::max_repo_bytes`) to decide whether a
+/// commit / push should be rejected. The walk is best-effort and
+/// silently skips entries it can't stat.
+pub(crate) fn dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;

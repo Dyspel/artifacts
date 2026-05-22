@@ -80,6 +80,20 @@ groups:
             (most common) or a legitimate growth need (rare). Bump
             ARTIFACTS_MAX_REPOS_PER_USER only after confirming.
 
+      - alert: ArtifactsRepoByteQuotaSustained
+        expr: rate(artifacts_repo_byte_quota_exceeded_total[5m]) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained 413 repo_byte_quota_exceeded rejections"
+          description: |
+            One or more repos are repeatedly hitting the per-repo
+            byte quota (`ARTIFACTS_MAX_REPO_BYTES`). Either a runaway
+            client pushing large pack files, a legitimate growth
+            event, or a need to GC the repo. Audit the audit log
+            for the affected repo IDs before bumping the limit.
+
       - alert: ArtifactsSqlitePoolExhausted
         expr: |
           artifacts_sqlite_pool_in_use

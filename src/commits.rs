@@ -119,6 +119,15 @@ pub async fn create_commit(
         return Err(Error::RepoNotFound(repo_id));
     }
     enforce_owner(&*state.data.ownership, &principal, &repo_id).await?;
+    // Soft per-repo byte quota. Race semantics match the per-user
+    // repo-count quota — a concurrent commit can land while we're
+    // checking, so a near-quota repo can momentarily go a few KB
+    // over. Acceptable; the next commit catches it.
+    crate::storage::check_repo_byte_quota(
+        &state.cfg.repos_dir(),
+        &repo_id,
+        state.cfg.max_repo_bytes,
+    )?;
     if !valid_branch_name(&body.branch) {
         return Err(Error::BadRequest(format!(
             "invalid branch name: {:?}",
