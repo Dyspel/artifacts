@@ -366,6 +366,289 @@ pub(crate) fn store_non_delta_entries<S: ObjectStore + ?Sized>(
     Ok(count)
 }
 
+// ---------------------------------------------------------------------
+// Delta resolution
+//
+// Git delta format (per Documentation/technical/pack-format.txt):
+//
+//   source_size  varint   (LE, MSB-continuation)
+//   target_size  varint
+//   instructions (until end of stream):
+//     COPY:    first_byte & 0x80 == 0x80
+//       lower 7 bits encode which optional offset/size bytes follow
+//         bit 0..3: offset byte present (LSB → MSB)
+//         bit 4..6: size byte present   (LSB → MSB)
+//       default offset = 0; default size = 0x10000 (when no size byte set)
+//       output += source[offset..offset + size]
+//     INSERT:  first_byte & 0x80 == 0
+//       size = first_byte & 0x7f   (size == 0 is reserved/invalid)
+//       output += next `size` bytes of the delta stream
+//
+// We trust the target_size header and pre-allocate exactly that — a
+// resolved object's size is bounded by what the pack producer chose,
+// not by attacker-controllable input on the wire.
+// ---------------------------------------------------------------------
+
+/// Decode a delta varint from `bytes[idx..]`. Returns the value and
+/// how many bytes it consumed. Lower 7 bits per byte; MSB continues.
+fn read_delta_varint(bytes: &[u8], mut idx: usize) -> Result<(u64, usize)> {
+    let start = idx;
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if idx >= bytes.len() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "delta varint: truncated at offset {idx}"
+            )));
+        }
+        let byte = bytes[idx];
+        idx += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((value, idx - start));
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(Error::Other(anyhow::anyhow!("delta varint: overflows u64")));
+        }
+    }
+}
+
+/// Apply a delta-instruction stream against `base`, producing the
+/// target payload. Errors on truncated input, source-size mismatch,
+/// or COPY out of range.
+pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    let (source_size, mut idx) = read_delta_varint(delta, 0)?;
+    if source_size != base.len() as u64 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "delta source size {source_size} != base len {}",
+            base.len()
+        )));
+    }
+    let (target_size, consumed) = read_delta_varint(delta, idx)?;
+    idx += consumed;
+
+    let target_size_usize = usize::try_from(target_size)
+        .map_err(|_| Error::Other(anyhow::anyhow!("delta target size too large for usize")))?;
+    let mut out = Vec::with_capacity(target_size_usize);
+
+    while idx < delta.len() {
+        let op = delta[idx];
+        idx += 1;
+        if op & 0x80 != 0 {
+            // COPY. Decode the 4-bit offset bitmask + 3-bit size bitmask.
+            let mut offset: u32 = 0;
+            for shift in 0..4 {
+                if op & (1 << shift) != 0 {
+                    if idx >= delta.len() {
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "delta COPY: truncated offset"
+                        )));
+                    }
+                    offset |= u32::from(delta[idx]) << (shift * 8);
+                    idx += 1;
+                }
+            }
+            let mut size: u32 = 0;
+            for shift in 0..3 {
+                if op & (1 << (4 + shift)) != 0 {
+                    if idx >= delta.len() {
+                        return Err(Error::Other(anyhow::anyhow!("delta COPY: truncated size")));
+                    }
+                    size |= u32::from(delta[idx]) << (shift * 8);
+                    idx += 1;
+                }
+            }
+            if size == 0 {
+                // Per spec: zero-encoded size means 0x10000.
+                size = 0x10000;
+            }
+            let start = offset as usize;
+            let end = start.saturating_add(size as usize);
+            if end > base.len() {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "delta COPY: range {start}..{end} out of base len {}",
+                    base.len()
+                )));
+            }
+            out.extend_from_slice(&base[start..end]);
+        } else {
+            // INSERT. Low 7 bits of op = literal byte count.
+            let n = (op & 0x7f) as usize;
+            if n == 0 {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "delta INSERT: zero-byte op is reserved"
+                )));
+            }
+            if idx + n > delta.len() {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "delta INSERT: {n} bytes wanted, {} available",
+                    delta.len() - idx
+                )));
+            }
+            out.extend_from_slice(&delta[idx..idx + n]);
+            idx += n;
+        }
+    }
+
+    if out.len() as u64 != target_size {
+        return Err(Error::Other(anyhow::anyhow!(
+            "delta applied: got {} bytes, target_size said {}",
+            out.len(),
+            target_size
+        )));
+    }
+    Ok(out)
+}
+
+/// Read a base object's `(kind, payload)` out of an `ObjectStore` by
+/// inflating its loose bytes locally. Sidesteps `read_object` —
+/// the trait default isn't implemented on MemObjectStore /
+/// SqliteObjectStore, but read_loose is universally available. The
+/// loose-only restriction is fine for the D4 production target
+/// (SqliteObjectStore stores everything as loose KV rows); FsObjectStore
+/// already overrides read_object directly when packed bases need to
+/// resolve.
+fn read_loose_inflated<S: ObjectStore + ?Sized>(
+    store: &S,
+    repo_id: &str,
+    oid: &str,
+) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    let Some(bytes) = store.read_loose(repo_id, oid)? else {
+        return Ok(None);
+    };
+    let mut decoder = flate2::read::ZlibDecoder::new(bytes.as_slice());
+    let mut inflated = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut inflated)
+        .map_err(|e| Error::Other(anyhow::anyhow!("loose inflate {oid}: {e}")))?;
+    let nul = inflated
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("loose {oid}: header has no NUL")))?;
+    let header = std::str::from_utf8(&inflated[..nul])
+        .map_err(|e| Error::Other(anyhow::anyhow!("loose {oid}: header utf8: {e}")))?;
+    let mut split = header.splitn(2, ' ');
+    let kind = split
+        .next()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("loose {oid}: missing kind")))?;
+    let kind = match kind {
+        "commit" => ObjectKind::Commit,
+        "tree" => ObjectKind::Tree,
+        "blob" => ObjectKind::Blob,
+        "tag" => ObjectKind::Tag,
+        other => {
+            return Err(Error::Other(anyhow::anyhow!(
+                "loose {oid}: unknown kind {other:?}"
+            )));
+        }
+    };
+    let payload = inflated[nul + 1..].to_vec();
+    Ok(Some((kind, payload)))
+}
+
+/// D2 entry point. Parse `pack_bytes`, store every non-delta entry,
+/// then resolve every REF_DELTA entry against its base in the store
+/// (either just-written this run or already present from a prior
+/// ingest). OFS_DELTA entries still fail here — D3 adds them.
+///
+/// Returns the number of objects stored across both phases.
+pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
+    pack_bytes: &[u8],
+    repo_id: &str,
+    store: &S,
+) -> Result<usize> {
+    let entries = parse_pack(pack_bytes)?;
+    let mut count = 0usize;
+
+    // Phase 1: write every direct entry. After this, REF_DELTA bases
+    // that point at same-pack non-deltas are visible via read_loose.
+    for entry in &entries {
+        if let ParsedKind::Direct(kind) = entry.kind {
+            let oid = loose_oid_hex(kind, &entry.data);
+            let loose = loose_format_bytes(kind, &entry.data)?;
+            store.write_loose(repo_id, &oid, &loose)?;
+            count += 1;
+        }
+    }
+
+    // Phase 2: resolve REF_DELTA entries. Multiple passes in case a
+    // delta points at another delta (chains): each pass resolves
+    // every entry whose base is now available, until either the
+    // queue empties or a pass makes no progress (which would mean
+    // a missing base).
+    let mut pending: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e.kind {
+            ParsedKind::RefDelta { .. } => Some(i),
+            ParsedKind::OfsDelta { .. } => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    if pending.is_empty() {
+        return Ok(count);
+    }
+
+    // OfsDelta is a hard error at this layer; flag early before
+    // burning passes.
+    for &i in &pending {
+        if matches!(entries[i].kind, ParsedKind::OfsDelta { .. }) {
+            return Err(Error::Other(anyhow::anyhow!(
+                "entry {i}: OFS_DELTA not yet supported (D3)"
+            )));
+        }
+    }
+
+    loop {
+        let before = pending.len();
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for i in pending {
+            let entry = &entries[i];
+            let ParsedKind::RefDelta { base_oid } = entry.kind else {
+                unreachable!("filtered to delta kinds above");
+            };
+            let base_oid_hex = {
+                let mut s = String::with_capacity(40);
+                for b in base_oid {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                }
+                s
+            };
+            let Some((base_kind, base_payload)) =
+                read_loose_inflated(store, repo_id, &base_oid_hex)?
+            else {
+                still_pending.push(i);
+                continue;
+            };
+            let target = apply_delta(&base_payload, &entry.data).map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "entry {i}: REF_DELTA apply against {base_oid_hex}: {e}"
+                ))
+            })?;
+            // The target object inherits the base's kind — delta
+            // chains keep transforming the same object, never change
+            // its type.
+            let oid = loose_oid_hex(base_kind, &target);
+            let loose = loose_format_bytes(base_kind, &target)?;
+            store.write_loose(repo_id, &oid, &loose)?;
+            count += 1;
+        }
+        if still_pending.is_empty() {
+            return Ok(count);
+        }
+        if still_pending.len() == before {
+            // No progress — some delta's base is genuinely missing.
+            return Err(Error::Other(anyhow::anyhow!(
+                "ref_delta resolution: {} entries with missing bases",
+                still_pending.len()
+            )));
+        }
+        pending = still_pending;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +925,272 @@ mod tests {
         let mut expected = vec![blob, tree, commit];
         expected.sort();
         assert_eq!(hashes, expected, "hashes from parser must match git's");
+    }
+
+    /// Encode a delta varint (LE, MSB-continuation).
+    fn delta_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    #[test]
+    fn delta_varint_roundtrips() {
+        for &v in &[0u64, 1, 127, 128, 16384, 0x100_000_000, u32::MAX as u64] {
+            let bytes = delta_varint(v);
+            let (parsed, _) = read_delta_varint(&bytes, 0).unwrap();
+            assert_eq!(parsed, v, "varint round-trip for {v}");
+        }
+    }
+
+    #[test]
+    fn apply_delta_pure_insert() {
+        let base = b"the original".to_vec();
+        // Delta: source_size=base.len(), target_size=N, INSERT N bytes literal.
+        let target_payload = b"fresh bytes that didn't exist in the base";
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(target_payload.len() as u64));
+        // INSERT op: low 7 bits = length (must fit in 0..127).
+        assert!(target_payload.len() <= 127);
+        delta.push(target_payload.len() as u8);
+        delta.extend_from_slice(target_payload);
+        let out = apply_delta(&base, &delta).unwrap();
+        assert_eq!(out, target_payload);
+    }
+
+    #[test]
+    fn apply_delta_pure_copy() {
+        let base = b"copy me copy you".to_vec();
+        // COPY all of base verbatim.
+        let target_size = base.len() as u64;
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(target_size));
+        // COPY op: MSB set | offset-byte-0 bit | size-byte-0 bit.
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00); // offset low byte = 0
+        delta.push(base.len() as u8); // size low byte = len
+        let out = apply_delta(&base, &delta).unwrap();
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn apply_delta_mixed_copy_then_insert() {
+        let base = b"prefix:OLD_SUFFIX".to_vec();
+        // Target = "prefix:" + "NEW_TAIL"
+        let copy_prefix = b"prefix:";
+        let insert_tail = b"NEW_TAIL";
+        let target_size = copy_prefix.len() + insert_tail.len();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(target_size as u64));
+        // COPY 7 bytes from offset 0.
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00);
+        delta.push(copy_prefix.len() as u8);
+        // INSERT insert_tail.
+        delta.push(insert_tail.len() as u8);
+        delta.extend_from_slice(insert_tail);
+        let out = apply_delta(&base, &delta).unwrap();
+        assert_eq!(out, [copy_prefix.as_ref(), insert_tail.as_ref()].concat());
+    }
+
+    #[test]
+    fn apply_delta_rejects_source_mismatch() {
+        let base = b"too short".to_vec();
+        let mut delta = Vec::new();
+        // Claim source is 100 bytes; base is only 9.
+        delta.extend_from_slice(&delta_varint(100));
+        delta.extend_from_slice(&delta_varint(1));
+        delta.push(1);
+        delta.push(b'x');
+        let err = apply_delta(&base, &delta).unwrap_err();
+        assert!(format!("{err}").contains("source size"));
+    }
+
+    // Helper for D2 tests: build a pack containing one direct entry
+    // + one REF_DELTA referencing it. The REF_DELTA reproduces the
+    // base-plus-insert-tail shape used by `apply_delta_mixed_copy_then_insert`.
+    fn build_pack_with_ref_delta(
+        base_kind: ObjectKind,
+        base_payload: &[u8],
+        tail: &[u8],
+    ) -> (Vec<u8>, [u8; 20]) {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        let base_oid_bytes: [u8; 20] = {
+            let mut h = Sha1::new();
+            h.update(format!("{} {}\0", kind_str(base_kind), base_payload.len()).as_bytes());
+            h.update(base_payload);
+            h.finalize().into()
+        };
+
+        // Build delta instructions: COPY all of base, INSERT tail.
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base_payload.len() as u64));
+        delta.extend_from_slice(&delta_varint((base_payload.len() + tail.len()) as u64));
+        // COPY base_payload.len() bytes from offset 0. Size encoding
+        // uses 1-3 bytes; handle the >255 case.
+        let bp_len = base_payload.len() as u32;
+        let mut copy_op = 0x80u8;
+        let mut copy_args = Vec::new();
+        // offset byte 0 (offset = 0)
+        copy_op |= 0x01;
+        copy_args.push(0u8);
+        // size bytes (1-3 needed)
+        let sz_b0 = (bp_len & 0xff) as u8;
+        let sz_b1 = ((bp_len >> 8) & 0xff) as u8;
+        let sz_b2 = ((bp_len >> 16) & 0xff) as u8;
+        if sz_b0 != 0 {
+            copy_op |= 0x10;
+            copy_args.push(sz_b0);
+        }
+        if sz_b1 != 0 {
+            copy_op |= 0x20;
+            copy_args.push(sz_b1);
+        }
+        if sz_b2 != 0 {
+            copy_op |= 0x40;
+            copy_args.push(sz_b2);
+        }
+        delta.push(copy_op);
+        delta.extend_from_slice(&copy_args);
+        // INSERT tail. Length must fit in 7 bits (≤ 127) for one op.
+        assert!(tail.len() <= 127);
+        delta.push(tail.len() as u8);
+        delta.extend_from_slice(tail);
+
+        // Now assemble the pack.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes()); // 2 entries
+
+        // Entry 1: the direct base.
+        let type_byte = match base_kind {
+            ObjectKind::Commit => OBJ_COMMIT,
+            ObjectKind::Tree => OBJ_TREE,
+            ObjectKind::Blob => OBJ_BLOB,
+            ObjectKind::Tag => OBJ_TAG,
+        };
+        let mut bsz = base_payload.len() as u64;
+        let mut header =
+            vec![(if bsz >> 4 > 0 { 0x80 } else { 0 }) | (type_byte << 4) | ((bsz & 0xf) as u8)];
+        bsz >>= 4;
+        while bsz > 0 {
+            let b = (bsz & 0x7f) as u8;
+            bsz >>= 7;
+            header.push((if bsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&header);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(base_payload).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // Entry 2: REF_DELTA pointing at entry 1.
+        let target_size = (base_payload.len() + tail.len()) as u64;
+        let mut dsz = target_size;
+        let mut dheader = vec![
+            (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dsz & 0xf) as u8),
+        ];
+        dsz >>= 4;
+        while dsz > 0 {
+            let b = (dsz & 0x7f) as u8;
+            dsz >>= 7;
+            dheader.push((if dsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&dheader);
+        pack.extend_from_slice(&base_oid_bytes);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&delta).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // SHA-1 trailer.
+        let mut h = Sha1::new();
+        h.update(&pack);
+        pack.extend_from_slice(&h.finalize());
+        (pack, base_oid_bytes)
+    }
+
+    #[test]
+    fn ref_delta_resolves_against_in_pack_base() {
+        let base_payload = b"the quick brown fox\n";
+        let tail = b" jumps over\n";
+        let (pack, _base_oid_bytes) =
+            build_pack_with_ref_delta(ObjectKind::Blob, base_payload, tail);
+
+        let store = MemObjectStore::new();
+        let n = store_with_ref_delta_resolution(&pack, "r", &store).unwrap();
+        assert_eq!(n, 2, "base + delta-resolved target");
+
+        // Both objects must exist.
+        let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
+        let expected_target: Vec<u8> = [base_payload.as_ref(), tail.as_ref()].concat();
+        let target_oid = loose_oid_hex(ObjectKind::Blob, &expected_target);
+        assert!(store.exists("r", &base_oid).unwrap());
+        assert!(store.exists("r", &target_oid).unwrap());
+
+        // The resolved target's loose bytes inflate to the right payload.
+        let stored = store.read_loose("r", &target_oid).unwrap().unwrap();
+        let mut d = flate2::read::ZlibDecoder::new(stored.as_slice());
+        let mut inflated = Vec::new();
+        std::io::Read::read_to_end(&mut d, &mut inflated).unwrap();
+        let nul = inflated.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&inflated[..nul]).unwrap(),
+            format!("blob {}", expected_target.len())
+        );
+        assert_eq!(&inflated[nul + 1..], expected_target.as_slice());
+    }
+
+    #[test]
+    fn ref_delta_missing_base_errors() {
+        // Same pack shape but only the REF_DELTA entry — the base
+        // isn't in the pack and isn't in the store.
+        let (pack, _) = build_pack_with_ref_delta(ObjectKind::Blob, b"some base", b" tail");
+        // Strip the first entry by rebuilding the pack with only the
+        // delta entry. Easier: just feed an empty store but use a
+        // delta pointing at a base OID nothing has — the function
+        // should fail with "missing bases."
+        // Quick hack: use the existing helper but wipe the loose
+        // copy of the base after store_with_ref_delta_resolution
+        // would have written it — except phase-1 writes the base
+        // unconditionally, so we'd never miss. Build a pack with
+        // ONLY a REF_DELTA pointing at a phantom OID instead.
+        let mut p = Vec::new();
+        p.extend_from_slice(b"PACK");
+        p.extend_from_slice(&2u32.to_be_bytes());
+        p.extend_from_slice(&1u32.to_be_bytes());
+        // REF_DELTA header, target_size=0 (after applying).
+        p.push(OBJ_REF_DELTA << 4);
+        p.extend_from_slice(&[0xab; 20]); // phantom base
+                                          // Empty delta body that claims source_size=0, target_size=0.
+        {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let body = vec![0u8, 0u8];
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&body).unwrap();
+            p.extend_from_slice(&enc.finish().unwrap());
+        }
+        p.extend_from_slice(&[0u8; 20]);
+
+        let store = MemObjectStore::new();
+        let err = store_with_ref_delta_resolution(&p, "r", &store).unwrap_err();
+        let _ = pack; // silence unused
+        assert!(format!("{err}").contains("missing bases"), "got: {err}");
     }
 
     #[test]
