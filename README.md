@@ -98,6 +98,7 @@ end-to-end in a day, not a quarter.
 | `GET /v1/admin/repos/:id/gc-preview` + `POST .../gc` — alternates-aware loose-object GC | ✅ |
 | `POST /v1/admin/token/rotate` — in-process admin-token rotation  | ✅     |
 | `POST /v1/admin/webhook-key/rotate` — re-encrypt every webhook secret under a fresh master key | ✅     |
+| `POST /v1/admin/jwt-key/rotate` — swap the in-process JWT signing secret (file-backed `<data-dir>/jwt-key.bin` when not env-pinned) | ✅     |
 | `GET /v1/admin/audit` — persistent audit log, filtered + paginated | ✅     |
 | `GET /v1/admin/audit/stats` — cheap row-count totals             | ✅     |
 | `GET /v1/admin/audit/verify-chain` — SHA-256 hash-chain tamper detection | ✅     |
@@ -570,6 +571,40 @@ compliance scenarios where an external archiver moves rows out
 before they age out.
 
 Admin-only. JWT principals get 403.
+
+### Rotate the JWT signing secret
+
+```
+POST /v1/admin/jwt-key/rotate
+Authorization: Bearer <admin>
+```
+
+Response:
+
+```json
+{
+  "key": "<base64-url-no-pad, 32 bytes of entropy>",
+  "persisted": true
+}
+```
+
+Generates a fresh HS256 secret, atomically swaps it into the in-memory
+cell, and returns it. After this call returns, every JWT minted under
+the previous secret stops verifying — coordinate with whatever identity
+provider (Dyspel backend, etc.) signs JWTs so both sides switch in
+lockstep.
+
+`persisted` is `true` when the new key was written to
+`<data-dir>/jwt-key.bin` (0600) — i.e., the deployment is file-backed
+(no `ARTIFACTS_JWT_SECRET` env var). `false` for env-pinned
+deployments: the response body is the only place the new key
+surfaces, and the operator must update the env var out of band
+before the process restarts.
+
+Admin-only. JWT principals get 403 (which is the only sane answer —
+rotating the JWT key while authenticating as a JWT user would lock
+the caller out mid-flight). Emits an `admin.jwt_key.rotate` audit
+event with `{persisted: bool}` — no key bytes in the event.
 
 ### Rotate the admin token
 

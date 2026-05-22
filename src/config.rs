@@ -13,8 +13,13 @@ pub struct Config {
     admin_token: RwLock<String>,
     /// Shared secret for verifying JWTs on REST endpoints. `None`
     /// disables the JWT auth path entirely — only the admin token is
-    /// accepted. Set via `--jwt-secret` / `ARTIFACTS_JWT_SECRET`.
-    pub jwt_secret: Option<String>,
+    /// accepted. Set initially via `--jwt-secret` /
+    /// `ARTIFACTS_JWT_SECRET` (or autoloaded from
+    /// `<data-dir>/jwt-key.bin` when the env var is unset). Rotated
+    /// in-place via `POST /v1/admin/jwt-key/rotate`; reads happen on
+    /// every REST call, so the RwLock keeps rotations from blocking
+    /// the auth hot path beyond the brief swap window.
+    jwt_secret: RwLock<Option<String>>,
 
     /// Maximum number of repos a single non-admin user may own. Applies
     /// to both `create_repo` and `fork_repo`. Admin bypasses. Set via
@@ -43,10 +48,30 @@ impl Config {
             data_dir,
             public_base_url,
             admin_token: RwLock::new(admin_token),
-            jwt_secret,
+            jwt_secret: RwLock::new(jwt_secret),
             max_repos_per_user,
             max_commit_blob_bytes,
         }
+    }
+
+    /// Snapshot the current JWT secret. Allocates — call once per
+    /// REST request at the auth boundary, not in inner loops. `None`
+    /// means JWT auth is disabled and only the admin token is
+    /// accepted.
+    pub fn jwt_secret(&self) -> Option<String> {
+        self.jwt_secret
+            .read()
+            .expect("jwt_secret lock poisoned")
+            .clone()
+    }
+
+    /// Replace the in-process JWT signing secret. Subsequent REST
+    /// requests verify against the new value; any JWT signed under
+    /// the old one stops authorizing immediately. Pass `None` to
+    /// disable JWT auth altogether (no clients can present any JWT
+    /// after this).
+    pub fn rotate_jwt_secret(&self, new: Option<String>) {
+        *self.jwt_secret.write().expect("jwt_secret lock poisoned") = new;
     }
 
     pub fn repos_dir(&self) -> PathBuf {

@@ -111,7 +111,7 @@ pub async fn create_commit(
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Commit)?;
     crate::storage::validate_repo_id(&repo_id)?;

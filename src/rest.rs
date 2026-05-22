@@ -41,7 +41,8 @@ use std::sync::Arc;
 // other handler modules) keep working after the split.
 pub use admin::{
     admin_audit_stats, admin_gc_preview, admin_gc_run, admin_get_repo, admin_list_audit,
-    admin_list_repos, admin_rotate_token, admin_rotate_webhook_key, admin_verify_audit_chain,
+    admin_list_repos, admin_rotate_jwt_key, admin_rotate_token, admin_rotate_webhook_key,
+    admin_verify_audit_chain,
 };
 pub use health::{health, health_ready};
 pub use repos::{create_repo, delete_repo, fork_repo, list_repos};
@@ -101,6 +102,12 @@ pub struct ObservState {
     /// env-var-only deployments. `admin_rotate_webhook_key` rewrites
     /// it post-rotation so a restart picks up the new key.
     pub webhook_key_path: Option<std::path::PathBuf>,
+    /// Path to the on-disk JWT signing secret. `None` when the
+    /// secret was env-pinned (`ARTIFACTS_JWT_SECRET` set) — in that
+    /// case the rotate endpoint still rotates the in-memory cell but
+    /// doesn't touch disk; the operator must update the env var out
+    /// of band before the process restarts.
+    pub jwt_key_path: Option<std::path::PathBuf>,
 }
 
 /// Process-level runtime signals. Today just the readiness drain
@@ -203,7 +210,7 @@ pub(crate) fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()
     let principal = authorize_rest(
         headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     if !matches!(principal, crate::auth::Principal::Admin) {
         return Err(Error::Forbidden(

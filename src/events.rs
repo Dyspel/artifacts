@@ -170,7 +170,7 @@ pub async fn sse_stream(
     let _principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     let rx = state.observ.events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|r| match r {

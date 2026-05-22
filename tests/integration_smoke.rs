@@ -403,6 +403,7 @@ fn smoke_end_to_end() {
     step18_sse_events(&server, &mut state);
     step_admin_inspection(&server, &state);
     step_audit_log(&server, &state);
+    step_admin_jwt_key_rotation(&server, &mut state);
     step_admin_token_rotation(&server, &state);
     step_drain_readiness(&mut server, &state);
 }
@@ -1566,6 +1567,53 @@ fn step_audit_log(server: &TestServer, st: &State) {
     let sv = parse_json(&stats.1);
     let total = sv.get("count").and_then(Value::as_u64).expect("count");
     assert!(total >= rows.len() as u64);
+}
+
+fn step_admin_jwt_key_rotation(server: &TestServer, st: &mut State) {
+    let auth = bearer(&server.admin_token);
+
+    // JWT user denied (must fire BEFORE the rotation; alice_jwt is
+    // still signed under the original secret here).
+    let jwt = send(
+        ureq::post(&format!("{}/v1/admin/jwt-key/rotate", server.base_url))
+            .set("Authorization", &bearer(&st.alice_jwt)),
+    );
+    assert_status(&jwt, 403, "JWT user cannot rotate JWT key");
+
+    // Admin rotation succeeds + returns a non-empty key.
+    let rotate = send(
+        ureq::post(&format!("{}/v1/admin/jwt-key/rotate", server.base_url))
+            .set("Authorization", &auth),
+    );
+    assert_status(&rotate, 200, "admin rotates JWT key");
+    let v = parse_json(&rotate.1);
+    let new_key = json_str(&v, "key").to_string();
+    assert!(!new_key.is_empty(), "rotated jwt key is empty");
+    // Env-pinned deployments don't persist to disk — the smoke harness
+    // sets ARTIFACTS_JWT_SECRET so persisted should be false.
+    assert_eq!(
+        v.get("persisted").and_then(Value::as_bool),
+        Some(false),
+        "env-pinned deployment should not persist on rotate"
+    );
+
+    // The new key is the live one — a JWT signed under it must
+    // authorize. Re-sign alice_jwt + bob_jwt under the new key so
+    // the subsequent admin-token-rotation step's "JWT user → 403"
+    // check still has a valid token to present (otherwise it would
+    // fail signature verification first and return 401).
+    st.alice_jwt = sign_jwt(&new_key, "alice");
+    st.bob_jwt = sign_jwt(&new_key, "bob");
+
+    let new_jwt_check = send(
+        ureq::get(&format!("{}/v1/repos", server.base_url))
+            .set("Authorization", &bearer(&st.alice_jwt)),
+    );
+    assert_status(
+        &new_jwt_check,
+        200,
+        "JWT signed under new key should authorize",
+    );
 }
 
 fn step_admin_token_rotation(server: &TestServer, _st: &State) {

@@ -200,6 +200,31 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         eprintln!("[artifacts] export ARTIFACTS_ADMIN_TOKEN={t} to persist across restarts");
         t
     });
+    // JWT secret resolution: env (already captured in `jwt_secret`)
+    // wins. If unset, fall back to `<data-dir>/jwt-key.bin`. If neither
+    // is present, JWT auth stays disabled until an admin rotates the
+    // key in via `POST /v1/admin/jwt-key/rotate`. The path is also the
+    // persistence target for that rotation; pinning via env means we
+    // skip the file rewrite (admin pre-committed the secret in the
+    // env, so the file isn't the source of truth).
+    let env_pinned_jwt = jwt_secret.is_some();
+    let jwt_key_path: Option<std::path::PathBuf> = if env_pinned_jwt {
+        None
+    } else {
+        Some(data_dir.join("jwt-key.bin"))
+    };
+    let jwt_secret = match jwt_secret {
+        Some(s) => Some(s),
+        None => jwt_key_path
+            .as_deref()
+            .filter(|p| p.exists())
+            .and_then(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.trim().to_string())
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            }),
+    };
     if jwt_secret.is_some() {
         tracing::info!("jwt auth enabled (HS256)");
     } else {
@@ -419,6 +444,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             events: event_bus,
             webhooks: webhook_registry,
             webhook_key_path,
+            jwt_key_path: jwt_key_path.clone(),
         },
         runtime: crate::rest::RuntimeState {
             draining: draining.clone(),
@@ -495,6 +521,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             "/v1/admin/webhook-key/rotate",
             post(rest::admin_rotate_webhook_key),
         )
+        .route("/v1/admin/jwt-key/rotate", post(rest::admin_rotate_jwt_key))
         .route("/v1/admin/audit", get(rest::admin_list_audit))
         .route("/v1/admin/audit/stats", get(rest::admin_audit_stats))
         .route(

@@ -41,7 +41,7 @@ pub async fn create_repo(
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Create)?;
     check_repo_quota(
@@ -108,7 +108,7 @@ pub async fn fork_repo(
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Create)?;
     if !state.data.storage.exists(&source_id) {
@@ -183,7 +183,7 @@ pub async fn delete_repo(
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Default)?;
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
@@ -283,7 +283,7 @@ pub async fn list_repos(
     let principal = authorize_rest(
         &headers,
         &state.cfg.admin_token(),
-        state.cfg.jwt_secret.as_deref(),
+        state.cfg.jwt_secret().as_deref(),
     )?;
     state
         .authn

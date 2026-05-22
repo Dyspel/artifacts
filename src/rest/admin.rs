@@ -234,6 +234,98 @@ pub async fn admin_rotate_token(
 }
 
 #[derive(Debug, Serialize)]
+pub struct AdminJwtKeyRotateResponse {
+    /// The freshly-generated JWT signing secret, base64-url-encoded
+    /// (no padding). 32 bytes of entropy. Caller must persist this
+    /// — if the server restarts before either the env var is
+    /// updated or the on-disk `<data-dir>/jwt-key.bin` is replaced,
+    /// every JWT minted under the previous key stops authorizing.
+    pub key: String,
+    /// True if the rotation persisted the new key to disk (i.e.
+    /// `<data-dir>/jwt-key.bin` was rewritten). False for env-pinned
+    /// deployments — the response body is the only place the new
+    /// key surfaces.
+    pub persisted: bool,
+}
+
+/// `POST /v1/admin/jwt-key/rotate`
+///
+/// Generates a fresh 32-byte HS256 secret, swaps the in-memory cell
+/// in `Config`, persists to `<data-dir>/jwt-key.bin` (0600) when the
+/// deployment is file-backed, and returns the new key. Mirrors the
+/// admin-token rotation pattern — the previous secret stops
+/// authorizing any JWT on the next request, no restart required.
+///
+/// Use this after a suspected leak of the JWT signing secret. Every
+/// JWT minted under the old secret instantly fails verification;
+/// fresh JWTs must be signed under the new secret. Coordinate with
+/// the identity provider (Dyspel backend etc.) — both sides need
+/// the new value to keep accepting tokens.
+///
+/// Admin-only. JWT principals get 403 (which is the only sane
+/// answer: a JWT user rotating the JWT key would lock themselves
+/// out mid-flight). Emits an `admin.jwt_key.rotate` audit event
+/// with `{persisted: bool}` — no key bytes in the event.
+pub async fn admin_rotate_jwt_key(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminJwtKeyRotateResponse>> {
+    require_admin(&state, &headers)?;
+    let new_key = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut bytes);
+        URL_SAFE_NO_PAD.encode(bytes)
+    };
+    state.cfg.rotate_jwt_secret(Some(new_key.clone()));
+
+    let persisted = if let Some(path) = state.observ.jwt_key_path.as_deref() {
+        // 0600 perms on POSIX; on Windows the OpenOptions mode flag is
+        // ignored but the file still gets the user's default ACL,
+        // which is roughly equivalent for single-user deployments.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(path).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(new_key.as_bytes())
+        }) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "jwt key file rewrite failed; persist `key` from response manually",
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    crate::audit::record(
+        &*state.observ.audit,
+        "admin.jwt_key.rotate",
+        "admin",
+        None,
+        serde_json::json!({ "persisted": persisted }),
+        None,
+    )
+    .await;
+
+    Ok(Json(AdminJwtKeyRotateResponse {
+        key: new_key,
+        persisted,
+    }))
+}
+
+#[derive(Debug, Serialize)]
 pub struct AdminWebhookKeyRotateResponse {
     /// Number of rows re-encrypted under the new key. Legacy
     /// plaintext rows (secret_nonce IS NULL) are skipped, so this
