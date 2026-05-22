@@ -1,0 +1,134 @@
+# Prometheus alertmanager rules for the artifacts server.
+#
+# Drop into your Prometheus config under `rule_files:` (one of the
+# entries can point at this file or at a directory containing it).
+# The alerts target the SLO violations that have actually shown up
+# in practice — tail-latency blowouts, sustained rejection rates,
+# pool exhaustion, and stuck-readiness drains.
+#
+# Severity convention (matches Alertmanager defaults):
+#   warning  — investigate during business hours.
+#   critical — page.
+#
+# `for:` durations are tuned to avoid flapping on transient
+# spikes. If your traffic shape makes any of them too noisy or too
+# slow, the right knob is the `for:` (lengthen to silence brief
+# blips, shorten to catch faster regressions) rather than the
+# threshold expression.
+
+groups:
+  - name: artifacts.slo
+    interval: 30s
+    rules:
+      - alert: ArtifactsP99LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(artifacts_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 request latency above 1s for 5m"
+          description: |
+            Sustained p99 latency above 1 second indicates either a
+            real slowdown (DB lock, FS pressure, upstream collector
+            backpressure on the OTLP path) or a saturation point on
+            the request-handling threadpool. Check the SQLite pool
+            in-use gauge first — if it's pegged at max_size, raise
+            ARTIFACTS_SQLITE_POOL_SIZE.
+
+      - alert: ArtifactsP99LatencyCritical
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(artifacts_request_duration_seconds_bucket[5m]))
+          ) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "p99 request latency above 5s for 2m — server is effectively down"
+          description: |
+            At 5-second p99 the user-experience contract is broken
+            even for cold clones. Treat as an outage.
+
+      - alert: ArtifactsRateLimitedSustained
+        expr: rate(artifacts_rate_limited_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained 429 rate_limited rejections"
+          description: |
+            More than 1/sec sustained rate-limited responses for ten
+            minutes. Either a genuine abuse pattern (review the
+            audit log for the offending actor) or the bucket
+            capacity is too tight for the legitimate workload.
+
+      - alert: ArtifactsQuotaExceededSustained
+        expr: rate(artifacts_quota_exceeded_total[5m]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained 429 quota_exceeded rejections"
+          description: |
+            A user is repeatedly hitting the per-user repo-count
+            quota. Could be a stuck retry loop on the client side
+            (most common) or a legitimate growth need (rare). Bump
+            ARTIFACTS_MAX_REPOS_PER_USER only after confirming.
+
+      - alert: ArtifactsSqlitePoolExhausted
+        expr: |
+          artifacts_sqlite_pool_in_use
+            / on (store) artifacts_sqlite_pool_size > 0.9
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SQLite pool {{ $labels.store }} >90% in use for 3m"
+          description: |
+            The r2d2 pool for the {{ $labels.store }} store has been
+            ≥90% saturated for three minutes. Future requests are
+            queueing on Pool::get() — observable as latency growth.
+            Bumping pool size in db_migrate::DEFAULT_POOL_SIZE
+            (currently 8) is the right knob if this isn't transient.
+
+      # No direct metric for "readiness flipped to 503 but never
+      # recovered." Approximate it by alerting on the absence of
+      # build_info — the gauge only exists while the process is
+      # alive. If it disappears entirely, the process is gone.
+      - alert: ArtifactsDown
+        expr: absent(artifacts_build_info) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Artifacts server is not reporting metrics"
+          description: |
+            No `artifacts_build_info` gauge has been scraped for
+            one minute. Either the process is dead or the scrape
+            target is misconfigured. Check the orchestrator's
+            readiness/liveness probe history first; a stuck-drain
+            scenario produces this signal because /metrics still
+            answers while readiness returns 503, but a crashloop
+            produces it too.
+
+      - alert: ArtifactsAuditWriteFailures
+        expr: |
+          increase(artifacts_audit_events_total[10m]) == 0
+          and on() rate(artifacts_requests_total{status=~"2.."}[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit log has no new events despite live mutation traffic"
+          description: |
+            artifacts_audit_events_total is flat for ten minutes
+            while 2xx requests are still landing. The audit writer
+            is best-effort and a SQLite hiccup logs but doesn't
+            fail the underlying mutation — this alert catches the
+            "audit silently stopped persisting" case before it
+            becomes a compliance problem.

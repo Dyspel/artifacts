@@ -12,6 +12,8 @@ Production-leaning runtime artifacts for the Artifacts server.
 | [`k8s/service.yaml`](k8s/service.yaml) | ClusterIP Service. Front with an Ingress for TLS / hostname routing. |
 | [`k8s/pvc.yaml`](k8s/pvc.yaml) | RWO PersistentVolumeClaim for the data dir. |
 | [`k8s/secrets.example.yaml`](k8s/secrets.example.yaml) | Template Secret — admin token + JWT secret + (optional) webhook master key. |
+| [`observability/dashboard.json`](observability/dashboard.json) | Starter Grafana dashboard — request rate, latency p50/p95/p99, rate-limit/quota rejections, SQLite pool, audit-event rate, gauges. Import via Grafana → Dashboards → New → Import. |
+| [`observability/alerts.yml`](observability/alerts.yml) | Prometheus alertmanager rules — p99 SLO violations, sustained 429s, pool exhaustion, server-down, audit-write-failures. |
 
 ## Why single-replica
 
@@ -46,6 +48,39 @@ spans you see on stderr are exactly the spans the collector receives.
 Failure modes (collector unreachable, bad endpoint, gRPC errors) log
 to stderr and drop the affected batch; the server keeps running. A
 remote-tracing misconfig will never take down the data plane.
+
+## Dashboards + alerts
+
+[`observability/dashboard.json`](observability/dashboard.json) is a
+starter Grafana dashboard targeting the metrics the server already
+emits — request rate by status, latency percentiles, the rate-limit
+/ quota counters, the per-store `r2d2_sqlite` pool gauges, the
+audit-event-by-kind rate, and the active-tokens / active-repos /
+active-webhooks / audit-rows stat panels. Import via **Grafana →
+Dashboards → New → Import**, point it at your Prometheus datasource
+when prompted. The dashboard uses a `${DS_PROMETHEUS}` variable so
+the same JSON works against any Prometheus-compatible source.
+
+[`observability/alerts.yml`](observability/alerts.yml) is a
+Prometheus alertmanager rule file. Drop it into your `rule_files:`
+list. Alerts:
+- **ArtifactsP99LatencyHigh / Critical** — p99 > 1s for 5m
+  (warning) or > 5s for 2m (critical).
+- **ArtifactsRateLimitedSustained / QuotaExceededSustained** —
+  abuse pattern or under-provisioned bucket.
+- **ArtifactsSqlitePoolExhausted** — pool ≥90% saturated for 3m
+  on any store. The right response is bumping
+  `db_migrate::DEFAULT_POOL_SIZE`.
+- **ArtifactsDown** — `absent(artifacts_build_info)` for 1m;
+  catches crashloops and misconfigured scrape targets.
+- **ArtifactsAuditWriteFailures** — audit events flat despite live
+  mutation traffic; the audit writer is best-effort, this catches
+  the "silently stopped persisting" case before it becomes a
+  compliance problem.
+
+`for:` durations are the recommended starting points — tune to your
+traffic shape (lengthen to silence brief blips, shorten to catch
+faster regressions) rather than touching the threshold expressions.
 
 ## What still needs operator decisions
 
