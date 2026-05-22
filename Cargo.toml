@@ -2,7 +2,7 @@
 name = "artifacts"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "A versioned filesystem that speaks Git — prototype"
 license = "Apache-2.0"
 

@@ -162,11 +162,10 @@ impl Storage for FsStorage {
         if path.exists() {
             return Err(Error::RepoExists(id.to_string()));
         }
-        write_bare_repo_layout(&path).map_err(|e| {
+        write_bare_repo_layout(&path).inspect_err(|_| {
             // Best-effort cleanup so a partial init doesn't leave a
             // stub dir that future creates would treat as RepoExists.
             let _ = std::fs::remove_dir_all(&path);
-            e
         })?;
         Ok(())
     }

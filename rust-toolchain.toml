@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned so local dev and CI agree on rustc/clippy/rustfmt versions.
+# Bump this and the matching version in .github/workflows/ci.yml in
+# lockstep; the workflow keeps an explicit version arg as a belt-and-
+# suspenders against forks that strip rust-toolchain.toml.
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

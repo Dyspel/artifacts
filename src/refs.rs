@@ -761,8 +761,8 @@ mod tests {
             for round in 0..50 {
                 let s1 = s.clone();
                 let s2 = s.clone();
-                let oid_a = format!("a{:039}", round);
-                let oid_b = format!("b{:039}", round);
+                let oid_a = format!("a{round:039}");
+                let oid_b = format!("b{round:039}");
                 let ref_name = format!("refs/round/{round}");
 
                 let h1 = tokio::spawn({
@@ -812,7 +812,7 @@ mod tests {
         assert!(names.contains(&"refs/tags/v1"));
         // Sorted lex.
         for w in all.windows(2) {
-            assert!(w[0].name <= w[1].name, "list not sorted: {:?}", names);
+            assert!(w[0].name <= w[1].name, "list not sorted: {names:?}");
         }
         // Filter by prefix.
         let only_test = refs.list(&repo, &["refs/test/".to_string()]).await.unwrap();

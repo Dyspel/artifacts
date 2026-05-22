@@ -3,8 +3,6 @@
 //! assertions (e.g. FsObjectStore's zlib loose-object format, the
 //! pack-index walk in `exists`, SQLite's BLOB-column round-trip).
 
-#![cfg(test)]
-
 use super::*;
 use crate::storage::{new_repo_id, FsStorage, Storage};
 use std::path::Path;

@@ -11,8 +11,6 @@
 //! The whole module is gated `#[cfg(test)]` so no production binary
 //! ever references it.
 
-#![cfg(test)]
-
 use crate::refs::FsRefStore;
 use crate::storage::{new_repo_id, FsStorage, Storage};
 use std::path::PathBuf;

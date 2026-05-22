@@ -641,7 +641,7 @@ fn sign_body(secret: Option<&str>, body: &[u8]) -> Option<String> {
     hex.push_str("sha256=");
     for b in bytes {
         use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{:02x}", b);
+        let _ = write!(&mut hex, "{b:02x}");
     }
     Some(hex)
 }

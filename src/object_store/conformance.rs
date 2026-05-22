@@ -10,8 +10,6 @@
 //! the helpers via `crate::object_store::conformance::*` after
 //! widening visibility.
 
-#![cfg(test)]
-
 use super::*;
 
 /// "Read returns the bytes that were written." The fundamental
