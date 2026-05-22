@@ -138,6 +138,16 @@ pub struct ServeArgs {
     /// Opt-in to binding a non-loopback address with `http://`.
     #[arg(long)]
     pub allow_insecure: bool,
+
+    /// OTLP/gRPC endpoint for distributed tracing. When set, per-request
+    /// spans (the same ones rendered to stderr) are also batched out to
+    /// this collector — Jaeger, Tempo, Honeycomb, or any OTLP-speaking
+    /// receiver. Default off; setting it is the only configuration
+    /// required.
+    ///
+    /// Example: `--otlp-endpoint http://otel-collector:4317`.
+    #[arg(long, env = "ARTIFACTS_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
 }
 
 /// Build the full server state graph and run the listener until
@@ -160,7 +170,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         shutdown_drain_delay_secs,
         audit_retention_days,
         allow_insecure,
+        otlp_endpoint,
     } = args;
+
+    // Install the tracing subscriber. The fmt layer is always present
+    // (per-request structured stderr logs); the OTLP layer is
+    // conditional on --otlp-endpoint being set. Both feed off the
+    // same EnvFilter so RUST_LOG controls both surfaces identically.
+    init_tracing(otlp_endpoint.as_deref())?;
 
     // Refuse to start in the "non-loopback bind + plaintext HTTP"
     // combination. Tokens travel in URLs and Basic auth — both
@@ -759,6 +776,62 @@ pub(crate) fn random_admin_token() -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Initialize tracing. `fmt` layer always; `tracing-opentelemetry` +
+/// OTLP/gRPC batched exporter when `otlp_endpoint` is `Some`. Both
+/// layers share the same `EnvFilter` so `RUST_LOG` controls them
+/// uniformly — no surprise where stderr shows a span but the
+/// collector doesn't.
+///
+/// On exporter failure (collector unreachable, bad endpoint, etc.)
+/// the batch processor logs to stderr and drops spans; the server
+/// keeps running. We don't want a remote-tracing misconfig to take
+/// the production data plane down.
+fn init_tracing(otlp_endpoint: Option<&str>) -> anyhow::Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "artifacts=info,tower_http=info".into());
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    match otlp_endpoint {
+        None => registry.init(),
+        Some(endpoint) => {
+            use opentelemetry::trace::TracerProvider;
+            use opentelemetry_otlp::WithExportConfig;
+            let resource = opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new("service.name", "artifacts"),
+                opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            ]);
+            let provider = opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter()
+                        .tonic()
+                        .with_endpoint(endpoint.to_string()),
+                )
+                .with_trace_config(
+                    opentelemetry_sdk::trace::Config::default().with_resource(resource),
+                )
+                .install_batch(opentelemetry_sdk::runtime::Tokio)
+                .map_err(|e| anyhow::anyhow!("install OTLP exporter ({endpoint}): {e}"))?;
+            // Make the tracer the global provider so any opentelemetry
+            // code path (none in production today, but spawning libs
+            // may use it) sees the same exporter.
+            let _ = opentelemetry::global::set_tracer_provider(provider.clone());
+            let tracer = provider.tracer("artifacts");
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+            registry.with(otel_layer).init();
+            tracing::info!(endpoint = %endpoint, "OTLP tracing enabled");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

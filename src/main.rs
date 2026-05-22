@@ -25,13 +25,11 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "artifacts=info,tower_http=info".into()),
-        )
-        .init();
-
+    // Tracing init moved into `app::serve` so it can read the
+    // `--otlp-endpoint` flag off the parsed args and install the
+    // OTLP layer alongside the fmt layer when present. Errors from
+    // clap parsing land on stderr via clap's own formatter, which
+    // happens before any of our spans would have fired anyway.
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve(args) => artifacts::app::serve(args).await?,

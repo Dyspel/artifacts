@@ -25,6 +25,28 @@ diverge immediately. Horizontal scale is genuinely a future milestone
 The Deployment uses `strategy: Recreate` so a rollout doesn't deadlock
 against itself trying to attach the same RWO volume to two pods.
 
+## Distributed tracing (optional)
+
+The server speaks OTLP/gRPC when `--otlp-endpoint <url>` (or
+`ARTIFACTS_OTLP_ENDPOINT`) is set. Per-request spans — the same
+ones rendered to stderr by the fmt layer — get batched out to the
+configured collector. Default off; nothing is sent if the flag is
+unset.
+
+```sh
+# Direct to a Jaeger / Tempo / Honeycomb collector:
+artifacts serve --otlp-endpoint http://otel-collector.observability:4317 …
+```
+
+The exporter is the batched-tonic build (gRPC, protobuf). Service
+identity is `service.name=artifacts`, `service.version=<cargo pkg
+version>`. `RUST_LOG` controls both fmt and OTLP outputs uniformly —
+spans you see on stderr are exactly the spans the collector receives.
+
+Failure modes (collector unreachable, bad endpoint, gRPC errors) log
+to stderr and drop the affected batch; the server keeps running. A
+remote-tracing misconfig will never take down the data plane.
+
 ## What still needs operator decisions
 
 - **`ARTIFACTS_PUBLIC_BASE_URL`**: the URL the server stitches into

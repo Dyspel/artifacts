@@ -27,6 +27,16 @@ tower = "0.5"
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OTLP exporter — opt-in via `--otlp-endpoint` / ARTIFACTS_OTLP_ENDPOINT.
+# Default off; no impact on deployments that don't set the flag.
+# Pinned to the version-compatible set: opentelemetry 0.24,
+# opentelemetry-otlp 0.17 (gRPC via tonic), tracing-opentelemetry 0.25.
+# `tonic` feature gives the gRPC exporter; HTTP/protobuf is also
+# available via the `http-proto` feature if a collector requires it.
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
