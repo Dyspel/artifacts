@@ -7,32 +7,25 @@
 //!
 //! ## Implementation
 //!
-//! The prototype shells out to git plumbing commands: `hash-object`,
-//! `read-tree`, `update-index`, `write-tree`, `commit-tree`, `update-ref`.
-//! Each request spawns a handful of short-lived child processes against a
-//! dedicated temp index file so concurrent requests don't clobber each
-//! other's in-flight state.
-//!
-//! Shelling out is ugly and slow compared to a native gitoxide
-//! implementation, but it's ~150 lines instead of ~1500, and it inherits
-//! the exact semantics of git's own commit path — including deltas over
-//! large trees, correct tree entry ordering, and the empty-tree SHA
-//! convention. M1 swaps these subprocess calls for direct `gix`
-//! `Repository::write_blob()` / `write_object()` calls without changing
-//! the REST surface.
+//! The commit construction is native `gix`: `Repository::write_blob` for
+//! each changed file, `Repository::edit_tree(...).upsert/remove/write`
+//! for the tree mutation (correct entry ordering + empty-tree convention
+//! handled by gix), then `Repository::write_object` for the commit
+//! header. No subprocess, no temp index, no per-request work tree —
+//! the whole gix flow runs inside one `spawn_blocking` task. Previously
+//! this was a five-subprocess dance (`hash-object` / `read-tree` /
+//! `update-index` / `write-tree` / `commit-tree` plus a temp
+//! `GIT_INDEX_FILE` + `GIT_WORK_TREE`).
 //!
 //! ## Atomicity
 //!
-//! The final `git update-ref <branch> <new> <expected>` is a native
-//! compare-and-swap on the filesystem ref. Two concurrent commits racing
-//! on the same branch:
+//! The ref update is delegated to `RefStore::cas_update`, which the
+//! filesystem impl implements as a `O_EXCL` lock + `rename`. Two
+//! concurrent commits racing on the same branch:
 //!   - both read the same parent,
-//!   - both build independent trees + commits,
-//!   - one wins the update-ref, the other fails with status 1 and we
-//!     return 409 Conflict with the current head so the caller can retry.
-//!
-//! This is exactly the ref-level CAS we'll promote to a first-class
-//! RefStore trait in M3.
+//!   - both build independent trees + commits via gix,
+//!   - one wins the CAS, the other fails and we return 409
+//!     `ref_conflict` with the current head so the caller can retry.
 
 use crate::{
     auth::authorize_rest,
@@ -109,10 +102,6 @@ pub struct CommitResult {
     pub branch: String,
 }
 
-/// The canonical SHA of git's empty tree. Hard-coded in git for the same
-/// reason we hard-code it here: it's a protocol constant.
-const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 pub async fn create_commit(
     State(state): State<RestState>,
     AxumPath(repo_id): AxumPath<String>,
@@ -155,88 +144,28 @@ pub async fn create_commit(
         }
     }
 
-    // Storage trait deliberately doesn't expose on-disk paths (a chunked-KV
-    // backend wouldn't have one). The commit plumbing is FS-specific because
-    // it shells out to git — so we derive the path from config here. When M1
-    // lands and this shell-out is replaced with native gitoxide calls, this
-    // coupling goes away.
     let git_dir = state.cfg.repos_dir().join(format!("{repo_id}.git"));
     let ref_name = format!("refs/heads/{}", body.branch);
 
-    // 1. Resolve the base tree. If parent was specified, pin to its tree and
-    // also verify it matches the current ref head (so we fail fast before
-    // doing any work if the caller has a stale parent).
-    let base_tree = match &body.parent {
-        Some(sha) => {
-            validate_sha(sha)?;
-            // Existence check via `ObjectStore::exists` — first
-            // production routing of the trait for a read path. FS impl
-            // stats the loose location then falls through to gix's
-            // pack-index walk if needed, so this works against both
-            // freshly-pushed (loose) and gc'd (packed) parents. A future
-            // chunked-KV impl satisfies the same call without a
-            // subprocess.
-            if !state.data.objects.exists(&repo_id, sha)? {
-                return Err(Error::BadRequest(format!("parent commit not found: {sha}")));
-            }
-            // Get its tree.
-            let (rc, stdout, stderr) = run_git(
-                &git_dir,
-                &["rev-parse", &format!("{sha}^{{tree}}")],
-                &[],
-                None,
-            )
-            .await?;
-            if rc != 0 {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "rev-parse tree failed: {}",
-                    String::from_utf8_lossy(&stderr)
-                )));
-            }
-            String::from_utf8(stdout)?.trim().to_string()
-        }
-        None => EMPTY_TREE_SHA.to_string(),
-    };
-
-    // 2. Temp index file + temp "work tree" so concurrent commits in the
-    // same repo don't clobber each other's in-flight state. The work tree
-    // is an empty directory; git's `update-index --force-remove` refuses to
-    // run in a "bare" context (git sees no work tree), but it doesn't care
-    // what the work tree *contains* — only that one exists. We drop both
-    // on return, success or failure.
-    let salt = uuid::Uuid::new_v4().simple().to_string();
-    let index_path = git_dir.join(format!("index-commit-{salt}"));
-    let worktree_path = git_dir.join(format!("wt-commit-{salt}"));
-    std::fs::create_dir_all(&worktree_path)?;
-    let _index_guard = TempFile(index_path.clone());
-    let _wt_guard = TempDir(worktree_path.clone());
-
-    let index_env_owned: Vec<(String, String)> = vec![
-        ("GIT_INDEX_FILE".into(), index_path.to_string_lossy().into()),
-        (
-            "GIT_WORK_TREE".into(),
-            worktree_path.to_string_lossy().into(),
-        ),
-    ];
-    let index_env: Vec<(&str, &str)> = index_env_owned
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
-    // 3. Seed the index with the base tree.
-    if base_tree != EMPTY_TREE_SHA {
-        let (rc, _, stderr) =
-            run_git(&git_dir, &["read-tree", &base_tree], &index_env, None).await?;
-        if rc != 0 {
-            return Err(Error::Other(anyhow::anyhow!(
-                "read-tree failed: {}",
-                String::from_utf8_lossy(&stderr)
+    // Pre-validate the parent exists before we go anywhere near gix —
+    // `ObjectStore::exists` works against loose + packed (FS impl) or
+    // a KV lookup (future chunked-KV impl), and is cheaper than gix's
+    // find_object error path.
+    if let Some(parent_sha) = &body.parent {
+        validate_sha(parent_sha)?;
+        if !state.data.objects.exists(&repo_id, parent_sha)? {
+            return Err(Error::BadRequest(format!(
+                "parent commit not found: {parent_sha}"
             )));
         }
     }
 
-    // 4. Apply changes in order.
-    for change in &body.changes {
+    // Decode the inputs (content/base64) and enforce the per-blob size
+    // cap on the request thread, before handing off to the blocking
+    // task. Failed decode + over-cap errors map cleanly to 400 here.
+    let mut prepared_changes: Vec<PreparedChange> = Vec::with_capacity(body.changes.len());
+    let max_blob_bytes = state.cfg.max_commit_blob_bytes;
+    for change in body.changes {
         match change {
             Change::Write {
                 path,
@@ -251,114 +180,61 @@ pub async fn create_commit(
                         )));
                     }
                     (None, None) => Vec::new(),
-                    (Some(s), None) => s.as_bytes().to_vec(),
+                    (Some(s), None) => s.into_bytes(),
                     (None, Some(b64)) => B64.decode(b64).map_err(|e| {
                         Error::BadRequest(format!("change for {path}: bad base64: {e}"))
                     })?,
                 };
-                // Size cap. REST-side commits are not appropriate for big
-                // binary blobs — each one goes through `git hash-object`
-                // as a buffered subprocess call, and the bytes sit in
-                // memory twice (the JSON buffer, the Vec<u8>). Push
-                // via git (smart-HTTP streams) for anything bigger.
-                let max = state.cfg.max_commit_blob_bytes;
-                if bytes.len() > max {
+                if bytes.len() > max_blob_bytes {
                     return Err(Error::BadRequest(format!(
                         "change for {path}: blob is {} bytes, over limit of {} bytes",
                         bytes.len(),
-                        max
+                        max_blob_bytes
                     )));
                 }
-                // hash-object writes the blob into the object database and
-                // prints the SHA.
-                let (rc, stdout, stderr) = run_git(
-                    &git_dir,
-                    &["hash-object", "-w", "--stdin", "--path", path],
-                    &[],
-                    Some(&bytes),
-                )
-                .await?;
-                if rc != 0 {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "hash-object failed for {path}: {}",
-                        String::from_utf8_lossy(&stderr)
-                    )));
-                }
-                let blob = String::from_utf8(stdout)?.trim().to_string();
-                let cacheinfo = format!("{mode},{blob},{path}");
-                let (rc, _, stderr) = run_git(
-                    &git_dir,
-                    &["update-index", "--add", "--cacheinfo", &cacheinfo],
-                    &index_env,
-                    None,
-                )
-                .await?;
-                if rc != 0 {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "update-index --add failed for {path}: {}",
-                        String::from_utf8_lossy(&stderr)
-                    )));
-                }
+                let kind = match mode.as_str() {
+                    "100644" => gix::objs::tree::EntryKind::Blob,
+                    "100755" => gix::objs::tree::EntryKind::BlobExecutable,
+                    _ => unreachable!("mode validated above"),
+                };
+                prepared_changes.push(PreparedChange::Write { path, bytes, kind });
             }
             Change::Delete { path } => {
-                let (rc, _, stderr) = run_git(
-                    &git_dir,
-                    &["update-index", "--force-remove", path],
-                    &index_env,
-                    None,
-                )
-                .await?;
-                if rc != 0 {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "update-index --force-remove failed for {path}: {}",
-                        String::from_utf8_lossy(&stderr)
-                    )));
-                }
+                prepared_changes.push(PreparedChange::Delete { path });
             }
         }
     }
 
-    // 5. Write the tree.
-    let (rc, stdout, stderr) = run_git(&git_dir, &["write-tree"], &index_env, None).await?;
-    if rc != 0 {
-        return Err(Error::Other(anyhow::anyhow!(
-            "write-tree failed: {}",
-            String::from_utf8_lossy(&stderr)
-        )));
-    }
-    let tree_sha = String::from_utf8(stdout)?.trim().to_string();
-
-    // 6. Write the commit. Env vars pin the author + committer without
-    // depending on the bare repo's (almost always absent) local git config.
-    let (author_name, author_email) = match &body.author {
-        Some(a) => (a.name.clone(), a.email.clone()),
+    // Author / committer signatures (computed here so the blocking
+    // task can move them in without borrowing `body`).
+    let (author_name, author_email) = match body.author {
+        Some(a) => (a.name, a.email),
         None => (
             "Artifacts".to_string(),
             "artifacts@noreply.local".to_string(),
         ),
     };
-    let commit_env: Vec<(&str, &str)> = vec![
-        ("GIT_AUTHOR_NAME", &author_name),
-        ("GIT_AUTHOR_EMAIL", &author_email),
-        ("GIT_COMMITTER_NAME", &author_name),
-        ("GIT_COMMITTER_EMAIL", &author_email),
-    ];
-    let mut commit_args: Vec<String> = vec!["commit-tree".into(), tree_sha.clone()];
-    if let Some(parent) = &body.parent {
-        commit_args.push("-p".into());
-        commit_args.push(parent.clone());
-    }
-    commit_args.push("-m".into());
-    commit_args.push(body.message.clone());
-    let commit_args_ref: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
-    let (rc, stdout, stderr) = run_git(&git_dir, &commit_args_ref, &commit_env, None).await?;
-    if rc != 0 {
-        return Err(Error::Other(anyhow::anyhow!(
-            "commit-tree failed: {}",
-            String::from_utf8_lossy(&stderr)
-        )));
-    }
-    let commit_sha = String::from_utf8(stdout)?.trim().to_string();
+
+    let parent_for_blocking = body.parent.clone();
+    let message = body.message.clone();
+    let branch_for_blocking = body.branch.clone();
+    let git_dir_for_blocking = git_dir.clone();
+    let _ = branch_for_blocking;
+
+    // Build tree + write commit via gix. spawn_blocking because every
+    // gix op is sync; the surrounding handler is async only for the
+    // HTTP boundary + the RefStore CAS below.
+    let (commit_sha, tree_sha) = crate::blocking::run_blocking("rest_commit_via_gix", move || {
+        build_and_write_commit(BuildCommitInput {
+            git_dir: git_dir_for_blocking,
+            parent: parent_for_blocking,
+            changes: prepared_changes,
+            message,
+            author_name,
+            author_email,
+        })
+    })
+    .await?;
 
     // 7. CAS the ref. This is the atomicity boundary — delegated to the
     // RefStore trait so the guts are swappable (M3-proper replaces the
@@ -403,7 +279,139 @@ pub async fn create_commit(
     }))
 }
 
-pub(crate) use crate::git_cmd::run_git;
+/// Internal shape for staging a change after content+size validation.
+/// `Write::bytes` is the decoded content (utf-8 or base64-decoded);
+/// `Write::kind` is the validated tree-entry mode. `Delete` carries
+/// the path verbatim.
+enum PreparedChange {
+    Write {
+        path: String,
+        bytes: Vec<u8>,
+        kind: gix::objs::tree::EntryKind,
+    },
+    Delete {
+        path: String,
+    },
+}
+
+/// Inputs to `build_and_write_commit`. One owning struct so the
+/// closure signature stays one argument.
+struct BuildCommitInput {
+    git_dir: std::path::PathBuf,
+    parent: Option<String>,
+    changes: Vec<PreparedChange>,
+    message: String,
+    author_name: String,
+    author_email: String,
+}
+
+/// Synchronous (gix is sync) builder: opens the repo, resolves the
+/// base tree, writes each blob, mutates the tree via gix's editor,
+/// and writes the commit object. Returns `(commit_sha, tree_sha)`.
+///
+/// Called from within `spawn_blocking`; do not invoke from an async
+/// context directly — every `repo.write_blob` round-trips through the
+/// filesystem.
+fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
+    let BuildCommitInput {
+        git_dir,
+        parent,
+        changes,
+        message,
+        author_name,
+        author_email,
+    } = input;
+
+    let repo = gix::open(&git_dir)
+        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open {}: {e}", git_dir.display())))?;
+
+    // Base tree: parent's tree, or git's canonical empty-tree id.
+    let base_tree_id = match &parent {
+        Some(sha) => {
+            let oid = gix::ObjectId::from_hex(sha.as_bytes()).map_err(|e| {
+                Error::Other(anyhow::anyhow!("parent {sha} is not a valid sha-1: {e}"))
+            })?;
+            let commit = repo
+                .find_commit(oid)
+                .map_err(|e| Error::Other(anyhow::anyhow!("find parent {sha}: {e}")))?;
+            commit
+                .tree_id()
+                .map_err(|e| Error::Other(anyhow::anyhow!("parent {sha} tree_id: {e}")))?
+                .detach()
+        }
+        None => gix::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+    };
+
+    let mut editor = repo
+        .edit_tree(base_tree_id)
+        .map_err(|e| Error::Other(anyhow::anyhow!("edit_tree on {base_tree_id}: {e}")))?;
+
+    for change in &changes {
+        match change {
+            PreparedChange::Write { path, bytes, kind } => {
+                let blob_id = repo
+                    .write_blob(bytes.as_slice())
+                    .map_err(|e| Error::Other(anyhow::anyhow!("write_blob {path}: {e}")))?
+                    .detach();
+                editor
+                    .upsert(path.as_str(), *kind, blob_id)
+                    .map_err(|e| Error::Other(anyhow::anyhow!("tree upsert {path}: {e}")))?;
+            }
+            PreparedChange::Delete { path } => {
+                editor
+                    .remove(path.as_str())
+                    .map_err(|e| Error::Other(anyhow::anyhow!("tree remove {path}: {e}")))?;
+            }
+        }
+    }
+
+    let tree_id = editor
+        .write()
+        .map_err(|e| Error::Other(anyhow::anyhow!("write tree object: {e}")))?
+        .detach();
+
+    // Time: `gix-date::Time` is a plain `{ seconds, offset }` struct;
+    // we set offset=0 (UTC) and pull seconds from SystemTime. Matches
+    // the previous subprocess path's behavior — we never set
+    // GIT_*_DATE there, so git defaulted to the same "now/UTC" shape.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let signature = gix::actor::Signature {
+        name: author_name.into(),
+        email: author_email.into(),
+        time: gix::date::Time {
+            seconds: now_secs,
+            offset: 0,
+        },
+    };
+
+    let parents = match &parent {
+        Some(sha) => {
+            let oid = gix::ObjectId::from_hex(sha.as_bytes())
+                .map_err(|e| Error::Other(anyhow::anyhow!("parent {sha}: {e}")))?;
+            smallvec::smallvec![oid]
+        }
+        None => smallvec::SmallVec::new(),
+    };
+
+    let commit = gix::objs::Commit {
+        tree: tree_id,
+        parents,
+        author: signature.clone(),
+        committer: signature,
+        message: message.into(),
+        encoding: None,
+        extra_headers: Vec::new(),
+    };
+    let commit_id = repo
+        .write_object(&commit)
+        .map_err(|e| Error::Other(anyhow::anyhow!("write commit object: {e}")))?
+        .detach();
+
+    Ok((commit_id.to_string(), tree_id.to_string()))
+}
 
 /// Match `git check-ref-format` semantics for a branch-name segment.
 ///
@@ -499,20 +507,6 @@ pub(crate) fn validate_sha(s: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::BadRequest(format!("invalid sha: {s:?}")))
-    }
-}
-
-struct TempFile(std::path::PathBuf);
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-struct TempDir(std::path::PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

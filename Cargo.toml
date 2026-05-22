@@ -58,7 +58,10 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # We only depend on the umbrella crate to avoid coupling to the
 # evolving sub-crate version matrix; pulling individual gix-* crates
 # directly tends to break on every release.
-gix = "0.83"
+# `tree-editor` is opt-in in gix 0.83; the REST-commit builder in
+# src/commits.rs uses Repository::edit_tree() to mutate the base tree
+# without copying it to a temp index.
+gix = { version = "0.83", features = ["tree-editor"] }
 # gix-pack is gix's pack-format crate. Used directly (not via the
 # `gix` umbrella) because the umbrella doesn't re-export it. Pin to
 # the version `gix 0.83` brings in transitively so the types line
@@ -73,6 +76,10 @@ gix-object = "0.51"
 # SqliteObjectStore::ingest_pack code (loose-object zlib deflate) can
 # import it without going through a private gix module.
 flate2 = "1"
+# Re-exported from gix-object but not from gix's umbrella crate; the
+# `Commit::parents` field is a `SmallVec<[ObjectId; 1]>`, so the
+# REST-commit builder (src/commits.rs) needs to name the type directly.
+smallvec = "1"
 # sha1 is needed for the empty-pack trailer in native_pack.rs.
 sha1 = "0.10"
 # prodash::Discard is used as the no-op progress sink for

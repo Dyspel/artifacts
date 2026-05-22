@@ -328,6 +328,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "smallvec",
  "subtle",
  "tempfile",
  "thiserror 1.0.69",

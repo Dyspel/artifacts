@@ -27,8 +27,9 @@
 
 use crate::{
     auth::authorize_rest,
-    commits::{run_git, valid_branch_name, validate_sha, Author},
+    commits::{valid_branch_name, validate_sha, Author},
     error::{Error, Result},
+    git_cmd::run_git,
     ownership::enforce_owner,
     rate_limit::Class,
     refs::CasOutcome,

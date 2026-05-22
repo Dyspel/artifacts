@@ -153,7 +153,7 @@ impl RefStore for FsRefStore {
     async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
         let git_dir = self.repo_path(repo_id);
         let (rc, stdout, _) =
-            crate::commits::run_git(&git_dir, &["rev-parse", "--verify", ref_name], &[], None)
+            crate::git_cmd::run_git(&git_dir, &["rev-parse", "--verify", ref_name], &[], None)
                 .await?;
         if rc != 0 {
             return Ok(None);
@@ -192,7 +192,7 @@ impl RefStore for FsRefStore {
     ) -> Result<CasOutcome> {
         let git_dir = self.repo_path(repo_id);
         let expected_arg = expected.unwrap_or(ZERO_SHA);
-        let (rc, _, stderr) = crate::commits::run_git(
+        let (rc, _, stderr) = crate::git_cmd::run_git(
             &git_dir,
             &["update-ref", ref_name, new_sha, expected_arg],
             &[],
@@ -223,10 +223,10 @@ impl RefStore for FsRefStore {
         // (CAS). Without expected we pass no extra arg, which makes
         // git delete unconditionally.
         let (rc, _, stderr) = if let Some(exp) = expected {
-            crate::commits::run_git(&git_dir, &["update-ref", "-d", ref_name, exp], &[], None)
+            crate::git_cmd::run_git(&git_dir, &["update-ref", "-d", ref_name, exp], &[], None)
                 .await?
         } else {
-            crate::commits::run_git(&git_dir, &["update-ref", "-d", ref_name], &[], None).await?
+            crate::git_cmd::run_git(&git_dir, &["update-ref", "-d", ref_name], &[], None).await?
         };
         if rc == 0 {
             return Ok(CasOutcome::Updated);
