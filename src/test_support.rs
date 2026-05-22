@@ -39,6 +39,12 @@ pub struct TestRepo {
     pub git_dir: PathBuf,
 }
 
+impl Default for TestRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestRepo {
     /// Construct a fresh, empty bare repo with a random id.
     pub fn new() -> Self {

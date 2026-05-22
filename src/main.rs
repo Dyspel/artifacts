@@ -1,46 +1,11 @@
-#![deny(unused)]
-
-mod alternates_cache;
-mod app;
-mod audit;
-mod auth;
-mod blocking;
-mod commits;
-mod config;
-mod db_migrate;
-mod error;
-mod events;
-mod gc;
-mod git_cmd;
-mod git_wire;
-mod ip_rate_limit;
-mod jwt;
-mod merge;
-mod metrics;
-mod native_pack;
-mod object_store;
-mod ownership;
-mod pkt_line;
-mod rate_limit;
-mod reads;
-mod refs;
-mod request_id;
-mod rest;
-mod secrets;
-mod smart_http;
-mod storage;
-#[cfg(test)]
-mod test_support;
-mod tokens;
-mod webhooks;
+//! `artifacts` binary entry point. Parses CLI args, initializes
+//! tracing, and dispatches to [`artifacts::app::serve`]. Everything
+//! else lives in the library crate (`src/lib.rs` and friends) so
+//! `cargo test --lib` can exercise internals without going through
+//! the binary.
 
 use clap::{Parser, Subcommand};
 
-/// CLI entry point. Parses arguments, initializes tracing, and
-/// dispatches to the requested subcommand. All real server logic
-/// lives in [`app::serve`]; this file is intentionally tiny so
-/// `main.rs` stays a stable launching pad for whatever subcommands
-/// land next.
 #[derive(Parser)]
 #[command(
     name = "artifacts",
@@ -55,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Start the server.
-    Serve(app::ServeArgs),
+    Serve(artifacts::app::ServeArgs),
 }
 
 #[tokio::main]
@@ -69,9 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve(args) => app::serve(args).await?,
+        Cmd::Serve(args) => artifacts::app::serve(args).await?,
     }
     Ok(())
 }
-
-pub(crate) use app::random_admin_token;
