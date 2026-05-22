@@ -1,0 +1,21 @@
+# In-cluster Service for the Artifacts server.
+#
+# Type ClusterIP because public traffic should land via an Ingress in
+# front of this (TLS termination, hostname routing, rate limit at the
+# edge). For dev or single-tenant deployments you can flip the type to
+# NodePort or LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: artifacts
+  labels:
+    app.kubernetes.io/name: artifacts
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: artifacts
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

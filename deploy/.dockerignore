@@ -1,0 +1,13 @@
+# Keep the build context small — the builder only needs Cargo.* + src/.
+# `cargo build` reads nothing else (rust-toolchain.toml is explicitly
+# COPY'd by the Dockerfile).
+target/
+data/
+.git/
+.github/
+deploy/
+tests/
+scripts/
+*.md
+*.log
+.DS_Store

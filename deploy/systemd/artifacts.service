@@ -1,0 +1,78 @@
+# Example systemd unit for the Artifacts server.
+#
+# Install:
+#   sudo cp deploy/systemd/artifacts.service /etc/systemd/system/
+#   sudo mkdir -p /etc/artifacts && sudo cp deploy/systemd/artifacts.env /etc/artifacts/artifacts.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now artifacts
+#
+# Assumes:
+#   - The `artifacts` binary is at /usr/local/bin/artifacts.
+#   - A dedicated system user `artifacts:artifacts` owns /var/lib/artifacts
+#     (the data dir) at mode 0700.
+#   - Operator-supplied secrets (admin token, JWT secret, TLS cert/key)
+#     live in /etc/artifacts/artifacts.env (mode 0600, root:artifacts).
+#
+# Reload on config change:  sudo systemctl reload-or-restart artifacts
+# Drain + restart on deploy: SIGTERM → graceful drain (configurable via
+#   ARTIFACTS_SHUTDOWN_TIMEOUT_SECS / ARTIFACTS_SHUTDOWN_DRAIN_DELAY_SECS).
+
+[Unit]
+Description=Artifacts — versioned filesystem that speaks Git (prototype)
+Documentation=https://github.com/dyspel/artifacts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=artifacts
+Group=artifacts
+EnvironmentFile=/etc/artifacts/artifacts.env
+
+ExecStart=/usr/local/bin/artifacts serve \
+    --data-dir /var/lib/artifacts \
+    --bind 127.0.0.1:8787 \
+    --public-base-url https://artifacts.internal
+
+# Graceful shutdown: systemd sends SIGTERM, server drains, then exits.
+# The TimeoutStopSec must comfortably exceed ARTIFACTS_SHUTDOWN_TIMEOUT_SECS
+# (default 30) so systemd doesn't SIGKILL mid-drain.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening --------------------------------------------------------------
+# The server only needs to read its binary, read EnvironmentFile, and
+# read/write the data dir. Lock everything else down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Data dir is the one writable path on the filesystem.
+ReadWritePaths=/var/lib/artifacts
+
+# Network namespaces are required (TCP listener); IPv4 + IPv6 only.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Reasonable resource bounds. The defaults assume a modest single-tenant
+# deployment; tune up for higher concurrency.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

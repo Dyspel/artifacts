@@ -973,6 +973,31 @@ Logging is via `tracing`. Tune with `RUST_LOG`:
 RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 ```
 
+## Deployment
+
+A starter set of runtime artifacts lives under [`deploy/`](./deploy/):
+
+- **[`deploy/Dockerfile`](./deploy/Dockerfile)** — multi-stage build,
+  debian-slim runtime, `git` on PATH (the server shells out to
+  `upload-pack` / `receive-pack`), non-root UID 10001.
+- **[`deploy/systemd/artifacts.service`](./deploy/systemd/artifacts.service)** — hardened
+  unit (`NoNewPrivileges`, `ProtectSystem=strict`, `SystemCallFilter`,
+  `MemoryDenyWriteExecute`). Pairs with
+  [`deploy/systemd/artifacts.env`](./deploy/systemd/artifacts.env) for
+  secrets.
+- **[`deploy/k8s/`](./deploy/k8s/)** — single-replica Deployment + Service
+  + RWO PVC. Readiness and liveness probes are pinned to
+  `/v1/health/ready` and `/v1/health` respectively so the
+  drain-readiness flip works as designed.
+
+The `--data-dir` is the entire mutable surface — bare git repos under
+`repos/` plus three SQLite databases (`tokens.db`, `audit.db`,
+`webhooks.db`). On k8s it must be a `PersistentVolumeClaim`. The
+prototype is single-replica until M3b lands; the manifest's
+`strategy: Recreate` is what keeps a rollout from deadlocking two
+pods on the same RWO volume. See [`deploy/README.md`](./deploy/README.md)
+for the full operator notes.
+
 ## Roadmap
 
 | Milestone | Status | Scope | Replaces |

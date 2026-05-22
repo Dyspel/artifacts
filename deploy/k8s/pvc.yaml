@@ -1,0 +1,25 @@
+# PersistentVolumeClaim for the Artifacts data dir.
+#
+# Sizing: the data dir holds bare git repos + three SQLite DBs (tokens,
+# audit, webhooks). The git layer is dominated by user-pushed objects;
+# a single-tenant deployment under a few thousand small repos fits in
+# 10–20 GiB easily. Bump for heavier workloads.
+#
+# Access mode is RWO (single-node read/write) — the prototype is
+# single-replica until M3b (distributed RefStore) lands. The matching
+# Deployment uses strategy: Recreate to avoid two pods racing for the
+# same RWO volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: artifacts-data
+  labels:
+    app.kubernetes.io/name: artifacts
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # Leave storageClassName unset to use the cluster default; set
+  # explicitly (e.g. "gp3", "premium-rwo") to pin a specific class.

@@ -1,0 +1,126 @@
+# Minimal Kubernetes Deployment for the Artifacts server.
+#
+# Pair with service.yaml + pvc.yaml. The Deployment's
+# replicas: 1 is load-bearing — the M0/M2a server has a single-node
+# data dir and `RefStore` only has a filesystem impl; horizontal
+# scaling has to wait for M3b (distributed RefStore + chunked-KV
+# Storage).
+#
+# Apply: kubectl apply -f deploy/k8s/
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: artifacts
+  labels:
+    app.kubernetes.io/name: artifacts
+spec:
+  replicas: 1
+  # Recreate strategy because the PVC is RWO — the new pod can't
+  # attach the volume until the old one releases it. Rolling
+  # would deadlock against itself.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: artifacts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: artifacts
+    spec:
+      # SIGTERM → server starts the drain cycle (readiness flips to
+      # 503, then listener closes, then graceful exit). The pod
+      # terminationGracePeriodSeconds must cover the full
+      # SHUTDOWN_DRAIN_DELAY_SECS + SHUTDOWN_TIMEOUT_SECS budget plus
+      # a small safety margin. Defaults sum to 35 s; we set 60 to
+      # leave headroom.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # UID 10001 matches the Dockerfile's `artifacts` user so the
+        # bind-mounted PVC's ownership lines up out of the box.
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        runAsNonRoot: true
+      containers:
+        - name: artifacts
+          image: artifacts:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - --data-dir
+            - /var/lib/artifacts
+            - --bind
+            - 0.0.0.0:8787
+            - --public-base-url
+            - $(ARTIFACTS_PUBLIC_BASE_URL)
+          ports:
+            - name: http
+              containerPort: 8787
+              protocol: TCP
+          env:
+            # Public URL the server hands back inside repo-create
+            # responses. Must be the externally-reachable address —
+            # NOT the in-cluster Service DNS — or `git clone` against
+            # the returned remote will hit the wrong host.
+            - name: ARTIFACTS_PUBLIC_BASE_URL
+              value: "https://artifacts.example.com"
+            - name: RUST_LOG
+              value: "artifacts=info,tower_http=info"
+          envFrom:
+            - secretRef:
+                name: artifacts-secrets
+          # Liveness — cheap in-memory probe. Restarts the process if
+          # it hangs; deliberately separate from readiness (a stuck
+          # SQLite query should drain, not restart).
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          # Readiness — exercises every SQLite store (tokens, audit,
+          # ownership). Flips to 503 + draining:true on SIGTERM
+          # before the listener stops accepting connections, so the
+          # endpoint controller pulls this pod out of the Service
+          # before traffic gets refused.
+          readinessProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/artifacts
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: artifacts-data
+        # readOnlyRootFilesystem=true means /tmp also has to be
+        # writable via a volume — gix-pack uses tempdirs during
+        # SqliteObjectStore::ingest_pack, and `git upload-pack`
+        # writes temp files too.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
