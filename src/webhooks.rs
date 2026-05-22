@@ -111,7 +111,7 @@ pub trait WebhookRegistry: Send + Sync {
 /// Same trait as MemRegistry. Wire choice happens in main.rs based on
 /// whether `ARTIFACTS_WEBHOOK_DB` is set (defaults to in-memory).
 pub struct SqliteWebhookRegistry {
-    conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    conn: crate::db_migrate::DbPool,
     /// Symmetric key used to seal/unseal `secret`. Wrapped in
     /// `RwLock<Arc<…>>` so `rotate_master_key` can swap it
     /// in-process. Reads (every `add` / `list`) clone the `Arc`
@@ -153,15 +153,24 @@ impl SqliteWebhookRegistry {
         path: &std::path::Path,
         master_key: Arc<crate::secrets::MasterKey>,
     ) -> crate::error::Result<Self> {
-        let conn = crate::db_migrate::open_with_migrations(path, "webhooks", &MIGRATIONS)?;
+        let conn = crate::db_migrate::open_pool_with_migrations(path, "webhooks", &MIGRATIONS)?;
         Ok(Self {
-            conn: Arc::new(std::sync::Mutex::new(conn)),
+            conn,
             master_key: std::sync::RwLock::new(master_key),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    /// Claim a pooled connection. Panics on pool exhaustion to keep
+    /// the trait's infallible-`add` shape — pool exhaustion would
+    /// stall every webhook write anyway, surfacing as a `Mutex`-poison
+    /// panic in the previous implementation.
+    fn lock(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
+        crate::metrics::get_pooled(&self.conn, "webhooks").expect("sqlite pool exhausted")
+    }
+
+    /// Expose the pool so periodic tasks can publish pool gauges.
+    pub(crate) fn pool(&self) -> &crate::db_migrate::DbPool {
+        &self.conn
     }
 
     /// Snapshot the current master key. Cheap (Arc clone). Callers

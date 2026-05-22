@@ -217,7 +217,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Arc::new(object_store::FsObjectStore::new(cfg.repos_dir()));
     let token_db_path = token_db.unwrap_or_else(|| data_dir.join("tokens.db"));
     tracing::info!(path = %token_db_path.display(), "opening metadata db");
+    // Collect each store's pool handle as we open them, so the
+    // pool-gauge refresher spawned below can publish
+    // `artifacts_sqlite_pool_size{store}` /
+    // `artifacts_sqlite_pool_in_use{store}` without having to
+    // re-thread the concrete types through the rest of the function.
+    let mut sqlite_pools: Vec<(&'static str, crate::db_migrate::DbPool)> = Vec::new();
     let sqlite_tokens = Arc::new(SqliteTokenStore::open(&token_db_path)?);
+    sqlite_pools.push(("tokens", sqlite_tokens.pool().clone()));
     // Periodic prune of revoked + expired rows. Without this the
     // tokens table grows monotonically: at 10k tokens/day, a year of
     // operation = 3.6M rows of dead weight. Runs hourly, with a 24h
@@ -235,7 +242,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Separate table and separate connection keeps the concerns
     // cleanly split; WAL-mode lets them coexist without lock
     // contention on the hot path.
-    let ownership: Arc<dyn OwnershipStore> = Arc::new(SqliteOwnershipStore::open(&token_db_path)?);
+    let sqlite_ownership = SqliteOwnershipStore::open(&token_db_path)?;
+    sqlite_pools.push(("ownership", sqlite_ownership.pool().clone()));
+    let ownership: Arc<dyn OwnershipStore> = Arc::new(sqlite_ownership);
     // Populate the repos-total gauge before the listener starts (so
     // the first scrape isn't 0), then spawn a 60s refresher to track
     // create/delete activity. Same cadence and rationale as the
@@ -248,8 +257,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // fail the underlying mutation).
     let audit_db_path = data_dir.join("audit.db");
     tracing::info!(path = %audit_db_path.display(), "opening audit db");
-    let audit: Arc<dyn audit::AuditStore> =
-        Arc::new(audit::SqliteAuditStore::open(&audit_db_path)?);
+    let sqlite_audit = audit::SqliteAuditStore::open(&audit_db_path)?;
+    sqlite_pools.push(("audit", sqlite_audit.pool().clone()));
+    let audit: Arc<dyn audit::AuditStore> = Arc::new(sqlite_audit);
     // Hourly retention sweep — same cadence as the token-prune task.
     // `0` days from the CLI flag disables pruning, which
     // `spawn_prune_task` honors by not spawning at all.
@@ -333,7 +343,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 webhook_key_path = Some(key_path);
             }
             tracing::info!(path = %p.display(), "webhooks: SQLite-backed registry (encrypted secrets)");
-            Arc::new(webhooks::SqliteWebhookRegistry::open(&p, master_key)?)
+            let sqlite_wh = webhooks::SqliteWebhookRegistry::open(&p, master_key)?;
+            sqlite_pools.push(("webhooks", sqlite_wh.pool().clone()));
+            Arc::new(sqlite_wh)
         }
         None => {
             tracing::info!("webhooks: in-memory registry (subscriptions lost on restart)");
@@ -347,6 +359,12 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     webhooks::spawn_dispatcher(webhook_registry.clone(), event_bus.clone());
     webhooks::refresh_active_webhook_gauge(&*webhook_registry);
     webhooks::spawn_active_gauge_refresher(webhook_registry.clone(), GAUGE_REFRESH_INTERVAL);
+
+    // One task that refreshes every store's pool gauges. Populated by
+    // each `SqliteXxxStore::open` call above; an empty `sqlite_pools`
+    // (e.g. webhook_registry is the in-memory variant) just becomes
+    // a no-op tick.
+    crate::metrics::spawn_pool_gauge_refresher(sqlite_pools, GAUGE_REFRESH_INTERVAL);
 
     // Shared drain flag. Flipped from `false` → `true` by the
     // shutdown listener task on first SIGTERM/SIGINT, before

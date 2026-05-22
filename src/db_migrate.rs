@@ -34,9 +34,15 @@
 //!   compose poorly with `CREATE TABLE`/`ALTER TABLE`, which auto-commit
 //!   on most platforms.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::Path;
+
+/// Pool type alias used across every SQLite-backed store. r2d2's
+/// `Pool` is internally `Arc<Inner>` so cloning is cheap; no outer
+/// `Arc` wrapper is needed.
+pub type DbPool = r2d2::Pool<SqliteConnectionManager>;
 
 /// One forward-only schema migration. `version` numbers within a
 /// namespace must be strictly increasing and contiguous; gaps are
@@ -124,6 +130,49 @@ pub fn open_with_migrations(
     )?;
     run(&conn, namespace, migrations)?;
     Ok(conn)
+}
+
+/// Default max pool size. SQLite under WAL allows N readers + 1
+/// writer concurrently; 8 is generous for a single-node prototype
+/// and well below the per-process FD budget. Tune via the (unwritten)
+/// `ARTIFACTS_SQLITE_POOL_SIZE` env var if a benchmark needs it.
+const DEFAULT_POOL_SIZE: u32 = 8;
+
+/// Open an `r2d2` connection pool backed by SQLite at `path`, with
+/// each connection initialized to WAL mode + the same migrations
+/// `open_with_migrations` applies. Migrations run **once** on a
+/// scratch connection at pool creation, not every connection — the
+/// `schema_version` rows are reused after that.
+///
+/// Returns a `DbPool`. The store keeps the pool by value (no `Arc`
+/// wrapper; r2d2's `Pool` is already `Arc<Inner>` internally).
+pub fn open_pool_with_migrations(
+    path: &Path,
+    namespace: &str,
+    migrations: &[Migration],
+) -> Result<DbPool> {
+    // Apply migrations once on a one-shot connection. Doing this here
+    // (rather than from `with_init`) avoids re-running the migrator
+    // on every pooled connection — migrations are idempotent but the
+    // `schema_version` reads still cost a query per connection.
+    open_with_migrations(path, namespace, migrations)?;
+
+    let manager = SqliteConnectionManager::file(path).with_init(|c| {
+        // Every newly-opened pooled connection gets the same WAL
+        // pragmas the migrator's one-shot connection set. WAL mode
+        // is a per-file mode (persists in the SQLite header), so
+        // it's already set after the first open; synchronous=NORMAL
+        // is per-connection and must be re-applied.
+        c.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;",
+        )
+    });
+    r2d2::Pool::builder()
+        .max_size(DEFAULT_POOL_SIZE)
+        .build(manager)
+        .map_err(|e| Error::Other(anyhow::anyhow!("build sqlite pool: {e}")))
 }
 
 /// Helper for migrations that add a column to an existing table.

@@ -24,17 +24,17 @@
 //! migration step for M4. Future schema changes will need real
 //! migrations; for now the tokens table is the only state.
 
+use crate::db_migrate::DbPool;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -163,23 +163,18 @@ pub trait TokenStore: Send + Sync {
 
 /// SQLite-backed `TokenStore`.
 ///
-/// SQLite is single-writer-multi-reader under WAL, and the C API isn't
-/// `Send + Sync` to begin with, so we serialize access with a mutex. This
-/// used to be a `std::sync::Mutex`, which blocked the *tokio worker
-/// thread* while held — fine for a prototype at low qps, wrong under
-/// load. We now use `tokio::sync::Mutex`: holding it suspends only the
-/// single task awaiting the lock, not a worker.
-///
-/// The SQLite operations themselves are sync + fast (microseconds for the
-/// hashed-key lookup). If we later see contention at thousands of qps,
-/// the right next step is `deadpool-sqlite` with a connection pool — but
-/// the `TokenStore` trait doesn't change.
+/// Backed by an `r2d2` connection pool — every method claims a
+/// connection from the pool via `metrics::get_pooled`, which times
+/// the claim and records it on `artifacts_sqlite_lock_wait_seconds`.
+/// Under WAL mode the pool gives real reader parallelism (N readers +
+/// one writer concurrently); the previous `Arc<tokio::sync::Mutex<Connection>>`
+/// serialized every query through a single connection.
 ///
 /// Tokens are stored as SHA-256 hashes. If the DB file leaks, a reader
 /// cannot present any of the stored rows as a token — they'd have to
 /// preimage the hash.
 pub struct SqliteTokenStore {
-    conn: Arc<TokioMutex<Connection>>,
+    conn: DbPool,
 }
 
 const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
@@ -212,10 +207,13 @@ const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
 
 impl SqliteTokenStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = crate::db_migrate::open_with_migrations(path, "tokens", &MIGRATIONS)?;
-        Ok(Self {
-            conn: Arc::new(TokioMutex::new(conn)),
-        })
+        let conn = crate::db_migrate::open_pool_with_migrations(path, "tokens", &MIGRATIONS)?;
+        Ok(Self { conn })
+    }
+
+    /// Expose the pool so periodic tasks can publish pool gauges.
+    pub(crate) fn pool(&self) -> &DbPool {
+        &self.conn
     }
 
     /// Delete rows that are guaranteed to never authorize a request again:
@@ -233,7 +231,7 @@ impl SqliteTokenStore {
     pub async fn prune(&self, expiry_grace: Duration) -> Result<u64> {
         let now = now_secs() as i64;
         let expiry_cutoff = now.saturating_sub(expiry_grace.as_secs() as i64);
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // `<=` not `<` mirrors lookup semantics: a row with
         // `expires_at == now` is already unusable (lookup uses
         // `expires_at > now`), so it's logically expired and prunable.
@@ -318,7 +316,7 @@ impl TokenStore for SqliteTokenStore {
         let hash = sha256_hex(&token);
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         conn.execute(
             "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at, subject)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -330,7 +328,7 @@ impl TokenStore for SqliteTokenStore {
     async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // SELECT only the columns we surface. The expired-row filter
         // is enforced by the predicate, not by reading expires_at into
         // the struct; the subject column is exposed through the
@@ -356,7 +354,7 @@ impl TokenStore for SqliteTokenStore {
     async fn revoke(&self, token: &str) -> Result<bool> {
         let hash = sha256_hex(token);
         let now = now_secs() as i64;
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         let affected = conn.execute(
             "UPDATE tokens SET revoked_at = ?1
              WHERE token_hash = ?2 AND revoked_at IS NULL",
@@ -367,7 +365,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn revoke_all_for_repo(&self, repo_id: &str) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // We only flip rows that are still authorizing — already-expired
         // tokens are dead anyway, so leaving their `revoked_at` NULL keeps
         // the audit trail honest ("this token expired" vs "this token was
@@ -384,7 +382,7 @@ impl TokenStore for SqliteTokenStore {
 
     async fn count_active(&self) -> Result<u64> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // Mirrors the lookup predicate exactly — a row is active iff it
         // would currently resolve to a TokenRecord. Pruning is what
         // keeps this aggregate cheap; an unbounded `tokens` table with
@@ -407,7 +405,7 @@ impl TokenStore for SqliteTokenStore {
         subject_filter: Option<&str>,
     ) -> Result<Vec<TokenSummary>> {
         let now = now_secs() as i64;
-        let conn = crate::metrics::lock_sqlite(&self.conn, "tokens").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         let mut stmt = conn.prepare_cached(
             "SELECT token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject
              FROM tokens
@@ -473,6 +471,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     fn open_store() -> (tempfile::TempDir, SqliteTokenStore) {
         let dir = tempfile::tempdir().unwrap();

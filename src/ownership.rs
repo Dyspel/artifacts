@@ -25,16 +25,16 @@
 //! The SQLite impl shares the same DB file as `SqliteTokenStore` —
 //! separate connection, separate table, WAL-mode concurrency.
 
+use crate::db_migrate::DbPool;
 use crate::{
     auth::Principal,
     error::{Error, Result},
 };
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex as TokioMutex;
 
 /// Records which user "owns" each repo.
 #[async_trait]
@@ -141,9 +141,9 @@ pub struct RepoRow {
 }
 
 /// SQLite-backed `OwnershipStore`. Shares the DB file with
-/// `SqliteTokenStore`; its own connection, its own table.
+/// `SqliteTokenStore`; its own pool, its own table.
 pub struct SqliteOwnershipStore {
-    conn: Arc<TokioMutex<Connection>>,
+    conn: DbPool,
 }
 
 const MIGRATIONS: [crate::db_migrate::Migration; 1] = [crate::db_migrate::Migration {
@@ -163,10 +163,13 @@ const MIGRATIONS: [crate::db_migrate::Migration; 1] = [crate::db_migrate::Migrat
 
 impl SqliteOwnershipStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = crate::db_migrate::open_with_migrations(path, "ownership", &MIGRATIONS)?;
-        Ok(Self {
-            conn: Arc::new(TokioMutex::new(conn)),
-        })
+        let conn = crate::db_migrate::open_pool_with_migrations(path, "ownership", &MIGRATIONS)?;
+        Ok(Self { conn })
+    }
+
+    /// Expose the pool so periodic tasks can publish pool gauges.
+    pub(crate) fn pool(&self) -> &DbPool {
+        &self.conn
     }
 }
 
@@ -180,7 +183,7 @@ fn now_secs() -> i64 {
 #[async_trait]
 impl OwnershipStore for SqliteOwnershipStore {
     async fn record_owner(&self, repo_id: &str, owner: Option<&str>) -> Result<()> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         conn.execute(
             "INSERT OR REPLACE INTO repos (id, owner_subject, created_at)
              VALUES (?1, ?2, ?3)",
@@ -190,7 +193,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn get_owner(&self, repo_id: &str) -> Result<Option<Option<String>>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id])?;
         let Some(row) = rows.next()? else {
@@ -202,13 +205,13 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn delete(&self, repo_id: &str) -> Result<()> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         conn.execute("DELETE FROM repos WHERE id = ?1", params![repo_id])?;
         Ok(())
     }
 
     async fn count_by_owner(&self, subject: &str) -> Result<u64> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt =
             conn.prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
         let mut rows = stmt.query(params![subject])?;
@@ -218,7 +221,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_all(&self) -> Result<Vec<RepoRow>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -239,7 +242,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_paginated(&self, limit: u32, offset: u32) -> Result<Vec<RepoRow>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -261,7 +264,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn count_all(&self) -> Result<u64> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM repos")?;
         let mut rows = stmt.query([])?;
         let row = rows.next()?.expect("COUNT(*) always returns one row");
@@ -270,7 +273,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -297,7 +300,7 @@ impl OwnershipStore for SqliteOwnershipStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<RepoRow>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
              FROM repos
@@ -320,7 +323,7 @@ impl OwnershipStore for SqliteOwnershipStore {
     }
 
     async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>> {
-        let conn = crate::metrics::lock_sqlite(&self.conn, "ownership").await;
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt =
             conn.prepare_cached("SELECT id, owner_subject, created_at FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id])?;

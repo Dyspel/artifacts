@@ -198,27 +198,75 @@ pub(crate) fn path_label_for(matched: Option<&str>, raw_uri: &str) -> String {
     }
 }
 
-/// Lock a SQLite connection mutex and record how long the wait took.
+/// Claim a connection from a SQLite pool and record how long the
+/// claim took.
 ///
-/// Wraps `tokio::sync::Mutex::lock()` with a histogram measurement
-/// keyed by store name (`tokens` / `ownership` / `audit`). Every
+/// Wraps `r2d2::Pool::get()` with a histogram measurement keyed by
+/// store name (`tokens` / `ownership` / `audit` / `webhooks`). Every
 /// store-side handler funnels through here, so the histogram is the
-/// canonical "is SQLite contention real yet?" signal.
+/// canonical "is SQLite pool contention real yet?" signal.
 ///
-/// Returns the same `MutexGuard` the caller would have got from
-/// `.lock().await` — no behavior change beyond the metric emission.
-pub(crate) async fn lock_sqlite<'a>(
-    conn: &'a tokio::sync::Mutex<rusqlite::Connection>,
+/// Returns the `PooledConnection` the caller would have got from
+/// `pool.get()` — no behavior change beyond the metric emission.
+/// On pool-exhaustion / r2d2 error, the error is mapped into
+/// `crate::error::Error::Other` so the trait-level `Result` types
+/// don't have to carry an `r2d2` import.
+pub(crate) fn get_pooled(
+    pool: &crate::db_migrate::DbPool,
     store: &'static str,
-) -> tokio::sync::MutexGuard<'a, rusqlite::Connection> {
+) -> crate::error::Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
     let start = Instant::now();
-    let guard = conn.lock().await;
+    let conn = pool
+        .get()
+        .map_err(|e| crate::error::Error::Other(anyhow::anyhow!("sqlite pool ({store}): {e}")))?;
     metrics::histogram!(
         "artifacts_sqlite_lock_wait_seconds",
         "store" => store,
     )
     .record(start.elapsed().as_secs_f64());
-    guard
+    let _ = pool;
+    Ok(conn)
+}
+
+/// Update the pool-state gauges for `store`. Cheap — `Pool::state()`
+/// is a `Mutex::lock + read counters` round-trip. Call from periodic
+/// refresh tasks (the same ones that refresh `_tokens_active_total`
+/// etc.).
+///
+/// Emits two gauges:
+///   - `artifacts_sqlite_pool_size{store}` — configured max
+///   - `artifacts_sqlite_pool_in_use{store}` — claimed connections
+pub(crate) fn refresh_pool_gauges(pool: &crate::db_migrate::DbPool, store: &'static str) {
+    let state = pool.state();
+    let size = pool.max_size();
+    let in_use = state.connections.saturating_sub(state.idle_connections);
+    metrics::gauge!("artifacts_sqlite_pool_size", "store" => store).set(size as f64);
+    metrics::gauge!("artifacts_sqlite_pool_in_use", "store" => store).set(in_use as f64);
+}
+
+/// Spawn a periodic refresher for the pool gauges of every SQLite
+/// store. One task instead of four — the work is just two gauge sets
+/// per pool per tick, far cheaper than the 60-second `tick` makes it
+/// look. Cloned pools share the underlying r2d2 `Arc<Inner>` so
+/// memory cost is trivial.
+pub fn spawn_pool_gauge_refresher(
+    pools: Vec<(&'static str, crate::db_migrate::DbPool)>,
+    tick: std::time::Duration,
+) {
+    // Publish once immediately so the first scrape doesn't see 0.
+    for (name, p) in &pools {
+        refresh_pool_gauges(p, name);
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        ticker.tick().await; // skip the immediate one
+        loop {
+            ticker.tick().await;
+            for (name, p) in &pools {
+                refresh_pool_gauges(p, name);
+            }
+        }
+    });
 }
 
 /// Render the Prometheus exposition. Returns `text/plain; version=0.0.4`

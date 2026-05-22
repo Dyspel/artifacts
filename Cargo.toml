@@ -41,6 +41,13 @@ futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Connection pool for the four SQLite stores (tokens / audit /
+# webhooks / ownership). Replaces the single Arc<TokioMutex<Connection>>
+# that previously serialized every store-side query — under WAL mode a
+# pool gives real reader parallelism (N readers + 1 writer
+# concurrently). Pinned to the version that targets `rusqlite 0.31`.
+r2d2 = "0.8"
+r2d2_sqlite = { version = "0.24" }
 sha2 = "0.10"
 subtle = "2"
 jsonwebtoken = "9"
