@@ -34,9 +34,8 @@ fn async_cmd() -> TokioCommand {
 }
 
 /// Returns a fresh `std::process::Command` set up to invoke `git`.
-/// The sync factory — used by `gc::rev_list_objects` and
-/// `storage::snapshot_refs_to_packed`, both of which run inside
-/// `spawn_blocking` and don't gain from async.
+/// The sync factory — used by `gc::rev_list_objects` (runs inside a
+/// spawn_blocking sweep, doesn't gain from async).
 fn sync_cmd() -> std::process::Command {
     std::process::Command::new(GIT)
 }
@@ -196,15 +195,5 @@ pub(crate) fn rev_list_objects_all(git_dir: &Path) -> std::process::Command {
     cmd.arg("--git-dir")
         .arg(git_dir)
         .args(["rev-list", "--objects", "--all"]);
-    cmd
-}
-
-/// `git --git-dir <dir> show-ref` — used by `storage::fork` to
-/// snapshot the source repo's refs into a `packed-refs` file inside
-/// the new fork. show-ref emits `<sha> <refname>` per line; an empty
-/// stdout (exit 1) means "no refs" and is a valid state.
-pub(crate) fn show_ref(git_dir: &Path) -> std::process::Command {
-    let mut cmd = sync_cmd();
-    cmd.arg("--git-dir").arg(git_dir).arg("show-ref");
     cmd
 }

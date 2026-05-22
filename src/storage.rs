@@ -332,29 +332,58 @@ pub(crate) fn write_bare_repo_layout(path: &Path) -> Result<()> {
 ///
 /// Empty source (no refs) → no packed-refs file. git handles that fine.
 fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
-    let output = crate::git_cmd::show_ref(src).output()?;
-    // `git show-ref` exits 1 with empty stdout when there are no refs
-    // (fresh init-bare, no pushes yet). That's not an error for us.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
+    // Enumerate the source repo's refs natively via gix; HEAD and any
+    // other symbolic refs are filtered out (their targets get written
+    // when we iterate to the underlying object ref). Annotated-tag
+    // peeled-target entries are deliberately *not* written — they're
+    // an optimization git can rebuild on demand, and emitting them
+    // here would require a separate find-object lookup per tag we
+    // don't want to pay at fork time.
+    let repo = gix::open(src)
+        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open({}): {e}", src.display())))?;
+    let platform = repo
+        .references()
+        .map_err(|e| Error::Other(anyhow::anyhow!("repo.references(): {e}")))?;
+    let iter = platform
+        .all()
+        .map_err(|e| Error::Other(anyhow::anyhow!("references.all(): {e}")))?;
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for reference in iter {
+        let reference = match reference {
+            Ok(r) => r,
+            Err(e) => {
+                // Broken ref files shouldn't take the fork down;
+                // log + skip. Matches `git show-ref`'s behaviour of
+                // emitting a warning to stderr and continuing.
+                tracing::warn!(error = %e, "skipping unreadable ref during fork snapshot");
+                continue;
+            }
+        };
+        if let gix::refs::TargetRef::Object(oid) = reference.target() {
+            entries.push((
+                oid.to_hex().to_string(),
+                reference.name().as_bstr().to_string(),
+            ));
+        }
+    }
+
+    if entries.is_empty() {
         return Ok(());
     }
 
+    // packed-refs spec requires sorted-by-name output; gix returns
+    // refs in fs-order which is approximately but not exactly the
+    // same. Sort explicitly so the header's `sorted` capability is
+    // honest.
+    entries.sort_by(|a, b| a.1.cmp(&b.1));
+
     let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted\n");
-    for line in stdout.lines() {
-        // show-ref emits `<sha> <refname>`. Packed-refs uses the same
-        // shape per line, so a direct pass-through is valid. We
-        // deliberately *don't* use --dereference here; annotated tags'
-        // peeled entries are an optimization git can rebuild on
-        // demand, and the dereferenced output form is trickier to
-        // convert to the exact packed-refs shape (^<peeled-sha> as
-        // its own line right after the tag line).
-        if let Some((sha, name)) = line.split_once(' ') {
-            packed.push_str(sha);
-            packed.push(' ');
-            packed.push_str(name);
-            packed.push('\n');
-        }
+    for (sha, name) in entries {
+        packed.push_str(&sha);
+        packed.push(' ');
+        packed.push_str(&name);
+        packed.push('\n');
     }
     std::fs::write(dst.join("packed-refs"), packed)?;
     Ok(())
