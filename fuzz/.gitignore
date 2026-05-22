@@ -1,0 +1,6 @@
+# cargo-fuzz output artifacts. Corpus rebuilds from coverage on
+# every run; crash reports + coverage profdata live in artifacts/.
+target/
+corpus/
+artifacts/
+coverage/

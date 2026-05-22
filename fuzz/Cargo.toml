@@ -1,0 +1,42 @@
+# cargo-fuzz scaffold. Built by `cargo +nightly fuzz run <target>`;
+# the runtime depends on the nightly-only `-Cinstrument-coverage` +
+# libfuzzer hooks.
+#
+# This file is intentionally its own workspace (`[workspace]` block
+# at the bottom) so the main crate's `cargo build` doesn't pull
+# `libfuzzer-sys` into every PR.
+
+[package]
+name = "artifacts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.artifacts]
+path = ".."
+
+# Each target compiles to a separate fuzzer binary. `test = false` /
+# `doc = false` / `bench = false` keep `cargo test`/`cargo doc` from
+# trying to build the libfuzzer-sys binary outside `cargo fuzz`.
+
+[[bin]]
+name = "pkt_line"
+path = "fuzz_targets/pkt_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_proto"
+path = "fuzz_targets/git_proto.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

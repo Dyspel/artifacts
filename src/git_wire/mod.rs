@@ -13,5 +13,8 @@
 //! (the framing primitive) still live at the crate root for now;
 //! moving them here is a follow-up.
 
-pub(crate) mod proto;
+// `proto` is `pub` so the libFuzzer harness in `fuzz/` can call into
+// the byte-shape parsers. `v2` stays `pub(crate)` — its response
+// builders touch `RefStore` and don't compose well as a fuzz surface.
+pub mod proto;
 pub(crate) mod v2;

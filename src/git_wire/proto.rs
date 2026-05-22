@@ -16,7 +16,7 @@
 use crate::pkt_line::{PktIter, PktLine};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct LsRefsArgs {
+pub struct LsRefsArgs {
     pub peel: bool,
     pub symrefs: bool,
     pub prefixes: Vec<String>,
@@ -27,7 +27,7 @@ pub(crate) struct LsRefsArgs {
 /// unfamiliar trips `simple = false` and the caller falls back to
 /// upload-pack rather than guess the right protocol response.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct V2FetchRequest {
+pub struct V2FetchRequest {
     pub wants: Vec<String>,
     pub haves: Vec<String>,
     pub done: bool,
@@ -54,7 +54,7 @@ impl V2FetchRequest {
 /// One ref-update command from a `git push`. Format on the wire:
 ///   `<old-oid> <new-oid> <refname>[\0<capabilities>]\n`
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RefUpdate {
+pub struct RefUpdate {
     pub old: String,
     pub new: String,
     pub name: String,
@@ -75,7 +75,7 @@ impl RefUpdate {
 
 /// Parsed shape of a smart-HTTP push body.
 #[derive(Debug)]
-pub(crate) struct ReceivePackRequest {
+pub struct ReceivePackRequest {
     pub updates: Vec<RefUpdate>,
     /// Capabilities advertised by the client on the first ref-update
     /// line (after a `\0`). We only need a few for the dispatch
@@ -117,7 +117,7 @@ impl ReceivePackRequest {
 /// else. Conservative: any unfamiliar capability or argument returns
 /// `None` so the subprocess path picks it up. That way new protocol
 /// extensions don't silently get the wrong response.
-pub(crate) fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
+pub fn parse_ls_refs_only(body: &[u8]) -> Option<LsRefsArgs> {
     let mut iter = PktIter::new(body);
 
     // 1. command line.
@@ -209,7 +209,7 @@ fn is_known_capability(line: &str) -> bool {
 /// accepts the well-known capabilities and arguments and tags any
 /// unfamiliar one via `has_unsupported`. Multi-command bodies, malformed
 /// pkt-lines, or non-fetch commands return `None`.
-pub(crate) fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
+pub fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
     let mut iter = PktIter::new(body);
 
     let first = match iter.next()? {
@@ -295,7 +295,7 @@ pub(crate) fn is_hex40(s: &str) -> bool {
 ///
 /// Returns `None` for malformed or unfamiliar bodies — caller falls
 /// through to `git receive-pack` which has every quirk covered.
-pub(crate) fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
+pub fn parse_receive_pack_body(body: &[u8]) -> Option<ReceivePackRequest> {
     let mut req = ReceivePackRequest {
         updates: Vec::new(),
         has_report_status: false,

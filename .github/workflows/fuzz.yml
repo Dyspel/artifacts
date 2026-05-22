@@ -1,0 +1,57 @@
+name: Fuzz
+
+# Nightly + manual. Intentionally not on `push` / `pull_request`: a
+# five-minute libFuzzer run is too slow for the PR gate and would
+# also flake on transient timing — fuzz is a continuous quality
+# signal, not a merge blocker.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz duration in seconds"
+        required: false
+        default: "300"
+  schedule:
+    # 07:30 UTC daily.
+    - cron: "30 7 * * *"
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: cargo fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pkt_line, git_proto]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-${{ matrix.target }}
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run fuzz target
+        run: |
+          DURATION="${{ github.event.inputs.duration_seconds || 300 }}"
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            --fuzz-dir fuzz -- -max_total_time=$DURATION
+      - name: Upload crashes on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
