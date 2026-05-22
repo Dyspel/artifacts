@@ -36,6 +36,11 @@ use gix_pack::data::output;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+/// Hand-rolled pack parser + delta resolver. KV-friendly (no
+/// filesystem touch); used by `SqliteObjectStore::ingest_pack` after
+/// the D4 wiring. See `src/native_pack/parse.rs`.
+pub(crate) mod parse;
+
 /// Index a pack from `pack_bytes` into `<repo>/objects/pack/`. Used
 /// by native receive-pack (M1b-3-gix) to replace the
 /// `git unpack-objects --stdin` subprocess: instead of unpacking
