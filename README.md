@@ -106,6 +106,14 @@ end-to-end in a day, not a quarter.
 | Forward-only schema migrator (`schema_version` per store)        | ✅     |
 | SQLite lock-wait histogram (`artifacts_sqlite_lock_wait_seconds`) | ✅     |
 | `artifacts-gui` Wayland/X11 visualizer (feature-gated)           | ✅     |
+| `r2d2_sqlite` connection pool — N readers + 1 writer per store, plus `_pool_size`/`_pool_in_use` gauges per store | ✅     |
+| Online `backup.sh` (SQLite `.backup` API + tar of `repos/`) + matching `restore.sh` + Rust round-trip test | ✅     |
+| REST commits via `gix::Repository::write_blob` + `edit_tree` + `write_object` (was 5 git subprocesses + temp index dir) | ✅     |
+| `Command::new("git")` centralized — exactly one production call site (inside `git_cmd`) | ✅     |
+| `cargo-fuzz` harnesses for `pkt_line` + `git_wire::proto` parsers (nightly CI + `workflow_dispatch`) | ✅     |
+| GitHub Actions CI — fmt + clippy `-D warnings` + `cargo test --all-targets` on pinned Rust 1.88 | ✅     |
+| Crate splits as lib + bin — `cargo test --lib` works; integration tests link the lib | ✅     |
+| `deploy/` — Dockerfile (multi-stage) + hardened systemd unit + single-replica k8s manifests (Recreate strategy, RWO PVC) | ✅     |
 
 **Known not-yet:**
 
@@ -209,6 +217,28 @@ response; a small p50 nudge because that endpoint was the cheaper
 of the two git subprocesses. M1b-2c swapped `git pack-objects` for
 `gix-pack`: another p50 −22% on the fetch hot path.
 
+### Concurrent load (32 parallel clones + 32 parallel pushes)
+
+Measured via `scripts/bench_concurrent.sh` (N=32 by default, release
+build, all clients on the same host). Each clone is the full 28 KB
+seed; each push is a small commit to a distinct repo so the bench
+exercises the SQLite pool + smart-HTTP layer without converging on
+a single ref's CAS:
+
+|        | 32 concurrent clones | 32 concurrent pushes |
+| ------ | --------------------: | --------------------: |
+| wall   | 111 ms                | 56 ms                 |
+| p50    | 75.0 ms               | 25.5 ms               |
+| p95    | 108.4 ms              | 49.9 ms               |
+| p99    | 108.8 ms              | 53.3 ms               |
+| tput   | 288 ops/s             | 572 ops/s             |
+
+These are fan-in burst numbers, not steady-state throughput — the
+right way to read them is "is p99 well-behaved when 32 clients
+arrive at once?" The `r2d2_sqlite` pool (max 8 connections per
+store) doesn't saturate at this fan-in; `artifacts_sqlite_pool_in_use`
+returns to 0 by the time the post-bench scrape runs.
+
 ### Push latency (sequential pushes of a small commit)
 
 Measured via `scripts/bench_push.sh` (200 iterations, release
@@ -234,9 +264,10 @@ genuinely can't shell out (a future chunked-KV `Storage` impl).
 
 ## Quickstart
 
-**Requirements:** Rust stable (we've tested 1.75+) and `git` ≥ 2.30 on
-`$PATH`. We invoke `git upload-pack` and `git receive-pack` directly for
-smart-HTTP (no CGI wrapper, no git-http-backend dep).
+**Requirements:** Rust 1.88 (pinned via `rust-toolchain.toml`) and
+`git` ≥ 2.30 on `$PATH`. We invoke `git upload-pack` and `git
+receive-pack` directly for smart-HTTP (no CGI wrapper, no
+git-http-backend dep).
 
 Run the server:
 
@@ -284,8 +315,8 @@ curl -sS -X POST \
 Run the test suite:
 
 ```sh
-cargo test                # unit tests
-./tests/smoke.sh          # end-to-end: create / clone / push / fork / scopes / REST commits / revoke / restart / JWT / quota / metrics / merge / paginated list / read APIs / SSE
+cargo test --all-targets  # 283 lib + 26 gui + 2 Rust integration tests
+./tests/smoke.sh          # thin shim → cargo test --test integration_smoke
 ./scripts/bench_fork.sh   # fork benchmark (FORKS=10000 PARALLEL=64 by default)
 ```
 
@@ -779,46 +810,68 @@ Basic with the repo token; scope is enforced (`receive-pack` requires
 
 ```
 artifacts/
-├── Cargo.toml                 cargo manifest (single binary crate)
+├── Cargo.toml                 cargo manifest
+├── rust-toolchain.toml        pinned 1.88 — local dev + CI agree
 ├── README.md                  this file
 ├── ARCHITECTURE.md            the three hard problems, prototype vs production
+├── .github/workflows/
+│   ├── ci.yml                 fmt / clippy / build+test on every PR
+│   └── fuzz.yml               nightly cargo-fuzz + workflow_dispatch
 ├── src/
-│   ├── main.rs                CLI + server wiring (axum router)
+│   ├── lib.rs                 library root — every module declared here
+│   ├── main.rs                thin bin shim: clap parse → app::serve
+│   ├── app.rs                 server bring-up (router, shutdown listener)
 │   ├── config.rs              runtime config (data dir, base URL, admin token)
 │   ├── error.rs               error type + IntoResponse + WWW-Authenticate
 │   ├── auth.rs                Basic/Bearer extraction + authorization helpers
 │   ├── jwt.rs                 HS256 verification (Dyspel `userId` / `sub`)
-│   ├── tokens.rs              TokenStore trait + InMemory + SQLite impls
+│   ├── tokens.rs              TokenStore trait + InMemory + SQLite-pool impls
 │   ├── ownership.rs           OwnershipStore trait + SQLite repos table + quota
 │   ├── refs.rs                RefStore trait + FsRefStore (CAS via update-ref)
 │   ├── storage.rs             Storage trait + FsStorage (fork-via-alternates — THE CORE)
-│   ├── object_store.rs        ObjectStore trait + Fs / Mem impls + gc routing
+│   ├── object_store/          ObjectStore trait + Fs / Mem / SQLite impls + conformance suite
 │   ├── alternates_cache.rs    memoizes alternates → source_id lookups
 │   ├── smart_http.rs          native v2 pack handlers + pack-handler shell-out fallback
 │   ├── pkt_line.rs            git smart-HTTP pkt-line parser
+│   ├── git_wire/              v2 ls-refs + fetch + push body parsers + response builders
 │   ├── native_pack.rs         empty-pack / sideband helpers used by smart_http
-│   ├── commits.rs             REST-side commits (POST /v1/repos/:id/commits)
+│   ├── git_cmd.rs             *the* single seam for spawning `git` subprocesses
+│   ├── commits.rs             REST-side commits via gix (POST /v1/repos/:id/commits)
 │   ├── merge.rs               three-way + fast-forward merge
-│   ├── reads.rs               read APIs (tree / blob / diff / notes / forks-of)
+│   ├── reads/                 read APIs (tree / blob / diff / notes / forks-of)
 │   ├── gc.rs                  alternates-aware loose-object reachability sweep
 │   ├── events.rs              in-process EventBus + SSE bridge
 │   ├── webhooks.rs            WebhookRegistry trait + SQLite/Mem impls + dispatcher
 │   ├── secrets.rs             AES-256-GCM master key (env + file resolver)
 │   ├── audit.rs               persistent audit log + SHA-256 hash-chain
-│   ├── db_migrate.rs          forward-only schema migrator (per-store namespaces)
-│   ├── metrics.rs             Prometheus exporter + track_metrics middleware
+│   ├── db_migrate.rs          forward-only schema migrator + `r2d2_sqlite` pool builder
+│   ├── metrics.rs             Prometheus exporter + pool-gauge refresher
 │   ├── rate_limit.rs          per-subject token bucket
 │   ├── ip_rate_limit.rs       per-IP token bucket for unauth /v1/health*
 │   ├── request_id.rs          X-Request-Id roundtrip + per-request span
+│   ├── blocking.rs            spawn_blocking + JoinError mapping helper
+│   ├── test_support.rs        #[cfg(test)] TestRepo fixture
 │   ├── rest.rs                shared RestState + helpers; handlers in rest/*
 │   ├── rest/                  repos.rs / tokens.rs / webhooks.rs / admin.rs / health.rs
 │   └── bin/
 │       └── artifacts-gui/     feature-gated: eframe/egui Wayland/X11 visualizer
 ├── tests/
-│   └── smoke.sh               end-to-end: create → clone → push → fork → scopes → REST commits → revoke → restart → JWT → quota → blob-cap → /metrics → merge → paginated list → read APIs → SSE
+│   ├── smoke.sh                       thin shim → `cargo test --test integration_smoke`
+│   ├── integration_smoke.rs           Rust port of the bash smoke; 22 scenarios in one #[test]
+│   └── backup_restore_roundtrip.rs    round-trips repo + token through backup.sh / restore.sh
+├── fuzz/                              cargo-fuzz workspace (own [workspace] block)
+│   ├── Cargo.toml
+│   └── fuzz_targets/
+│       ├── pkt_line.rs                arbitrary bytes → pkt_line::read
+│       └── git_proto.rs               arbitrary bytes → v2 + push parsers
+├── deploy/                            Dockerfile + systemd unit + k8s manifests
 └── scripts/
-    ├── bench_fork.sh          10,000-fork benchmark; measures disk + latency
-    └── bench_clone.sh         clone-latency benchmark; p50/p95/p99/max over N clones
+    ├── bench_fork.sh           10,000-fork benchmark; measures disk + latency
+    ├── bench_clone.sh          sequential-clone latency; p50/p95/p99/max
+    ├── bench_push.sh           sequential-push latency; same shape
+    ├── bench_concurrent.sh     N=32 parallel clones + pushes; fan-in p99
+    ├── backup.sh               online data-dir snapshot (SQLite .backup + tar)
+    └── restore.sh              inverse — restore a backup into a fresh data dir
 ```
 
 Under `$DATA_DIR` at runtime:
@@ -956,15 +1009,28 @@ cargo build --release       # optimized, used by benchmarks
 cargo run -- serve --data-dir ./data --bind 127.0.0.1:8787
 
 # Test
-cargo test                  # 281 unit tests (storage, smart-http, refs, commits, tokens, auth, jwt, ownership, rate-limit, request-id, audit, gc-via-ObjectStore, webhooks, config rotation, audit log + retention, audit hash-chain tamper detection, webhook-secret encryption + master-key rotation, object-store conformance across Fs/Mem/SQLite, bind-safety, error-response contracts, health-readiness probes, metrics cardinality, schema-migration framework, per-IP rate-limit at unauth boundary, pagination proptest)
-./tests/smoke.sh            # end-to-end integration smoke (multi-step)
-./scripts/bench_fork.sh     # fork benchmark, knobs via env:
-FORKS=100   PARALLEL=4  ./scripts/bench_fork.sh   # quick sanity run
-FORKS=10000 PARALLEL=32 ./scripts/bench_fork.sh   # the headline test
-KEEP=1 FORKS=5 ./scripts/bench_fork.sh            # keep data dir for poking
+cargo test --lib            # 283 lib tests in isolation (no bin link)
+cargo test --all-targets    # + 26 gui unit tests + 2 Rust integration tests
+                            # (tests/integration_smoke.rs covers the 22
+                            # end-to-end scenarios the bash smoke used to;
+                            # tests/backup_restore_roundtrip.rs round-trips
+                            # backup.sh + restore.sh)
+./tests/smoke.sh            # thin shim → cargo test --test integration_smoke
 
-./scripts/bench_clone.sh    # clone-latency benchmark
-CLONES=200 ./scripts/bench_clone.sh               # time 200 sequential clones
+# Bench
+./scripts/bench_fork.sh         # fork benchmark (FORKS / PARALLEL knobs)
+./scripts/bench_clone.sh        # sequential clones; CLONES=200 default
+./scripts/bench_push.sh         # sequential pushes
+./scripts/bench_concurrent.sh   # N=32 parallel clones + pushes; fan-in p99
+
+# Backup / restore (online)
+./scripts/backup.sh  <data-dir>   <backup-dir>
+./scripts/restore.sh <backup-dir> <data-dir>     # server must be stopped
+
+# Fuzz (nightly Rust + cargo-fuzz install required)
+cd fuzz
+cargo +nightly fuzz run pkt_line  --max-total-time=60
+cargo +nightly fuzz run git_proto --max-total-time=60
 ```
 
 Logging is via `tracing`. Tune with `RUST_LOG`:
@@ -972,6 +1038,12 @@ Logging is via `tracing`. Tune with `RUST_LOG`:
 ```sh
 RUST_LOG=artifacts=debug,tower_http=info cargo run -- serve ...
 ```
+
+The Prometheus `/metrics` endpoint includes `r2d2`-pool gauges per
+SQLite store — `artifacts_sqlite_pool_size{store}` and
+`artifacts_sqlite_pool_in_use{store}` for `tokens` / `ownership` /
+`audit` / `webhooks`. Use these alongside the request-duration
+histogram to spot pool exhaustion under load.
 
 ## Deployment
 
