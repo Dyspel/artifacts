@@ -42,6 +42,7 @@ pub async fn health_ready(
         &*state.authn.tokens,
         &*state.observ.audit,
         &*state.data.ownership,
+        state.cfg.readiness_write_check,
     )
     .await
 }
@@ -78,22 +79,51 @@ async fn probe_stores(
     tokens: &dyn TokenStore,
     audit: &dyn AuditStore,
     ownership: &dyn OwnershipStore,
+    write_check: bool,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     use axum::http::StatusCode;
     use std::time::Duration;
     let deadline = Duration::from_secs(1);
-    let tokens_ok = matches!(
+    // Per-store read-side probe: matches the pre-existing contract.
+    // Each future is independent so a single store's failure doesn't
+    // mask the others.
+    let tokens_read = matches!(
         tokio::time::timeout(deadline, tokens.lookup("__health_ready_probe__")).await,
         Ok(Ok(_))
     );
-    let audit_ok = matches!(
+    let audit_read = matches!(
         tokio::time::timeout(deadline, audit.count()).await,
         Ok(Ok(_))
     );
-    let ownership_ok = matches!(
+    let ownership_read = matches!(
         tokio::time::timeout(deadline, ownership.count_all()).await,
         Ok(Ok(_))
     );
+    // Write-side probe — gated on `write_check` so deployments that
+    // explicitly opt out (read-only replica, intentional probe load
+    // minimization, etc.) keep the read-only behavior. When the flag
+    // is off the write outcomes default to "ok" so the AND below
+    // doesn't down-grade the result.
+    let (tokens_write, audit_write, ownership_write) = if write_check {
+        let t = matches!(
+            tokio::time::timeout(deadline, tokens.probe_write()).await,
+            Ok(Ok(_))
+        );
+        let a = matches!(
+            tokio::time::timeout(deadline, audit.probe_write()).await,
+            Ok(Ok(_))
+        );
+        let o = matches!(
+            tokio::time::timeout(deadline, ownership.probe_write()).await,
+            Ok(Ok(_))
+        );
+        (t, a, o)
+    } else {
+        (true, true, true)
+    };
+    let tokens_ok = tokens_read && tokens_write;
+    let audit_ok = audit_read && audit_write;
+    let ownership_ok = ownership_read && ownership_write;
     let all_ok = tokens_ok && audit_ok && ownership_ok;
     let body = serde_json::json!({
         "ok": all_ok,
@@ -137,11 +167,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    /// Minimal `TokenStore` whose `lookup` outcome is configurable.
-    /// Every other trait method either has a default impl or panics
-    /// (we never exercise them from `health_ready`).
+    /// Minimal `TokenStore` whose `lookup` outcome + `probe_write`
+    /// outcome are both configurable. Every other trait method either
+    /// has a default impl or panics (we never exercise them from
+    /// `health_ready`).
     struct StubTokenStore {
         lookup_succeeds: bool,
+        write_succeeds: bool,
     }
 
     #[async_trait]
@@ -166,6 +198,15 @@ mod tests {
         }
         async fn revoke(&self, _: &str) -> Result<bool> {
             unreachable!("health_ready does not revoke")
+        }
+        async fn probe_write(&self) -> Result<()> {
+            if self.write_succeeds {
+                Ok(())
+            } else {
+                Err(Error::Other(anyhow::anyhow!(
+                    "simulated tokens-store write failure"
+                )))
+            }
         }
     }
 
@@ -264,12 +305,13 @@ mod tests {
     async fn probe_stores_returns_200_when_all_ok() {
         let tokens = StubTokenStore {
             lookup_succeeds: true,
+            write_succeeds: true,
         };
         let audit = NoopAuditStore;
         let ownership = StubOwnershipStore {
             count_succeeds: true,
         };
-        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, true).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body.0["ok"], serde_json::json!(true));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));
@@ -281,12 +323,13 @@ mod tests {
     async fn probe_stores_returns_503_when_tokens_fails() {
         let tokens = StubTokenStore {
             lookup_succeeds: false,
+            write_succeeds: true,
         };
         let audit = NoopAuditStore;
         let ownership = StubOwnershipStore {
             count_succeeds: true,
         };
-        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, true).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("fail"));
@@ -298,12 +341,13 @@ mod tests {
     async fn probe_stores_returns_503_when_audit_fails() {
         let tokens = StubTokenStore {
             lookup_succeeds: true,
+            write_succeeds: true,
         };
         let audit = FailingAuditStore;
         let ownership = StubOwnershipStore {
             count_succeeds: true,
         };
-        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, true).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));
@@ -312,15 +356,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_stores_write_check_failure_flags_the_store() {
+        // Read-side OK, write-side fails → the store is flagged
+        // even though its read probe was happy. Covers the case
+        // where a tokens.db on a read-only filesystem reads fine
+        // but can't accept the next mutation.
+        let tokens = StubTokenStore {
+            lookup_succeeds: true,
+            write_succeeds: false,
+        };
+        let audit = NoopAuditStore;
+        let ownership = StubOwnershipStore {
+            count_succeeds: true,
+        };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, true).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["components"]["tokens"], serde_json::json!("fail"));
+        assert_eq!(body.0["components"]["audit"], serde_json::json!("ok"));
+        assert_eq!(body.0["components"]["ownership"], serde_json::json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn probe_stores_write_check_disabled_ignores_write_failure() {
+        // With write_check=false, a failing write probe doesn't
+        // down-grade the result — matches the opt-out behavior the
+        // ARTIFACTS_READINESS_WRITE_CHECK=0 env var enables.
+        let tokens = StubTokenStore {
+            lookup_succeeds: true,
+            write_succeeds: false,
+        };
+        let audit = NoopAuditStore;
+        let ownership = StubOwnershipStore {
+            count_succeeds: true,
+        };
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, false).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body.0["ok"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
     async fn probe_stores_returns_503_when_ownership_fails() {
         let tokens = StubTokenStore {
             lookup_succeeds: true,
+            write_succeeds: true,
         };
         let audit = NoopAuditStore;
         let ownership = StubOwnershipStore {
             count_succeeds: false,
         };
-        let (status, body) = probe_stores(&tokens, &audit, &ownership).await;
+        let (status, body) = probe_stores(&tokens, &audit, &ownership, true).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.0["ok"], serde_json::json!(false));
         assert_eq!(body.0["components"]["tokens"], serde_json::json!("ok"));

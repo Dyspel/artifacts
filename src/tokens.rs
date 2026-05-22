@@ -159,6 +159,17 @@ pub trait TokenStore: Send + Sync {
             "TokenStore::list_for_repo not implemented"
         )))
     }
+
+    /// Exercise the store's write path with a transient row that's
+    /// immediately deleted. The readiness probe calls this (when
+    /// `ARTIFACTS_READINESS_WRITE_CHECK` is not 0) so a read-only
+    /// filesystem or quota-full sqlite gets caught at probe time
+    /// rather than at the next real mutation. Default impl is a
+    /// no-op so non-SQLite backends (the in-memory test store)
+    /// compose without overriding.
+    async fn probe_write(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// SQLite-backed `TokenStore`.
@@ -361,6 +372,16 @@ impl TokenStore for SqliteTokenStore {
             params![now, hash],
         )?;
         Ok(affected > 0)
+    }
+
+    async fn probe_write(&self) -> Result<()> {
+        let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _probe (k INTEGER PRIMARY KEY);
+             INSERT OR REPLACE INTO _probe (k) VALUES (1);
+             DELETE FROM _probe WHERE k = 1;",
+        )?;
+        Ok(())
     }
 
     async fn revoke_all_for_repo(&self, repo_id: &str) -> Result<u64> {

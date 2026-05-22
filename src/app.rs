@@ -119,6 +119,16 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_MAX_REPO_BYTES", default_value_t = 0)]
     pub max_repo_bytes: u64,
 
+    /// Enable the write-check side of `/v1/health/ready`. When set,
+    /// the readiness probe also exercises each SQLite store's write
+    /// path (transient INSERT+DELETE against a `_probe` table) so an
+    /// unwritable backing store surfaces at the orchestrator's
+    /// polling cadence rather than at the next real mutation.
+    /// Default true; opt out with `ARTIFACTS_READINESS_WRITE_CHECK=0`.
+    #[arg(long, env = "ARTIFACTS_READINESS_WRITE_CHECK", default_value_t = true,
+          action = clap::ArgAction::Set)]
+    pub readiness_write_check: bool,
+
     /// PEM-encoded TLS certificate. Pair with `--tls-key`.
     #[arg(long, env = "ARTIFACTS_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -171,6 +181,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_repos_per_user,
         max_commit_blob_bytes,
         max_repo_bytes,
+        readiness_write_check,
         tls_cert,
         tls_key,
         shutdown_timeout_secs,
@@ -245,6 +256,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_repos_per_user,
         max_commit_blob_bytes,
         max_repo_bytes,
+        readiness_write_check,
     ));
     tracing::info!(
         max_repos_per_user,

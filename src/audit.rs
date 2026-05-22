@@ -151,6 +151,13 @@ pub trait AuditStore: Send + Sync {
     async fn verify_chain(&self) -> Result<ChainVerifyOk> {
         Ok(ChainVerifyOk { verified: 0 })
     }
+    /// Exercise the store's write path with a transient row that's
+    /// immediately deleted. Mirrors `TokenStore::probe_write` — the
+    /// readiness probe calls this so an unwritable backing store
+    /// surfaces at probe time rather than at the next real mutation.
+    async fn probe_write(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Drops every write on the floor. Used by tests where audit
@@ -346,6 +353,16 @@ impl AuditStore for SqliteAuditStore {
         let affected =
             conn.execute("DELETE FROM audit_events WHERE ts < ?1", params![cutoff_ts])?;
         Ok(affected as u64)
+    }
+
+    async fn probe_write(&self) -> Result<()> {
+        let conn = crate::metrics::get_pooled(&self.conn, "audit")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _probe (k INTEGER PRIMARY KEY);
+             INSERT OR REPLACE INTO _probe (k) VALUES (1);
+             DELETE FROM _probe WHERE k = 1;",
+        )?;
+        Ok(())
     }
 
     async fn verify_chain(&self) -> Result<ChainVerifyOk> {

@@ -129,6 +129,14 @@ pub trait OwnershipStore: Send + Sync {
     /// PK-lookup is O(1); previously this was a `list_all().find(...)`
     /// scan over the whole table.
     async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>>;
+
+    /// Exercise the store's write path with a transient row that's
+    /// immediately deleted. Mirrors `TokenStore::probe_write` — the
+    /// readiness probe calls this so an unwritable backing store
+    /// surfaces at probe time rather than at the next real mutation.
+    async fn probe_write(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One row of the `repos` table. `owner` is `None` for admin-created
@@ -270,6 +278,16 @@ impl OwnershipStore for SqliteOwnershipStore {
         let row = rows.next()?.expect("COUNT(*) always returns one row");
         let n: i64 = row.get(0)?;
         Ok(n as u64)
+    }
+
+    async fn probe_write(&self) -> Result<()> {
+        let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _probe (k INTEGER PRIMARY KEY);
+             INSERT OR REPLACE INTO _probe (k) VALUES (1);
+             DELETE FROM _probe WHERE k = 1;",
+        )?;
+        Ok(())
     }
 
     async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {

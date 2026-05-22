@@ -39,9 +39,19 @@ pub struct Config {
     /// boundary. `0` means unlimited (default). Set via
     /// `--max-repo-bytes` / `ARTIFACTS_MAX_REPO_BYTES`.
     pub max_repo_bytes: u64,
+
+    /// When `true` (default), `/v1/health/ready` exercises each
+    /// SQLite store's write path via `probe_write` (transient
+    /// INSERT/DELETE against a `_probe` table) alongside the
+    /// existing cheap-SELECT probe. Catches a read-only filesystem
+    /// or quota-full sqlite at the orchestrator's polling cadence
+    /// instead of at the next real mutation. Set via
+    /// `ARTIFACTS_READINESS_WRITE_CHECK=0` to opt out.
+    pub readiness_write_check: bool,
 }
 
 impl Config {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         data_dir: PathBuf,
         public_base_url: String,
@@ -50,6 +60,7 @@ impl Config {
         max_repos_per_user: u64,
         max_commit_blob_bytes: usize,
         max_repo_bytes: u64,
+        readiness_write_check: bool,
     ) -> Self {
         Self {
             data_dir,
@@ -59,6 +70,7 @@ impl Config {
             max_repos_per_user,
             max_commit_blob_bytes,
             max_repo_bytes,
+            readiness_write_check,
         }
     }
 
@@ -117,6 +129,7 @@ mod tests {
             16,
             1024,
             0,
+            true,
         )
     }
 
