@@ -103,6 +103,10 @@ tempfile = "3"
 # Property tests for pagination + bucket math. Kept dev-only;
 # `std` is the default feature, which is all we need.
 proptest = "1"
+# Used by tests/integration_smoke.rs to send SIGTERM to the spawned
+# server (`std::process::Child::kill` is SIGKILL on Unix; the
+# graceful-shutdown scenario specifically needs SIGTERM).
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
