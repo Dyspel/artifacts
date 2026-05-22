@@ -51,9 +51,8 @@ use axum::{
     extract::{Path as AxumPath, Request, State},
     http::{header, HeaderMap, Method, Response, StatusCode},
 };
-use std::{path::Path, process::Stdio, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 #[derive(Clone)]
 pub struct GitState {
@@ -247,17 +246,8 @@ async fn info_refs(
         .strip_prefix("git-")
         .expect("service validated by service_from_query");
 
-    let mut cmd = Command::new("git");
-    cmd.args([sub, "--stateless-rpc", "--advertise-refs"])
-        .arg(repo_path);
-    if let Some(gp) = headers.get("git-protocol").and_then(|v| v.to_str().ok()) {
-        cmd.env("GIT_PROTOCOL", gp);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = cmd.spawn()?;
+    let git_protocol = headers.get("git-protocol").and_then(|v| v.to_str().ok());
+    let child = crate::git_cmd::pack_handler_advertise(repo_path, sub, git_protocol).spawn()?;
     let output = child.wait_with_output().await?;
     if !output.status.success() {
         tracing::error!(
@@ -368,16 +358,8 @@ async fn pack_handler(
         }
     }
 
-    let mut cmd = Command::new("git");
-    cmd.args([sub, "--stateless-rpc"]).arg(repo_path);
-    if let Some(gp) = headers.get("git-protocol").and_then(|v| v.to_str().ok()) {
-        cmd.env("GIT_PROTOCOL", gp);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
+    let git_protocol = headers.get("git-protocol").and_then(|v| v.to_str().ok());
+    let mut child = crate::git_cmd::pack_handler_serve(repo_path, sub, git_protocol).spawn()?;
 
     // Pipe body to stdin in a task so the pack handler can start streaming
     // back output without waiting for the full body to land.
@@ -599,14 +581,7 @@ async fn apply_ref_update(
 /// Used for the pack-side of native receive-pack until M1b-3-gix
 /// swaps in `gix-pack`'s native pack-indexing.
 async fn unpack_objects_via_subprocess(repo_path: &Path, pack_bytes: &[u8]) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("--git-dir")
-        .arg(repo_path)
-        .args(["unpack-objects", "-q"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = crate::git_cmd::unpack_objects(repo_path).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let bytes = pack_bytes.to_vec();
         tokio::spawn(async move {

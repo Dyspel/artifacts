@@ -302,11 +302,7 @@ fn network_around(repos_dir: &Path, seed: &str, cache: &AlternatesCache) -> Resu
 /// need the OID part.
 fn rev_list_objects(repos_dir: &Path, repo_id: &str) -> Result<Vec<String>> {
     let git_dir = repos_dir.join(format!("{repo_id}.git"));
-    let out = std::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(&git_dir)
-        .args(["rev-list", "--objects", "--all"])
-        .output()?;
+    let out = crate::git_cmd::rev_list_objects_all(&git_dir).output()?;
     if !out.status.success() {
         // A repo with no refs exits 0 with empty stdout; non-zero
         // is a real error.

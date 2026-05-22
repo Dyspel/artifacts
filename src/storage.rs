@@ -16,7 +16,6 @@
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Repo lifecycle. Implementations are free to back repos with any
 /// storage medium as long as they can honor create / fork / delete /
@@ -308,11 +307,7 @@ pub(crate) fn write_bare_repo_layout(path: &Path) -> Result<()> {
 ///
 /// Empty source (no refs) → no packed-refs file. git handles that fine.
 fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(src)
-        .arg("show-ref")
-        .output()?;
+    let output = crate::git_cmd::show_ref(src).output()?;
     // `git show-ref` exits 1 with empty stdout when there are no refs
     // (fresh init-bare, no pushes yet). That's not an error for us.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -343,6 +338,7 @@ fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn create_writes_minimal_bare_repo_layout_recognised_by_git() {

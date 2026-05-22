@@ -14,6 +14,7 @@
 //! M1b-3-gix migration will delete this entirely.
 
 use crate::error::{Error, Result};
+use crate::git_cmd;
 use crate::git_wire::proto::{LsRefsArgs, V2FetchRequest};
 use crate::pkt_line as pkt;
 use crate::refs::{HeadState, RefStore};
@@ -22,9 +23,7 @@ use axum::{
     http::{header, Response, StatusCode},
 };
 use std::path::Path;
-use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 /// Native v2 fetch response. Generates a packfile via the in-process
 /// gix-pack path and wraps it in the v2 fetch response framing:
@@ -97,19 +96,7 @@ async fn generate_pack_via_pack_objects(
     wants: &[String],
     haves: &[String],
 ) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
-    cmd.arg("--git-dir").arg(repo_path).args([
-        "pack-objects",
-        "--stdout",
-        "--revs",
-        "--thin",
-        "--delta-base-offset",
-    ]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
+    let mut child = git_cmd::pack_objects_revs(repo_path).spawn()?;
 
     // Write `<want>\n` and `^<have>\n` lines.
     let mut input = String::with_capacity(42 * (wants.len() + haves.len()));
