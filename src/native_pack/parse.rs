@@ -546,6 +546,130 @@ fn read_loose_inflated<S: ObjectStore + ?Sized>(
     Ok(Some((kind, payload)))
 }
 
+/// D3 entry point. Parse `pack_bytes`, store every Direct entry,
+/// then resolve every delta entry — both REF_DELTA (looked up via
+/// the store) and OFS_DELTA (looked up by byte offset in this pack).
+/// Multi-pass with no-progress detection so chains of arbitrary
+/// length resolve eventually, and a missing base surfaces as a hard
+/// error rather than an infinite loop.
+///
+/// Returns the total number of objects stored.
+pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
+    pack_bytes: &[u8],
+    repo_id: &str,
+    store: &S,
+) -> Result<usize> {
+    use std::collections::HashMap;
+
+    let entries = parse_pack(pack_bytes)?;
+    let mut count = 0usize;
+
+    // Map a pack-byte-offset to its entry index so OFS_DELTA can
+    // resolve `entry_offset - base_offset_delta` → the base entry's
+    // position in `entries`.
+    let offset_to_idx: HashMap<usize, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.offset, i))
+        .collect();
+
+    // In-memory cache of (kind, payload) for entries we've fully
+    // materialized this run. Direct entries land here in phase 1;
+    // delta entries land here as their bases resolve.
+    //
+    // Bases are needed by OFS_DELTA in `apply_delta`, so we keep the
+    // payload bytes around even after we've written them via
+    // write_loose — a future deeply-deltified pack would otherwise
+    // pay an inflate-from-store cost per OFS_DELTA hop. The Vec<u8>
+    // cost is bounded by the pack's uncompressed size.
+    let mut resolved: HashMap<usize, (ObjectKind, Vec<u8>)> = HashMap::new();
+
+    // Phase 1: write every Direct entry, prime the resolved cache.
+    for (i, entry) in entries.iter().enumerate() {
+        if let ParsedKind::Direct(kind) = entry.kind {
+            let payload = entry.data.clone();
+            let oid = loose_oid_hex(kind, &payload);
+            let loose = loose_format_bytes(kind, &payload)?;
+            store.write_loose(repo_id, &oid, &loose)?;
+            resolved.insert(i, (kind, payload));
+            count += 1;
+        }
+    }
+
+    // Phase 2: deltas. Multi-pass over the pending queue; each pass
+    // resolves every delta whose base is now available (via the
+    // resolved cache for OFS_DELTA, via the store for REF_DELTA).
+    let mut pending: Vec<usize> = (0..entries.len())
+        .filter(|i| !resolved.contains_key(i))
+        .collect();
+
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut still_pending: Vec<usize> = Vec::with_capacity(pending.len());
+        for i in pending {
+            let entry = &entries[i];
+            let outcome = match &entry.kind {
+                ParsedKind::Direct(_) => unreachable!("Direct entries already resolved"),
+                ParsedKind::RefDelta { base_oid } => {
+                    let base_hex = hex_oid(base_oid);
+                    read_loose_inflated(store, repo_id, &base_hex)?
+                }
+                ParsedKind::OfsDelta { base_offset_delta } => {
+                    let delta = usize::try_from(*base_offset_delta).map_err(|_| {
+                        Error::Other(anyhow::anyhow!(
+                            "entry {i}: OFS_DELTA offset doesn't fit usize"
+                        ))
+                    })?;
+                    let base_offset = entry.offset.checked_sub(delta).ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!(
+                            "entry {i}: OFS_DELTA base offset underflow ({} - {})",
+                            entry.offset,
+                            delta
+                        ))
+                    })?;
+                    let base_idx = *offset_to_idx.get(&base_offset).ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!(
+                            "entry {i}: OFS_DELTA base offset {base_offset} doesn't match any entry"
+                        ))
+                    })?;
+                    resolved.get(&base_idx).cloned()
+                }
+            };
+            let Some((base_kind, base_payload)) = outcome else {
+                still_pending.push(i);
+                continue;
+            };
+            let target = apply_delta(&base_payload, &entry.data)
+                .map_err(|e| Error::Other(anyhow::anyhow!("entry {i}: apply_delta: {e}")))?;
+            let oid = loose_oid_hex(base_kind, &target);
+            let loose = loose_format_bytes(base_kind, &target)?;
+            store.write_loose(repo_id, &oid, &loose)?;
+            resolved.insert(i, (base_kind, target));
+            count += 1;
+        }
+        if still_pending.len() == before {
+            return Err(Error::Other(anyhow::anyhow!(
+                "delta resolution stuck: {} entries with missing bases",
+                still_pending.len()
+            )));
+        }
+        pending = still_pending;
+    }
+
+    Ok(count)
+}
+
+/// Hex-encode a 20-byte OID into 40 lowercase chars. Pulled out so
+/// REF_DELTA resolution has one canonical formatter.
+fn hex_oid(oid: &[u8; 20]) -> String {
+    let mut s = String::with_capacity(40);
+    for b in oid {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// D2 entry point. Parse `pack_bytes`, store every non-delta entry,
 /// then resolve every REF_DELTA entry against its base in the store
 /// (either just-written this run or already present from a prior
@@ -1191,6 +1315,190 @@ mod tests {
         let err = store_with_ref_delta_resolution(&p, "r", &store).unwrap_err();
         let _ = pack; // silence unused
         assert!(format!("{err}").contains("missing bases"), "got: {err}");
+    }
+
+    /// Encode an OFS_DELTA negative-offset field. Inverse of the
+    /// parser in `parse_ofs_delta_offset` — same MSB-continuation
+    /// big-endian scheme with the "+1 per continuation" quirk.
+    fn encode_ofs_offset(mut n: u64) -> Vec<u8> {
+        let mut bytes = vec![(n & 0x7f) as u8];
+        n >>= 7;
+        while n > 0 {
+            n -= 1;
+            bytes.push(((n & 0x7f) | 0x80) as u8);
+            n >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    #[test]
+    fn ofs_delta_offset_roundtrips() {
+        for &v in &[1u64, 127, 128, 16384, 1_000_000, u32::MAX as u64] {
+            let bytes = encode_ofs_offset(v);
+            let (parsed, consumed) = parse_ofs_delta_offset(&bytes).unwrap();
+            assert_eq!(parsed, v, "ofs offset {v}");
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    /// Build a pack with [Direct base, OFS_DELTA pointing back at it].
+    /// Test helper for D3.
+    fn build_pack_with_ofs_delta(
+        base_kind: ObjectKind,
+        base_payload: &[u8],
+        tail: &[u8],
+    ) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use sha1::{Digest, Sha1};
+        use std::io::Write;
+
+        // Build delta instructions: COPY all of base, then INSERT tail.
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base_payload.len() as u64));
+        delta.extend_from_slice(&delta_varint((base_payload.len() + tail.len()) as u64));
+        let bp_len = base_payload.len() as u32;
+        let mut copy_op = 0x80u8 | 0x01;
+        let mut copy_args = vec![0u8];
+        let b0 = (bp_len & 0xff) as u8;
+        let b1 = ((bp_len >> 8) & 0xff) as u8;
+        let b2 = ((bp_len >> 16) & 0xff) as u8;
+        if b0 != 0 {
+            copy_op |= 0x10;
+            copy_args.push(b0);
+        }
+        if b1 != 0 {
+            copy_op |= 0x20;
+            copy_args.push(b1);
+        }
+        if b2 != 0 {
+            copy_op |= 0x40;
+            copy_args.push(b2);
+        }
+        delta.push(copy_op);
+        delta.extend_from_slice(&copy_args);
+        assert!(tail.len() <= 127);
+        delta.push(tail.len() as u8);
+        delta.extend_from_slice(tail);
+
+        // Assemble the pack.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        // Entry 1: Direct base at offset 12.
+        let base_offset = pack.len();
+        let type_byte = match base_kind {
+            ObjectKind::Commit => OBJ_COMMIT,
+            ObjectKind::Tree => OBJ_TREE,
+            ObjectKind::Blob => OBJ_BLOB,
+            ObjectKind::Tag => OBJ_TAG,
+        };
+        let mut bsz = base_payload.len() as u64;
+        let mut header =
+            vec![(if bsz >> 4 > 0 { 0x80 } else { 0 }) | (type_byte << 4) | ((bsz & 0xf) as u8)];
+        bsz >>= 4;
+        while bsz > 0 {
+            let b = (bsz & 0x7f) as u8;
+            bsz >>= 7;
+            header.push((if bsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&header);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(base_payload).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // Entry 2: OFS_DELTA pointing back at entry 1.
+        let delta_offset = pack.len();
+        let target_size = (base_payload.len() + tail.len()) as u64;
+        let mut dsz = target_size;
+        let mut dheader = vec![
+            (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_OFS_DELTA << 4) | ((dsz & 0xf) as u8),
+        ];
+        dsz >>= 4;
+        while dsz > 0 {
+            let b = (dsz & 0x7f) as u8;
+            dsz >>= 7;
+            dheader.push((if dsz > 0 { 0x80 } else { 0 }) | b);
+        }
+        pack.extend_from_slice(&dheader);
+        // Negative offset to the base entry.
+        let offset_field = encode_ofs_offset((delta_offset - base_offset) as u64);
+        pack.extend_from_slice(&offset_field);
+        // zlib-compressed delta body.
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&delta).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // SHA-1 trailer.
+        let mut h = Sha1::new();
+        h.update(&pack);
+        pack.extend_from_slice(&h.finalize());
+        pack
+    }
+
+    #[test]
+    fn ofs_delta_resolves_against_in_pack_base() {
+        let base_payload = b"the quick brown fox\n";
+        let tail = b" jumped\n";
+        let pack = build_pack_with_ofs_delta(ObjectKind::Blob, base_payload, tail);
+
+        let store = MemObjectStore::new();
+        let n = store_with_full_resolution(&pack, "r", &store).unwrap();
+        assert_eq!(n, 2);
+
+        let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
+        let expected_target: Vec<u8> = [base_payload.as_ref(), tail.as_ref()].concat();
+        let target_oid = loose_oid_hex(ObjectKind::Blob, &expected_target);
+        assert!(store.exists("r", &base_oid).unwrap());
+        assert!(store.exists("r", &target_oid).unwrap());
+    }
+
+    #[test]
+    fn full_resolution_handles_ref_delta_too() {
+        // The full-resolution path should also handle REF_DELTA
+        // entries (D3 is supposed to be a superset of D2).
+        let base_payload = b"a base shared between ref and ofs paths";
+        let tail = b" tail";
+        let (pack, _) = build_pack_with_ref_delta(ObjectKind::Blob, base_payload, tail);
+        let store = MemObjectStore::new();
+        let n = store_with_full_resolution(&pack, "r", &store).unwrap();
+        assert_eq!(n, 2);
+        let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
+        let expected = [base_payload.as_ref(), tail.as_ref()].concat();
+        let target_oid = loose_oid_hex(ObjectKind::Blob, &expected);
+        assert!(store.exists("r", &base_oid).unwrap());
+        assert!(store.exists("r", &target_oid).unwrap());
+    }
+
+    #[test]
+    fn ofs_delta_underflow_errors() {
+        // Build a pack where entry 1 is an OFS_DELTA pointing
+        // 99999 bytes BEFORE itself — impossible, so resolution
+        // must fail with an offset-underflow message.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        pack.push(OBJ_OFS_DELTA << 4); // size=0
+        let offset_field = encode_ofs_offset(99999);
+        pack.extend_from_slice(&offset_field);
+        {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let body = vec![0u8, 0u8];
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&body).unwrap();
+            pack.extend_from_slice(&enc.finish().unwrap());
+        }
+        pack.extend_from_slice(&[0u8; 20]);
+
+        let store = MemObjectStore::new();
+        let err = store_with_full_resolution(&pack, "r", &store).unwrap_err();
+        assert!(format!("{err}").contains("underflow"), "got: {err}");
     }
 
     #[test]
