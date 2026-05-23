@@ -90,6 +90,34 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
+impl From<r2d2::Error> for Error {
+    fn from(e: r2d2::Error) -> Self {
+        Error::Other(anyhow::Error::from(e))
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Other(anyhow::Error::from(e))
+    }
+}
+
+impl From<base64::DecodeError> for Error {
+    fn from(e: base64::DecodeError) -> Self {
+        Error::Other(anyhow::Error::from(e))
+    }
+}
+
+impl From<aes_gcm::Error> for Error {
+    fn from(e: aes_gcm::Error) -> Self {
+        // aes_gcm::Error is a unit struct with no Display detail, so
+        // anyhow::Error::from would yield a useless message. Wrap
+        // with a hard-coded context line — every caller that goes
+        // through `?` here knows it's an AES seal/unseal failure.
+        Error::Other(anyhow::anyhow!("aes-gcm operation failed: {e}"))
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
