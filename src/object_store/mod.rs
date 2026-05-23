@@ -49,6 +49,7 @@
 //!   doesn't route through this yet.
 
 use crate::error::{Error, Result};
+use crate::ids::{Oid, RepoId};
 use std::path::{Path, PathBuf};
 // HashMap, RwLock, Arc, Mutex only matter to MemObjectStore +
 // SqliteObjectStore, both of which are `#[cfg(test)]`. Importing them
@@ -127,7 +128,7 @@ pub trait ObjectStore: Send + Sync {
     /// might be in a packfile, or absent entirely; callers that
     /// need that distinction should consult a higher-level `find`
     /// API on top of this trait.
-    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>>;
+    fn read_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<Option<Vec<u8>>>;
 
     /// Store loose-object bytes for `(repo_id, oid)`. Idempotent:
     /// a second write of the same `oid` is a no-op (loose objects
@@ -146,7 +147,7 @@ pub trait ObjectStore: Send + Sync {
     /// chunked-KV impl that *does* materialize loose-format bytes
     /// has a contract to satisfy.
     #[allow(dead_code)]
-    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()>;
+    fn write_loose(&self, repo_id: &RepoId, oid: &Oid, bytes: &[u8]) -> Result<()>;
 
     /// Enumerate every loose object in the repo. Used by gc to
     /// compute the on-disk set that gets diffed against the
@@ -157,13 +158,13 @@ pub trait ObjectStore: Send + Sync {
     /// no loose objects yet (rather than an error) — this matches
     /// the FS shape where a missing `objects/` dir is identical
     /// to one with no loose subdirs.
-    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>>;
+    fn list_loose(&self, repo_id: &RepoId) -> Result<Vec<LooseInfo>>;
 
     /// Delete a loose object by oid. Returns `Ok(true)` if a row
     /// was removed, `Ok(false)` if the object wasn't there
     /// (idempotent — a second delete of the same oid is fine).
     /// Malformed oid is an error, mirroring `write_loose`.
-    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool>;
+    fn delete_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool>;
 
     /// Does the store have an object with this oid? Covers loose
     /// **and** packed in backends that have a pack concept (the FS
@@ -175,7 +176,7 @@ pub trait ObjectStore: Send + Sync {
     /// can answer existence without reading the body (FS stat-only,
     /// pack `.idx` binary-search, KV row-presence) should override
     /// to skip the body fetch.
-    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+    fn exists(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         Ok(self.read_loose(repo_id, oid)?.is_some())
     }
 
@@ -194,7 +195,7 @@ pub trait ObjectStore: Send + Sync {
     /// — both lack a base-object lookup against an existing repo)
     /// fall through to this default and the receive-pack handler
     /// errors out. The FS impl overrides with `gix_pack` ingestion.
-    fn ingest_pack(&self, _repo_id: &str, _pack_bytes: &[u8]) -> Result<usize> {
+    fn ingest_pack(&self, _repo_id: &RepoId, _pack_bytes: &[u8]) -> Result<usize> {
         Err(Error::Other(anyhow::anyhow!(
             "ingest_pack: not supported by this ObjectStore backend"
         )))
@@ -211,7 +212,7 @@ pub trait ObjectStore: Send + Sync {
     /// default since the production blob-read path doesn't exercise
     /// them; if a future production KV backend needs it, override
     /// there too.
-    fn read_object(&self, _repo_id: &str, _oid: &str) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    fn read_object(&self, _repo_id: &RepoId, _oid: &Oid) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         Err(Error::Other(anyhow::anyhow!(
             "read_object: not supported by this ObjectStore backend"
         )))
@@ -230,15 +231,19 @@ impl FsObjectStore {
         Self { root: root.into() }
     }
 
-    fn loose_path(&self, repo_id: &str, oid: &str) -> Option<PathBuf> {
+    fn loose_path(&self, repo_id: &RepoId, oid: &Oid) -> Option<PathBuf> {
         // Defensive: oid validation. We don't trust the caller for
         // path-traversal — anything outside the [a-f0-9]{40} shape
         // gets rejected. Shared with `MemObjectStore` so both impls
         // honor the same malformed-oid contract.
-        if !oid_is_valid(oid) {
+        // Defensive double-check even though `Oid::try_from` validated
+        // at construction — a future impl that bypasses the newtype
+        // shouldn't be allowed to traverse the fs.
+        let oid_str = oid.as_str();
+        if !oid_is_valid(oid_str) {
             return None;
         }
-        let (a, b) = oid.split_at(2);
+        let (a, b) = oid_str.split_at(2);
         Some(
             self.root
                 .join(format!("{repo_id}.git"))
@@ -250,7 +255,7 @@ impl FsObjectStore {
 }
 
 impl ObjectStore for FsObjectStore {
-    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
+    fn read_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<Option<Vec<u8>>> {
         let path = match self.loose_path(repo_id, oid) {
             Some(p) => p,
             None => return Ok(None),
@@ -262,7 +267,7 @@ impl ObjectStore for FsObjectStore {
         }
     }
 
-    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
+    fn write_loose(&self, repo_id: &RepoId, oid: &Oid, bytes: &[u8]) -> Result<()> {
         let path = self
             .loose_path(repo_id, oid)
             .ok_or_else(|| Error::Other(anyhow::anyhow!("write_loose: invalid oid {oid:?}")))?;
@@ -302,7 +307,7 @@ impl ObjectStore for FsObjectStore {
         }
     }
 
-    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+    fn list_loose(&self, repo_id: &RepoId) -> Result<Vec<LooseInfo>> {
         let objects = self.root.join(format!("{repo_id}.git")).join("objects");
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&objects) {
@@ -355,7 +360,7 @@ impl ObjectStore for FsObjectStore {
         Ok(out)
     }
 
-    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
+    fn delete_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         let path = self
             .loose_path(repo_id, oid)
             .ok_or_else(|| Error::Other(anyhow::anyhow!("delete_loose: invalid oid {oid:?}")))?;
@@ -366,7 +371,7 @@ impl ObjectStore for FsObjectStore {
         }
     }
 
-    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
+    fn exists(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         // Fast path: stat the loose location. Cheaper than opening
         // gix and never wakes the pack index. Most freshly-pushed
         // objects live here until `git gc` repacks them.
@@ -392,14 +397,14 @@ impl ObjectStore for FsObjectStore {
             // either; treat as "no such object" rather than bubbling.
             Err(_) => return Ok(false),
         };
-        let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
+        let gix_oid = match gix::ObjectId::from_hex(oid.as_str().as_bytes()) {
             Ok(o) => o,
             Err(_) => return Ok(false),
         };
         Ok(repo.find_header(gix_oid).is_ok())
     }
 
-    fn ingest_pack(&self, repo_id: &str, pack_bytes: &[u8]) -> Result<usize> {
+    fn ingest_pack(&self, repo_id: &RepoId, pack_bytes: &[u8]) -> Result<usize> {
         // Delegates to the existing native pack indexer. The pack file
         // lands at `<repo>/objects/pack/pack-<sha>.{pack,idx}`; gix
         // resolves thin-pack deltas against the repo's existing odb.
@@ -419,7 +424,7 @@ impl ObjectStore for FsObjectStore {
         Ok(0)
     }
 
-    fn read_object(&self, repo_id: &str, oid: &str) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+    fn read_object(&self, repo_id: &RepoId, oid: &Oid) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         // Override the loose-only default so packed objects resolve
         // too. Mirrors `exists()`'s shape: cheap path-validity check
         // first, then open the repo through gix and let its object
@@ -435,10 +440,13 @@ impl ObjectStore for FsObjectStore {
 
 fn read_object_fs_inner(
     root: &Path,
-    repo_id: &str,
-    oid: &str,
+    repo_id: &RepoId,
+    oid: &Oid,
 ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
-    if !oid_is_valid(oid) {
+    let oid_str = oid.as_str();
+    // Defensive — `Oid::try_from` validated already, but the gix call
+    // below propagates whatever malformed string we hand it.
+    if !oid_is_valid(oid_str) {
         return Ok(None);
     }
     let repo_path = root.join(format!("{repo_id}.git"));
@@ -449,7 +457,7 @@ fn read_object_fs_inner(
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
-    let gix_oid = match gix::ObjectId::from_hex(oid.as_bytes()) {
+    let gix_oid = match gix::ObjectId::from_hex(oid.as_str().as_bytes()) {
         Ok(o) => o,
         Err(_) => return Ok(None),
     };
@@ -545,10 +553,7 @@ impl Default for MemObjectStore {
 
 #[cfg(test)]
 impl ObjectStore for MemObjectStore {
-    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
-        if !oid_is_valid(oid) {
-            return Ok(None);
-        }
+    fn read_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<Option<Vec<u8>>> {
         Ok(self
             .objects
             .read()
@@ -557,12 +562,7 @@ impl ObjectStore for MemObjectStore {
             .map(|e| e.bytes.clone()))
     }
 
-    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
-        if !oid_is_valid(oid) {
-            return Err(Error::Other(anyhow::anyhow!(
-                "write_loose: invalid oid {oid:?}"
-            )));
-        }
+    fn write_loose(&self, repo_id: &RepoId, oid: &Oid, bytes: &[u8]) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -580,13 +580,13 @@ impl ObjectStore for MemObjectStore {
         Ok(())
     }
 
-    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+    fn list_loose(&self, repo_id: &RepoId) -> Result<Vec<LooseInfo>> {
         Ok(self
             .objects
             .read()
             .expect("MemObjectStore lock poisoned")
             .iter()
-            .filter(|((r, _), _)| r == repo_id)
+            .filter(|((r, _), _)| r.as_str() == repo_id.as_str())
             .map(|((_, oid), e)| LooseInfo {
                 oid: oid.clone(),
                 size: e.bytes.len() as u64,
@@ -595,12 +595,7 @@ impl ObjectStore for MemObjectStore {
             .collect())
     }
 
-    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        if !oid_is_valid(oid) {
-            return Err(Error::Other(anyhow::anyhow!(
-                "delete_loose: invalid oid {oid:?}"
-            )));
-        }
+    fn delete_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         Ok(self
             .objects
             .write()
@@ -609,10 +604,7 @@ impl ObjectStore for MemObjectStore {
             .is_some())
     }
 
-    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        if !oid_is_valid(oid) {
-            return Ok(false);
-        }
+    fn exists(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         // Skip the body clone — `contains_key` is all we need.
         Ok(self
             .objects
@@ -688,14 +680,11 @@ impl SqliteObjectStore {
 
 #[cfg(test)]
 impl ObjectStore for SqliteObjectStore {
-    fn read_loose(&self, repo_id: &str, oid: &str) -> Result<Option<Vec<u8>>> {
-        if !oid_is_valid(oid) {
-            return Ok(None);
-        }
+    fn read_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<Option<Vec<u8>>> {
         let conn = self.lock();
         let res = conn.query_row(
             "SELECT bytes FROM loose_objects WHERE repo_id = ?1 AND oid = ?2",
-            rusqlite::params![repo_id, oid],
+            rusqlite::params![repo_id.as_str(), oid.as_str()],
             |row| row.get::<_, Vec<u8>>(0),
         );
         match res {
@@ -705,12 +694,7 @@ impl ObjectStore for SqliteObjectStore {
         }
     }
 
-    fn write_loose(&self, repo_id: &str, oid: &str, bytes: &[u8]) -> Result<()> {
-        if !oid_is_valid(oid) {
-            return Err(Error::Other(anyhow::anyhow!(
-                "write_loose: invalid oid {oid:?}"
-            )));
-        }
+    fn write_loose(&self, repo_id: &RepoId, oid: &Oid, bytes: &[u8]) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -723,19 +707,19 @@ impl ObjectStore for SqliteObjectStore {
         conn.execute(
             "INSERT OR IGNORE INTO loose_objects (repo_id, oid, bytes, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![repo_id, oid, bytes, now],
+            rusqlite::params![repo_id.as_str(), oid.as_str(), bytes, now],
         )?;
         Ok(())
     }
 
-    fn list_loose(&self, repo_id: &str) -> Result<Vec<LooseInfo>> {
+    fn list_loose(&self, repo_id: &RepoId) -> Result<Vec<LooseInfo>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT oid, LENGTH(bytes), created_at
              FROM loose_objects
              WHERE repo_id = ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![repo_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![repo_id.as_str()], |row| {
             Ok(LooseInfo {
                 oid: row.get(0)?,
                 size: row.get::<_, i64>(1)? as u64,
@@ -749,30 +733,22 @@ impl ObjectStore for SqliteObjectStore {
         Ok(out)
     }
 
-    fn delete_loose(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        if !oid_is_valid(oid) {
-            return Err(Error::Other(anyhow::anyhow!(
-                "delete_loose: invalid oid {oid:?}"
-            )));
-        }
+    fn delete_loose(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         let conn = self.lock();
         let affected = conn.execute(
             "DELETE FROM loose_objects WHERE repo_id = ?1 AND oid = ?2",
-            rusqlite::params![repo_id, oid],
+            rusqlite::params![repo_id.as_str(), oid.as_str()],
         )?;
         Ok(affected > 0)
     }
 
-    fn exists(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        if !oid_is_valid(oid) {
-            return Ok(false);
-        }
+    fn exists(&self, repo_id: &RepoId, oid: &Oid) -> Result<bool> {
         let conn = self.lock();
         // `EXISTS` skips returning the bytes; the planner sees the
         // covering index and answers from the index alone.
         let n: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM loose_objects WHERE repo_id = ?1 AND oid = ?2)",
-            rusqlite::params![repo_id, oid],
+            rusqlite::params![repo_id.as_str(), oid.as_str()],
             |row| row.get(0),
         )?;
         Ok(n != 0)
@@ -790,7 +766,7 @@ impl ObjectStore for SqliteObjectStore {
     /// stopgap. The chunked-KV "no filesystem" purity claim now holds
     /// against any pack receive-pack lands on a SQLite-backed
     /// deployment.
-    fn ingest_pack(&self, repo_id: &str, pack_bytes: &[u8]) -> Result<usize> {
+    fn ingest_pack(&self, repo_id: &RepoId, pack_bytes: &[u8]) -> Result<usize> {
         if pack_bytes.len() <= 32 {
             return Ok(0);
         }

@@ -140,7 +140,8 @@ pub fn preview(
         }
     }
 
-    let loose = objects.list_loose(repo_id)?;
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id)?;
+    let loose = objects.list_loose(&repo_id_typed)?;
 
     let mut unreachable_bytes: u64 = 0;
     let mut sample: Vec<String> = Vec::new();
@@ -204,7 +205,8 @@ pub fn run(
     // the full list through preview's return (which only carries a
     // bounded sample). The preview-then-list pair is each O(N); doing
     // the enumerate twice is fine at our repo size.
-    let loose = objects.list_loose(repo_id)?;
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id)?;
+    let loose = objects.list_loose(&repo_id_typed)?;
 
     // Recompute reachable here so we don't have to plumb it through
     // GcPreview's public shape (which is intentionally bounded).
@@ -236,7 +238,17 @@ pub fn run(
             );
             continue;
         }
-        match objects.delete_loose(repo_id, &info.oid) {
+        // info.oid was produced by `list_loose` which guarantees a
+        // valid 40-char hex OID; the try_from below is the same
+        // predicate, can't realistically fail.
+        let oid_typed = match crate::ids::Oid::try_from(info.oid.as_str()) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(oid = %info.oid, error = %e, "gc: skipping malformed oid");
+                continue;
+            }
+        };
+        match objects.delete_loose(&repo_id_typed, &oid_typed) {
             Ok(true) => {
                 deleted += 1;
                 deleted_bytes += info.size;

@@ -98,8 +98,9 @@ pub async fn authorize_git(
     required: Scope,
 ) -> Result<TokenRecord> {
     let token = basic_token(headers)?;
+    let token_typed = crate::ids::Token::try_from(token.as_str())?;
     let record = tokens
-        .lookup(&token)
+        .lookup(&token_typed)
         .await?
         .ok_or(Error::UnauthorizedBasic)?;
     if record.repo_id != repo_id {

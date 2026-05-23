@@ -162,7 +162,12 @@ pub async fn create_commit(
     // find_object error path.
     if let Some(parent_sha) = &body.parent {
         validate_sha(parent_sha)?;
-        if !state.data.objects.exists(&repo_id, parent_sha)? {
+        // RepoId/Oid construction at the trait boundary; validation
+        // is the same predicate as validate_repo_id/validate_sha
+        // above so this can't realistically fail.
+        let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+        let parent_oid = crate::ids::Oid::try_from(parent_sha.as_str())?;
+        if !state.data.objects.exists(&repo_id_typed, &parent_oid)? {
             return Err(Error::BadRequest(format!(
                 "parent commit not found: {parent_sha}"
             )));
@@ -249,10 +254,22 @@ pub async fn create_commit(
     // RefStore trait so the guts are swappable (M3-proper replaces the
     // single-node FsRefStore with a distributed state machine; this call
     // site stays identical).
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    let ref_name_typed = crate::ids::RefName::try_from(ref_name.as_str())?;
+    let commit_sha_typed = crate::ids::Oid::try_from(commit_sha.as_str())?;
+    let parent_typed = match body.parent.as_deref() {
+        Some(s) => Some(crate::ids::Oid::try_from(s)?),
+        None => None,
+    };
     match state
         .data
         .refs
-        .cas_update(&repo_id, &ref_name, body.parent.as_deref(), &commit_sha)
+        .cas_update(
+            &repo_id_typed,
+            &ref_name_typed,
+            parent_typed.as_ref(),
+            &commit_sha_typed,
+        )
         .await?
     {
         CasOutcome::Updated => {}

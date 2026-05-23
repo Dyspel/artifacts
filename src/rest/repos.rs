@@ -54,15 +54,20 @@ pub async fn create_repo(
     state.data.storage.create(&id)?;
     // Record ownership *before* minting the token so a crash between the
     // two leaves a repo we can identify the owner of.
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    let owner_typed = match principal.subject() {
+        Some(s) => Some(crate::ids::Subject::try_from(s)?),
+        None => None,
+    };
     state
         .data
         .ownership
-        .record_owner(&id, principal.subject())
+        .record_owner(&id_typed, owner_typed.as_ref())
         .await?;
     let token = state
         .authn
         .tokens
-        .mint(&id, Scope::Write, None, principal.subject())
+        .mint(&id_typed, Scope::Write, None, owner_typed.as_ref())
         .await?;
     let remote = remote_url(&state.cfg, &id, &token);
     crate::audit::record(
@@ -126,16 +131,21 @@ pub async fn fork_repo(
         .unwrap_or((None, false));
     let fork_id = fork_id.unwrap_or_else(new_repo_id);
     state.data.storage.fork(&source_id, &fork_id)?;
+    let fork_id_typed = crate::ids::RepoId::try_from(fork_id.as_str())?;
+    let owner_typed = match principal.subject() {
+        Some(s) => Some(crate::ids::Subject::try_from(s)?),
+        None => None,
+    };
     state
         .data
         .ownership
-        .record_owner(&fork_id, principal.subject())
+        .record_owner(&fork_id_typed, owner_typed.as_ref())
         .await?;
     let scope = if read_only { Scope::Read } else { Scope::Write };
     let token = state
         .authn
         .tokens
-        .mint(&fork_id, scope, None, principal.subject())
+        .mint(&fork_id_typed, scope, None, owner_typed.as_ref())
         .await?;
     let remote = remote_url(&state.cfg, &fork_id, &token);
     crate::audit::record(
@@ -207,7 +217,8 @@ pub async fn delete_repo(
         let mut deleted = Vec::with_capacity(order.len());
         for dep in &order {
             state.data.storage.delete(dep)?;
-            state.data.ownership.delete(dep).await?;
+            let dep_typed = crate::ids::RepoId::try_from(dep.as_str())?;
+            state.data.ownership.delete(&dep_typed).await?;
             state.data.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
         }
@@ -246,7 +257,8 @@ pub async fn delete_repo(
     }
 
     state.data.storage.delete(&id)?;
-    state.data.ownership.delete(&id).await?;
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    state.data.ownership.delete(&id_typed).await?;
     state.data.alternates_cache.invalidate(&id);
     let mode = if force { "force" } else { "default" };
     crate::audit::record(
@@ -301,14 +313,17 @@ pub async fn list_repos(
             state.data.ownership.list_paginated(limit, offset).await?,
             state.data.ownership.count_all().await?,
         ),
-        crate::auth::Principal::User { subject } => (
-            state
-                .data
-                .ownership
-                .list_paginated_by_owner(subject, limit, offset)
-                .await?,
-            state.data.ownership.count_by_owner(subject).await?,
-        ),
+        crate::auth::Principal::User { subject } => {
+            let subject_typed = crate::ids::Subject::try_from(subject.as_str())?;
+            (
+                state
+                    .data
+                    .ownership
+                    .list_paginated_by_owner(&subject_typed, limit, offset)
+                    .await?,
+                state.data.ownership.count_by_owner(&subject_typed).await?,
+            )
+        }
     };
 
     if offset == 0 && total > limit as u64 {

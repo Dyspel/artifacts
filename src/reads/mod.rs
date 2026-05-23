@@ -105,7 +105,8 @@ pub async fn get_repo(
     headers: HeaderMap,
 ) -> Result<Json<RepoDetail>> {
     let git_dir = authorize_read(&state, &headers, &repo_id).await?;
-    let Some(row) = state.data.ownership.get_row(&repo_id).await? else {
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    let Some(row) = state.data.ownership.get_row(&repo_id_typed).await? else {
         return Err(Error::RepoNotFound(repo_id));
     };
     let refs = list_refs_native(&git_dir).await?;
@@ -494,9 +495,10 @@ pub async fn get_blob(
     // walks loose + pack stores via gix; a future chunked-KV impl
     // serves from its KV. Off the tokio pool for the same reason.
     let objects = state.data.objects.clone();
-    let repo_id_for_read = repo_id.clone();
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    let blob_oid_typed = crate::ids::Oid::try_from(blob_oid.as_str())?;
     let read_result = crate::blocking::run_blocking("read_object", move || {
-        objects.read_object(&repo_id_for_read, &blob_oid)
+        objects.read_object(&repo_id_typed, &blob_oid_typed)
     })
     .await?;
 

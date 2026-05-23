@@ -17,6 +17,7 @@
 //! repo to a single node.
 
 use crate::error::{Error, Result};
+use crate::ids::{Oid, RefName, RepoId};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -67,7 +68,7 @@ pub enum HeadState {
 #[async_trait]
 pub trait RefStore: Send + Sync {
     /// Read a ref by full name (e.g. `refs/heads/main`). `None` = absent.
-    async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>>;
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>>;
 
     /// Atomically set `ref_name` to `new_sha`.
     ///
@@ -77,10 +78,10 @@ pub trait RefStore: Send + Sync {
     ///   yet exist.
     async fn cas_update(
         &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected: Option<&str>,
-        new_sha: &str,
+        repo_id: &RepoId,
+        ref_name: &RefName,
+        expected: Option<&Oid>,
+        new_sha: &Oid,
     ) -> Result<CasOutcome>;
 
     /// Atomically delete `ref_name`. The CAS variant prevents
@@ -100,9 +101,9 @@ pub trait RefStore: Send + Sync {
     /// no-op'ing. Concrete stores override.
     async fn cas_delete(
         &self,
-        _repo_id: &str,
-        _ref_name: &str,
-        _expected: Option<&str>,
+        _repo_id: &RepoId,
+        _ref_name: &RefName,
+        _expected: Option<&Oid>,
     ) -> Result<CasOutcome> {
         Err(Error::Other(anyhow::anyhow!(
             "RefStore::cas_delete not implemented for this backend"
@@ -113,19 +114,23 @@ pub trait RefStore: Send + Sync {
     /// `prefixes` slice means "all refs". Order is unspecified — the
     /// caller (e.g. ls-refs) sorts as needed.
     ///
+    /// `prefixes` are free-form string prefixes (e.g. `"refs/heads/"`),
+    /// not full `RefName`s — they don't have to satisfy the strict
+    /// check-ref-format rules, so they stay as `String`.
+    ///
     /// Default impl errors; concrete stores override. We give a default
     /// rather than `unimplemented!()` so callers can detect "this store
     /// doesn't support enumeration" without a panic — useful for
     /// future stores that genuinely can't enumerate (e.g. a chunked KV
     /// without a secondary index).
-    async fn list(&self, _repo_id: &str, _prefixes: &[String]) -> Result<Vec<RefEntry>> {
+    async fn list(&self, _repo_id: &RepoId, _prefixes: &[String]) -> Result<Vec<RefEntry>> {
         Err(Error::Other(anyhow::anyhow!(
             "RefStore::list not implemented for this backend"
         )))
     }
 
     /// Read HEAD's symref/detached/unborn state. Default errors as above.
-    async fn read_head(&self, _repo_id: &str) -> Result<HeadState> {
+    async fn read_head(&self, _repo_id: &RepoId) -> Result<HeadState> {
         Err(Error::Other(anyhow::anyhow!(
             "RefStore::read_head not implemented for this backend"
         )))
@@ -143,18 +148,22 @@ impl FsRefStore {
         Self { repos_dir }
     }
 
-    fn repo_path(&self, repo_id: &str) -> PathBuf {
+    fn repo_path(&self, repo_id: &RepoId) -> PathBuf {
         self.repos_dir.join(format!("{repo_id}.git"))
     }
 }
 
 #[async_trait]
 impl RefStore for FsRefStore {
-    async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>> {
         let git_dir = self.repo_path(repo_id);
-        let (rc, stdout, _) =
-            crate::git_cmd::run_git(&git_dir, &["rev-parse", "--verify", ref_name], &[], None)
-                .await?;
+        let (rc, stdout, _) = crate::git_cmd::run_git(
+            &git_dir,
+            &["rev-parse", "--verify", ref_name.as_str()],
+            &[],
+            None,
+        )
+        .await?;
         if rc != 0 {
             return Ok(None);
         }
@@ -166,7 +175,7 @@ impl RefStore for FsRefStore {
         }
     }
 
-    async fn list(&self, repo_id: &str, prefixes: &[String]) -> Result<Vec<RefEntry>> {
+    async fn list(&self, repo_id: &RepoId, prefixes: &[String]) -> Result<Vec<RefEntry>> {
         let git_dir = self.repo_path(repo_id);
         let entries = enumerate_refs(&git_dir)?;
         if prefixes.is_empty() {
@@ -178,23 +187,28 @@ impl RefStore for FsRefStore {
             .collect())
     }
 
-    async fn read_head(&self, repo_id: &str) -> Result<HeadState> {
+    async fn read_head(&self, repo_id: &RepoId) -> Result<HeadState> {
         let git_dir = self.repo_path(repo_id);
         head_state(&git_dir)
     }
 
     async fn cas_update(
         &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected: Option<&str>,
-        new_sha: &str,
+        repo_id: &RepoId,
+        ref_name: &RefName,
+        expected: Option<&Oid>,
+        new_sha: &Oid,
     ) -> Result<CasOutcome> {
         let git_dir = self.repo_path(repo_id);
-        let expected_arg = expected.unwrap_or(ZERO_SHA);
+        let expected_arg = expected.map(|o| o.as_str()).unwrap_or(ZERO_SHA);
         let (rc, _, stderr) = crate::git_cmd::run_git(
             &git_dir,
-            &["update-ref", ref_name, new_sha, expected_arg],
+            &[
+                "update-ref",
+                ref_name.as_str(),
+                new_sha.as_str(),
+                expected_arg,
+            ],
             &[],
             None,
         )
@@ -213,9 +227,9 @@ impl RefStore for FsRefStore {
 
     async fn cas_delete(
         &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected: Option<&str>,
+        repo_id: &RepoId,
+        ref_name: &RefName,
+        expected: Option<&Oid>,
     ) -> Result<CasOutcome> {
         let git_dir = self.repo_path(repo_id);
         // `git update-ref -d <ref> [old-sha]` deletes; with
@@ -223,10 +237,21 @@ impl RefStore for FsRefStore {
         // (CAS). Without expected we pass no extra arg, which makes
         // git delete unconditionally.
         let (rc, _, stderr) = if let Some(exp) = expected {
-            crate::git_cmd::run_git(&git_dir, &["update-ref", "-d", ref_name, exp], &[], None)
-                .await?
+            crate::git_cmd::run_git(
+                &git_dir,
+                &["update-ref", "-d", ref_name.as_str(), exp.as_str()],
+                &[],
+                None,
+            )
+            .await?
         } else {
-            crate::git_cmd::run_git(&git_dir, &["update-ref", "-d", ref_name], &[], None).await?
+            crate::git_cmd::run_git(
+                &git_dir,
+                &["update-ref", "-d", ref_name.as_str()],
+                &[],
+                None,
+            )
+            .await?
         };
         if rc == 0 {
             return Ok(CasOutcome::Updated);
@@ -312,7 +337,7 @@ impl MemRefStore {
 #[cfg(test)]
 #[async_trait]
 impl RefStore for MemRefStore {
-    async fn read(&self, repo_id: &str, ref_name: &str) -> Result<Option<String>> {
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>> {
         let g = self.lock();
         Ok(g.refs
             .get(&(repo_id.to_string(), ref_name.to_string()))
@@ -321,15 +346,15 @@ impl RefStore for MemRefStore {
 
     async fn cas_update(
         &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected: Option<&str>,
-        new_sha: &str,
+        repo_id: &RepoId,
+        ref_name: &RefName,
+        expected: Option<&Oid>,
+        new_sha: &Oid,
     ) -> Result<CasOutcome> {
         let mut g = self.lock();
         let key = (repo_id.to_string(), ref_name.to_string());
         let current = g.refs.get(&key).cloned();
-        let matches = match (expected, current.as_deref()) {
+        let matches = match (expected.map(|o| o.as_str()), current.as_deref()) {
             (None, None) => true,
             (Some(e), Some(c)) => e == c,
             _ => false,
@@ -341,12 +366,12 @@ impl RefStore for MemRefStore {
         Ok(CasOutcome::Updated)
     }
 
-    async fn list(&self, repo_id: &str, prefixes: &[String]) -> Result<Vec<RefEntry>> {
+    async fn list(&self, repo_id: &RepoId, prefixes: &[String]) -> Result<Vec<RefEntry>> {
         let g = self.lock();
         let mut out: Vec<RefEntry> = g
             .refs
             .iter()
-            .filter(|((r, _), _)| r == repo_id)
+            .filter(|((r, _), _)| r.as_str() == repo_id.as_str())
             .filter(|((_, name), _)| {
                 prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p))
             })
@@ -360,10 +385,10 @@ impl RefStore for MemRefStore {
         Ok(out)
     }
 
-    async fn read_head(&self, repo_id: &str) -> Result<HeadState> {
+    async fn read_head(&self, repo_id: &RepoId) -> Result<HeadState> {
         let g = self.lock();
         Ok(g.heads
-            .get(repo_id)
+            .get(repo_id.as_str())
             .cloned()
             .unwrap_or_else(|| HeadState::Unborn {
                 target: "refs/heads/main".to_string(),
@@ -372,14 +397,14 @@ impl RefStore for MemRefStore {
 
     async fn cas_delete(
         &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected: Option<&str>,
+        repo_id: &RepoId,
+        ref_name: &RefName,
+        expected: Option<&Oid>,
     ) -> Result<CasOutcome> {
         let mut g = self.lock();
         let key = (repo_id.to_string(), ref_name.to_string());
         let current = g.refs.get(&key).cloned();
-        let matches = match (expected, current.as_deref()) {
+        let matches = match (expected.map(|o| o.as_str()), current.as_deref()) {
             (None, _) => true, // unconditional delete
             (Some(e), Some(c)) => e == c,
             (Some(_), None) => false,
@@ -551,14 +576,24 @@ mod tests {
     use super::*;
     use crate::storage::{new_repo_id, FsStorage, Storage};
 
-    fn setup_repo() -> (PathBuf, String, FsRefStore) {
+    fn rid(s: &str) -> RepoId {
+        RepoId::try_from(s).unwrap()
+    }
+    fn rn(s: &str) -> RefName {
+        RefName::try_from(s).unwrap()
+    }
+    fn to_oid(s: &str) -> Oid {
+        Oid::try_from(s).unwrap()
+    }
+
+    fn setup_repo() -> (PathBuf, RepoId, FsRefStore) {
         let tmp = std::env::temp_dir().join(format!("refs-test-{}", new_repo_id()));
         let repos_dir = tmp.join("repos");
         let storage = FsStorage::new(&repos_dir).unwrap();
-        let repo_id = new_repo_id();
-        storage.create(&repo_id).unwrap();
+        let repo_id_str = new_repo_id();
+        storage.create(&repo_id_str).unwrap();
         let refs = FsRefStore::new(repos_dir);
-        (tmp, repo_id, refs)
+        (tmp, rid(&repo_id_str), refs)
     }
 
     /// Write `bytes` as a blob into the given bare repo and return its SHA.
@@ -595,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn read_nonexistent_ref_returns_none() {
         let (_tmp, repo, refs) = setup_repo();
-        let r = refs.read(&repo, "refs/heads/nope").await.unwrap();
+        let r = refs.read(&repo, &rn("refs/heads/nope")).await.unwrap();
         assert_eq!(r, None);
     }
 
@@ -603,14 +638,14 @@ mod tests {
     async fn cas_update_creates_ref_when_expected_none() {
         let (_tmp, repo, refs) = setup_repo();
         let git_dir = refs.repo_path(&repo);
-        let sha = write_blob(&git_dir, b"hello");
+        let sha = to_oid(&write_blob(&git_dir, b"hello"));
 
         let out = refs
-            .cas_update(&repo, "refs/test/t", None, &sha)
+            .cas_update(&repo, &rn("refs/test/t"), None, &sha)
             .await
             .unwrap();
         assert_eq!(out, CasOutcome::Updated);
-        let r = refs.read(&repo, "refs/test/t").await.unwrap();
+        let r = refs.read(&repo, &rn("refs/test/t")).await.unwrap();
         assert_eq!(r.as_deref(), Some(sha.as_str()));
     }
 
@@ -624,46 +659,31 @@ mod tests {
         #[tokio::test]
         async fn cas_create_then_update_then_stale_conflicts() {
             let s = MemRefStore::new();
+            let repo = rid("rtst");
+            let rname = rn("refs/heads/x");
+            let oid1 = to_oid("0123456789012345678901234567890123456789");
+            let oid2 = to_oid("abcabcabcabcabcabcabcabcabcabcabcabcabca");
+            let oid3 = to_oid("ffffffffffffffffffffffffffffffffffffffff");
             // create
             assert_eq!(
-                s.cas_update(
-                    "r",
-                    "refs/heads/x",
-                    None,
-                    "0123456789012345678901234567890123456789"
-                )
-                .await
-                .unwrap(),
+                s.cas_update(&repo, &rname, None, &oid1).await.unwrap(),
                 CasOutcome::Updated,
             );
             // update under matching expected
             assert_eq!(
-                s.cas_update(
-                    "r",
-                    "refs/heads/x",
-                    Some("0123456789012345678901234567890123456789"),
-                    "abcabcabcabcabcabcabcabcabcabcabcabcabca",
-                )
-                .await
-                .unwrap(),
+                s.cas_update(&repo, &rname, Some(&oid1), &oid2)
+                    .await
+                    .unwrap(),
                 CasOutcome::Updated,
             );
             // stale expected → conflict, current returned
             match s
-                .cas_update(
-                    "r",
-                    "refs/heads/x",
-                    Some("0123456789012345678901234567890123456789"),
-                    "ffffffffffffffffffffffffffffffffffffffff",
-                )
+                .cas_update(&repo, &rname, Some(&oid1), &oid3)
                 .await
                 .unwrap()
             {
                 CasOutcome::Conflict { current } => {
-                    assert_eq!(
-                        current.as_deref(),
-                        Some("abcabcabcabcabcabcabcabcabcabcabcabcabca"),
-                    );
+                    assert_eq!(current.as_deref(), Some(oid2.as_str()),);
                 }
                 other => panic!("expected Conflict, got {other:?}"),
             }
@@ -672,13 +692,17 @@ mod tests {
         #[tokio::test]
         async fn read_returns_none_for_missing_ref() {
             let s = MemRefStore::new();
-            assert!(s.read("r", "refs/heads/nope").await.unwrap().is_none());
+            assert!(s
+                .read(&rid("rtst"), &rn("refs/heads/nope"))
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]
         async fn read_head_defaults_to_unborn_main() {
             let s = MemRefStore::new();
-            match s.read_head("r").await.unwrap() {
+            match s.read_head(&rid("rtst")).await.unwrap() {
                 HeadState::Unborn { target } => assert_eq!(target, "refs/heads/main"),
                 other => panic!("expected Unborn, got {other:?}"),
             }
@@ -687,13 +711,15 @@ mod tests {
         #[tokio::test]
         async fn list_filters_by_prefix() {
             let s = MemRefStore::new();
-            s.cas_update("r", "refs/heads/main", None, "0".repeat(40).as_str())
+            let repo = rid("rtst");
+            let zero = to_oid(&"0".repeat(40));
+            s.cas_update(&repo, &rn("refs/heads/main"), None, &zero)
                 .await
                 .unwrap();
-            s.cas_update("r", "refs/tags/v1", None, "0".repeat(40).as_str())
+            s.cas_update(&repo, &rn("refs/tags/v1"), None, &zero)
                 .await
                 .unwrap();
-            let heads = s.list("r", &["refs/heads/".into()]).await.unwrap();
+            let heads = s.list(&repo, &["refs/heads/".into()]).await.unwrap();
             assert_eq!(heads.len(), 1);
             assert_eq!(heads[0].name, "refs/heads/main");
         }
@@ -701,55 +727,54 @@ mod tests {
         #[tokio::test]
         async fn cas_delete_removes_when_expected_matches() {
             let s = MemRefStore::new();
-            let oid = "0".repeat(40);
-            s.cas_update("r", "refs/heads/x", None, &oid).await.unwrap();
-            assert!(s.read("r", "refs/heads/x").await.unwrap().is_some());
+            let repo = rid("rtst");
+            let rname = rn("refs/heads/x");
+            let oid = to_oid(&"0".repeat(40));
+            s.cas_update(&repo, &rname, None, &oid).await.unwrap();
+            assert!(s.read(&repo, &rname).await.unwrap().is_some());
             assert_eq!(
-                s.cas_delete("r", "refs/heads/x", Some(&oid)).await.unwrap(),
+                s.cas_delete(&repo, &rname, Some(&oid)).await.unwrap(),
                 CasOutcome::Updated,
             );
-            assert!(s.read("r", "refs/heads/x").await.unwrap().is_none());
+            assert!(s.read(&repo, &rname).await.unwrap().is_none());
         }
 
         #[tokio::test]
         async fn cas_delete_conflicts_when_expected_stale() {
             let s = MemRefStore::new();
-            let oid_old = "0".repeat(40);
-            let oid_new = "1".repeat(40);
-            s.cas_update("r", "refs/heads/x", None, &oid_old)
-                .await
-                .unwrap();
-            s.cas_update("r", "refs/heads/x", Some(&oid_old), &oid_new)
+            let repo = rid("rtst");
+            let rname = rn("refs/heads/x");
+            let oid_old = to_oid(&"0".repeat(40));
+            let oid_new = to_oid(&"1".repeat(40));
+            s.cas_update(&repo, &rname, None, &oid_old).await.unwrap();
+            s.cas_update(&repo, &rname, Some(&oid_old), &oid_new)
                 .await
                 .unwrap();
             // Try deleting with the stale oid — should conflict and
             // return current.
-            match s
-                .cas_delete("r", "refs/heads/x", Some(&oid_old))
-                .await
-                .unwrap()
-            {
+            match s.cas_delete(&repo, &rname, Some(&oid_old)).await.unwrap() {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_deref(), Some(oid_new.as_str()));
                 }
                 other => panic!("expected Conflict, got {other:?}"),
             }
             // Ref is still present — delete didn't happen.
-            assert!(s.read("r", "refs/heads/x").await.unwrap().is_some());
+            assert!(s.read(&repo, &rname).await.unwrap().is_some());
         }
 
         #[tokio::test]
         async fn cas_delete_unconditional_when_expected_none() {
             let s = MemRefStore::new();
-            s.cas_update("r", "refs/heads/x", None, &"0".repeat(40))
-                .await
-                .unwrap();
+            let repo = rid("rtst");
+            let rname = rn("refs/heads/x");
+            let zero = to_oid(&"0".repeat(40));
+            s.cas_update(&repo, &rname, None, &zero).await.unwrap();
             // expected=None bypasses the equality check.
             assert_eq!(
-                s.cas_delete("r", "refs/heads/x", None).await.unwrap(),
+                s.cas_delete(&repo, &rname, None).await.unwrap(),
                 CasOutcome::Updated,
             );
-            assert!(s.read("r", "refs/heads/x").await.unwrap().is_none());
+            assert!(s.read(&repo, &rname).await.unwrap().is_none());
         }
 
         #[tokio::test]
@@ -761,19 +786,19 @@ mod tests {
             for round in 0..50 {
                 let s1 = s.clone();
                 let s2 = s.clone();
-                let oid_a = format!("a{round:039}");
-                let oid_b = format!("b{round:039}");
-                let ref_name = format!("refs/round/{round}");
+                let oid_a = to_oid(&format!("a{round:039}"));
+                let oid_b = to_oid(&format!("b{round:039}"));
+                let ref_name = rn(&format!("refs/round/{round}"));
 
                 let h1 = tokio::spawn({
                     let r = ref_name.clone();
                     let oid = oid_a.clone();
-                    async move { s1.cas_update("r", &r, None, &oid).await.unwrap() }
+                    async move { s1.cas_update(&rid("rtst"), &r, None, &oid).await.unwrap() }
                 });
                 let h2 = tokio::spawn({
                     let r = ref_name.clone();
                     let oid = oid_b.clone();
-                    async move { s2.cas_update("r", &r, None, &oid).await.unwrap() }
+                    async move { s2.cas_update(&rid("rtst"), &r, None, &oid).await.unwrap() }
                 });
                 let r1 = h1.await.unwrap();
                 let r2 = h2.await.unwrap();
@@ -794,14 +819,14 @@ mod tests {
         // exercise enumeration without spinning up real commits.
         let (_tmp, repo, refs) = setup_repo();
         let git_dir = refs.repo_path(&repo);
-        let s = write_blob(&git_dir, b"hello");
-        refs.cas_update(&repo, "refs/test/a", None, &s)
+        let s = to_oid(&write_blob(&git_dir, b"hello"));
+        refs.cas_update(&repo, &rn("refs/test/a"), None, &s)
             .await
             .unwrap();
-        refs.cas_update(&repo, "refs/test/sub/b", None, &s)
+        refs.cas_update(&repo, &rn("refs/test/sub/b"), None, &s)
             .await
             .unwrap();
-        refs.cas_update(&repo, "refs/tags/v1", None, &s)
+        refs.cas_update(&repo, &rn("refs/tags/v1"), None, &s)
             .await
             .unwrap();
 
@@ -840,8 +865,8 @@ mod tests {
         // branch-shape-dance.
         let (_tmp, repo, refs) = setup_repo();
         let git_dir = refs.repo_path(&repo);
-        let s = write_blob(&git_dir, b"hello");
-        refs.cas_update(&repo, "refs/test/x", None, &s)
+        let s = to_oid(&write_blob(&git_dir, b"hello"));
+        refs.cas_update(&repo, &rn("refs/test/x"), None, &s)
             .await
             .unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/test/x\n").unwrap();
@@ -849,7 +874,7 @@ mod tests {
         match st {
             HeadState::Symbolic { target, oid } => {
                 assert_eq!(target, "refs/test/x");
-                assert_eq!(oid, s);
+                assert_eq!(oid, s.as_str());
             }
             other => panic!("expected Symbolic, got {other:?}"),
         }
@@ -910,27 +935,26 @@ mod tests {
     async fn cas_update_rejects_stale_expected() {
         let (_tmp, repo, refs) = setup_repo();
         let git_dir = refs.repo_path(&repo);
-        let s1 = write_blob(&git_dir, b"one");
-        let s2 = write_blob(&git_dir, b"two");
-        let s3 = write_blob(&git_dir, b"three");
+        let s1 = to_oid(&write_blob(&git_dir, b"one"));
+        let s2 = to_oid(&write_blob(&git_dir, b"two"));
+        let s3 = to_oid(&write_blob(&git_dir, b"three"));
+        let rname = rn("refs/test/x");
 
         // create
         assert_eq!(
-            refs.cas_update(&repo, "refs/test/x", None, &s1)
-                .await
-                .unwrap(),
+            refs.cas_update(&repo, &rname, None, &s1).await.unwrap(),
             CasOutcome::Updated
         );
         // expected=s1 -> succeeds, now at s2
         assert_eq!(
-            refs.cas_update(&repo, "refs/test/x", Some(&s1), &s2)
+            refs.cas_update(&repo, &rname, Some(&s1), &s2)
                 .await
                 .unwrap(),
             CasOutcome::Updated
         );
         // expected=s1 (stale) -> conflict, current should be s2
         match refs
-            .cas_update(&repo, "refs/test/x", Some(&s1), &s3)
+            .cas_update(&repo, &rname, Some(&s1), &s3)
             .await
             .unwrap()
         {

@@ -184,8 +184,10 @@ pub(crate) async fn native_ls_refs_response(
 
         // HEAD is special: not under any refs/ prefix. Place first
         // so the response order matches what upload-pack produces.
+        let repo_id_typed = crate::ids::RepoId::try_from(repo_id)?;
+
         if want_head {
-            match refs.read_head(repo_id).await? {
+            match refs.read_head(&repo_id_typed).await? {
                 HeadState::Symbolic { target, oid } => {
                     rows.push(LsRefsRow {
                         oid,
@@ -219,7 +221,7 @@ pub(crate) async fn native_ls_refs_response(
         }
 
         if !other_prefixes.is_empty() {
-            let mut entries = refs.list(repo_id, &other_prefixes).await?;
+            let mut entries = refs.list(&repo_id_typed, &other_prefixes).await?;
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             for e in entries {
                 let extra = if args.peel {

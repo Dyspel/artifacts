@@ -58,6 +58,7 @@
 #![allow(dead_code)]
 
 use crate::error::{Error, Result};
+use crate::ids::{Oid, RepoId};
 use crate::object_store::{ObjectKind, ObjectStore};
 
 /// Git pack object-type codes (per the format spec).
@@ -295,7 +296,7 @@ fn decompress_zlib(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
 /// Hash a (kind, payload) pair under git's canonical loose-object
 /// format: SHA-1 over `"<kind> <size>\0<payload>"`. Returns the
 /// 40-char hex digest, which is the OID storage key.
-pub(crate) fn loose_oid_hex(kind: ObjectKind, payload: &[u8]) -> String {
+pub(crate) fn loose_oid_hex(kind: ObjectKind, payload: &[u8]) -> Oid {
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     let header = format!("{} {}\0", kind_str(kind), payload.len());
@@ -307,7 +308,10 @@ pub(crate) fn loose_oid_hex(kind: ObjectKind, payload: &[u8]) -> String {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{b:02x}");
     }
-    hex
+    // SHA-1 of an arbitrary byte slice always produces 40-char lowercase
+    // hex, so `Oid::try_from` cannot fail here. The `expect` documents
+    // that invariant for the next reader.
+    Oid::try_from(hex).expect("SHA-1 hex must satisfy Oid contract")
 }
 
 /// Encode a payload + kind as the zlib-deflated loose-object bytes
@@ -344,7 +348,7 @@ const fn kind_str(kind: ObjectKind) -> &'static str {
 /// Not yet hooked into `ingest_pack` — D4 does that wiring.
 pub(crate) fn store_non_delta_entries<S: ObjectStore + ?Sized>(
     pack_bytes: &[u8],
-    repo_id: &str,
+    repo_id: &RepoId,
     store: &S,
 ) -> Result<usize> {
     let entries = parse_pack(pack_bytes)?;
@@ -512,8 +516,8 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
 /// resolve.
 fn read_loose_inflated<S: ObjectStore + ?Sized>(
     store: &S,
-    repo_id: &str,
-    oid: &str,
+    repo_id: &RepoId,
+    oid: &Oid,
 ) -> Result<Option<(ObjectKind, Vec<u8>)>> {
     let Some(bytes) = store.read_loose(repo_id, oid)? else {
         return Ok(None);
@@ -557,7 +561,7 @@ fn read_loose_inflated<S: ObjectStore + ?Sized>(
 /// Returns the total number of objects stored.
 pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
     pack_bytes: &[u8],
-    repo_id: &str,
+    repo_id: &RepoId,
     store: &S,
 ) -> Result<usize> {
     use std::collections::HashMap;
@@ -660,15 +664,17 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
     Ok(count)
 }
 
-/// Hex-encode a 20-byte OID into 40 lowercase chars. Pulled out so
-/// REF_DELTA resolution has one canonical formatter.
-fn hex_oid(oid: &[u8; 20]) -> String {
+/// Hex-encode a 20-byte OID into a validated [`Oid`]. Pulled out so
+/// REF_DELTA resolution has one canonical formatter. The 40-char
+/// lowercase-hex output always satisfies the `Oid` contract; the
+/// `expect` documents that for the next reader.
+fn hex_oid(oid: &[u8; 20]) -> Oid {
     let mut s = String::with_capacity(40);
     for b in oid {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
-    s
+    Oid::try_from(s).expect("20-byte SHA-1 always hex-encodes to a valid Oid")
 }
 
 /// D2 entry point. Parse `pack_bytes`, store every non-delta entry,
@@ -679,7 +685,7 @@ fn hex_oid(oid: &[u8; 20]) -> String {
 /// Returns the number of objects stored across both phases.
 pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
     pack_bytes: &[u8],
-    repo_id: &str,
+    repo_id: &RepoId,
     store: &S,
 ) -> Result<usize> {
     let entries = parse_pack(pack_bytes)?;
@@ -733,14 +739,7 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
             let ParsedKind::RefDelta { base_oid } = entry.kind else {
                 unreachable!("filtered to delta kinds above");
             };
-            let base_oid_hex = {
-                let mut s = String::with_capacity(40);
-                for b in base_oid {
-                    use std::fmt::Write as _;
-                    let _ = write!(s, "{b:02x}");
-                }
-                s
-            };
+            let base_oid_hex = hex_oid(&base_oid);
             let Some((base_kind, base_payload)) =
                 read_loose_inflated(store, repo_id, &base_oid_hex)?
             else {
@@ -777,7 +776,16 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{Oid, RepoId};
     use crate::object_store::{MemObjectStore, ObjectKind};
+
+    fn rid() -> RepoId {
+        RepoId::try_from("rtst").unwrap()
+    }
+
+    fn oid_from(s: &str) -> Oid {
+        Oid::try_from(s).unwrap()
+    }
 
     /// Encode a git loose-object payload (just the payload —
     /// `<kind> <size>\0` header isn't baked in; the pack format
@@ -908,15 +916,15 @@ mod tests {
             (ObjectKind::Commit, payload_commit),
         ]);
         let store = MemObjectStore::new();
-        let n = store_non_delta_entries(&pack, "r", &store).unwrap();
+        let n = store_non_delta_entries(&pack, &rid(), &store).unwrap();
         assert_eq!(n, 2);
 
         // Each object retrievable by its canonical OID, and the
         // bytes match what was inflated from the pack.
         let blob_oid = loose_oid_hex(ObjectKind::Blob, payload_blob);
         let commit_oid = loose_oid_hex(ObjectKind::Commit, payload_commit);
-        assert!(store.exists("r", &blob_oid).unwrap());
-        assert!(store.exists("r", &commit_oid).unwrap());
+        assert!(store.exists(&rid(), &blob_oid).unwrap());
+        assert!(store.exists(&rid(), &commit_oid).unwrap());
 
         // The bytes we wrote back are zlib(`<kind> <size>\0<payload>`).
         // Sanity-check that the read_loose body starts with the zlib
@@ -924,7 +932,7 @@ mod tests {
         // then inflate locally and confirm the round-trip — Mem's
         // read_object isn't implemented, but the storage format is
         // what we care about.
-        let bytes = store.read_loose("r", &blob_oid).unwrap().unwrap();
+        let bytes = store.read_loose(&rid(), &blob_oid).unwrap().unwrap();
         assert_eq!(bytes[0], 0x78, "loose object must start with zlib magic");
 
         let mut d = flate2::read::ZlibDecoder::new(bytes.as_slice());
@@ -1042,7 +1050,7 @@ mod tests {
         let mut hashes: Vec<String> = entries
             .iter()
             .filter_map(|e| match e.kind {
-                ParsedKind::Direct(k) => Some(loose_oid_hex(k, &e.data)),
+                ParsedKind::Direct(k) => Some(loose_oid_hex(k, &e.data).as_str().to_owned()),
                 _ => None,
             })
             .collect();
@@ -1256,18 +1264,18 @@ mod tests {
             build_pack_with_ref_delta(ObjectKind::Blob, base_payload, tail);
 
         let store = MemObjectStore::new();
-        let n = store_with_ref_delta_resolution(&pack, "r", &store).unwrap();
+        let n = store_with_ref_delta_resolution(&pack, &rid(), &store).unwrap();
         assert_eq!(n, 2, "base + delta-resolved target");
 
         // Both objects must exist.
         let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
         let expected_target: Vec<u8> = [base_payload.as_ref(), tail.as_ref()].concat();
         let target_oid = loose_oid_hex(ObjectKind::Blob, &expected_target);
-        assert!(store.exists("r", &base_oid).unwrap());
-        assert!(store.exists("r", &target_oid).unwrap());
+        assert!(store.exists(&rid(), &base_oid).unwrap());
+        assert!(store.exists(&rid(), &target_oid).unwrap());
 
         // The resolved target's loose bytes inflate to the right payload.
-        let stored = store.read_loose("r", &target_oid).unwrap().unwrap();
+        let stored = store.read_loose(&rid(), &target_oid).unwrap().unwrap();
         let mut d = flate2::read::ZlibDecoder::new(stored.as_slice());
         let mut inflated = Vec::new();
         std::io::Read::read_to_end(&mut d, &mut inflated).unwrap();
@@ -1313,7 +1321,7 @@ mod tests {
         p.extend_from_slice(&[0u8; 20]);
 
         let store = MemObjectStore::new();
-        let err = store_with_ref_delta_resolution(&p, "r", &store).unwrap_err();
+        let err = store_with_ref_delta_resolution(&p, &rid(), &store).unwrap_err();
         let _ = pack; // silence unused
         assert!(format!("{err}").contains("missing bases"), "got: {err}");
     }
@@ -1447,14 +1455,14 @@ mod tests {
         let pack = build_pack_with_ofs_delta(ObjectKind::Blob, base_payload, tail);
 
         let store = MemObjectStore::new();
-        let n = store_with_full_resolution(&pack, "r", &store).unwrap();
+        let n = store_with_full_resolution(&pack, &rid(), &store).unwrap();
         assert_eq!(n, 2);
 
         let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
         let expected_target: Vec<u8> = [base_payload.as_ref(), tail.as_ref()].concat();
         let target_oid = loose_oid_hex(ObjectKind::Blob, &expected_target);
-        assert!(store.exists("r", &base_oid).unwrap());
-        assert!(store.exists("r", &target_oid).unwrap());
+        assert!(store.exists(&rid(), &base_oid).unwrap());
+        assert!(store.exists(&rid(), &target_oid).unwrap());
     }
 
     #[test]
@@ -1465,13 +1473,13 @@ mod tests {
         let tail = b" tail";
         let (pack, _) = build_pack_with_ref_delta(ObjectKind::Blob, base_payload, tail);
         let store = MemObjectStore::new();
-        let n = store_with_full_resolution(&pack, "r", &store).unwrap();
+        let n = store_with_full_resolution(&pack, &rid(), &store).unwrap();
         assert_eq!(n, 2);
         let base_oid = loose_oid_hex(ObjectKind::Blob, base_payload);
         let expected = [base_payload.as_ref(), tail.as_ref()].concat();
         let target_oid = loose_oid_hex(ObjectKind::Blob, &expected);
-        assert!(store.exists("r", &base_oid).unwrap());
-        assert!(store.exists("r", &target_oid).unwrap());
+        assert!(store.exists(&rid(), &base_oid).unwrap());
+        assert!(store.exists(&rid(), &target_oid).unwrap());
     }
 
     #[test]
@@ -1498,7 +1506,7 @@ mod tests {
         pack.extend_from_slice(&[0u8; 20]);
 
         let store = MemObjectStore::new();
-        let err = store_with_full_resolution(&pack, "r", &store).unwrap_err();
+        let err = store_with_full_resolution(&pack, &rid(), &store).unwrap_err();
         assert!(format!("{err}").contains("underflow"), "got: {err}");
     }
 
@@ -1529,7 +1537,7 @@ mod tests {
         pack.extend_from_slice(&[0u8; 20]);
 
         let store = MemObjectStore::new();
-        let err = store_non_delta_entries(&pack, "r", &store).unwrap_err();
+        let err = store_non_delta_entries(&pack, &rid(), &store).unwrap_err();
         assert!(
             format!("{err}").contains("delta entries not yet supported"),
             "got: {err}"

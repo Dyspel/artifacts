@@ -171,10 +171,22 @@ pub async fn merge_branches(
         Some(t) => is_ancestor(&git_dir, t, &source_sha).await?,
     };
     if ff_available && body.strategy != Strategy::Merge {
+        let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+        let target_ref_typed = crate::ids::RefName::try_from(target_ref.as_str())?;
+        let source_sha_typed = crate::ids::Oid::try_from(source_sha.as_str())?;
+        let target_sha_typed = match target_sha.as_deref() {
+            Some(s) => Some(crate::ids::Oid::try_from(s)?),
+            None => None,
+        };
         match state
             .data
             .refs
-            .cas_update(&repo_id, &target_ref, target_sha.as_deref(), &source_sha)
+            .cas_update(
+                &repo_id_typed,
+                &target_ref_typed,
+                target_sha_typed.as_ref(),
+                &source_sha_typed,
+            )
             .await?
         {
             CasOutcome::Updated => {
@@ -276,10 +288,19 @@ pub async fn merge_branches(
     let commit_sha = String::from_utf8(stdout)?.trim().to_string();
 
     // 8. CAS the target ref.
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    let target_ref_typed = crate::ids::RefName::try_from(target_ref.as_str())?;
+    let target_sha_typed = crate::ids::Oid::try_from(target_sha.as_str())?;
+    let commit_sha_typed = crate::ids::Oid::try_from(commit_sha.as_str())?;
     match state
         .data
         .refs
-        .cas_update(&repo_id, &target_ref, Some(&target_sha), &commit_sha)
+        .cas_update(
+            &repo_id_typed,
+            &target_ref_typed,
+            Some(&target_sha_typed),
+            &commit_sha_typed,
+        )
         .await?
     {
         CasOutcome::Updated => {}

@@ -87,8 +87,10 @@ async fn probe_stores(
     // Per-store read-side probe: matches the pre-existing contract.
     // Each future is independent so a single store's failure doesn't
     // mask the others.
+    let probe_tok = crate::ids::Token::try_from("__health_ready_probe__")
+        .expect("static probe token literal is valid");
     let tokens_read = matches!(
-        tokio::time::timeout(deadline, tokens.lookup("__health_ready_probe__")).await,
+        tokio::time::timeout(deadline, tokens.lookup(&probe_tok)).await,
         Ok(Ok(_))
     );
     let audit_read = matches!(
@@ -180,14 +182,14 @@ mod tests {
     impl TokenStore for StubTokenStore {
         async fn mint(
             &self,
-            _: &str,
+            _: &crate::ids::RepoId,
             _: Scope,
             _: Option<Duration>,
-            _: Option<&str>,
+            _: Option<&crate::ids::Subject>,
         ) -> Result<String> {
             unreachable!("health_ready does not mint")
         }
-        async fn lookup(&self, _: &str) -> Result<Option<TokenRecord>> {
+        async fn lookup(&self, _: &crate::ids::Token) -> Result<Option<TokenRecord>> {
             if self.lookup_succeeds {
                 Ok(None)
             } else {
@@ -196,7 +198,7 @@ mod tests {
                 )))
             }
         }
-        async fn revoke(&self, _: &str) -> Result<bool> {
+        async fn revoke(&self, _: &crate::ids::Token) -> Result<bool> {
             unreachable!("health_ready does not revoke")
         }
         async fn probe_write(&self) -> Result<()> {
@@ -240,16 +242,20 @@ mod tests {
 
     #[async_trait]
     impl OwnershipStore for StubOwnershipStore {
-        async fn record_owner(&self, _: &str, _: Option<&str>) -> Result<()> {
+        async fn record_owner(
+            &self,
+            _: &crate::ids::RepoId,
+            _: Option<&crate::ids::Subject>,
+        ) -> Result<()> {
             unreachable!("health_ready does not record")
         }
-        async fn get_owner(&self, _: &str) -> Result<Option<Option<String>>> {
+        async fn get_owner(&self, _: &crate::ids::RepoId) -> Result<Option<Option<String>>> {
             unreachable!("health_ready does not get_owner")
         }
-        async fn delete(&self, _: &str) -> Result<()> {
+        async fn delete(&self, _: &crate::ids::RepoId) -> Result<()> {
             unreachable!("health_ready does not delete")
         }
-        async fn count_by_owner(&self, _: &str) -> Result<u64> {
+        async fn count_by_owner(&self, _: &crate::ids::Subject) -> Result<u64> {
             unreachable!("health_ready does not count_by_owner")
         }
         async fn list_all(&self) -> Result<Vec<RepoRow>> {
@@ -264,10 +270,10 @@ mod tests {
                 )))
             }
         }
-        async fn list_by_owner(&self, _: &str) -> Result<Vec<RepoRow>> {
+        async fn list_by_owner(&self, _: &crate::ids::Subject) -> Result<Vec<RepoRow>> {
             unreachable!("health_ready does not list_by_owner")
         }
-        async fn get_row(&self, _: &str) -> Result<Option<RepoRow>> {
+        async fn get_row(&self, _: &crate::ids::RepoId) -> Result<Option<RepoRow>> {
             unreachable!("health_ready does not get_row")
         }
     }

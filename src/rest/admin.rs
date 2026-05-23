@@ -95,7 +95,8 @@ pub async fn admin_get_repo(
         crate::rate_limit::Class::Default,
     )?;
 
-    let Some(row) = state.data.ownership.get_row(&id).await? else {
+    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
+    let Some(row) = state.data.ownership.get_row(&id_typed).await? else {
         return Err(Error::RepoNotFound(id));
     };
 

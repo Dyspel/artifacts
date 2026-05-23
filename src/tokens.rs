@@ -26,6 +26,7 @@
 
 use crate::db_migrate::DbPool;
 use crate::error::{Error, Result};
+use crate::ids::{RepoId, Subject, Token};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
@@ -106,20 +107,20 @@ pub trait TokenStore: Send + Sync {
     /// holds only the hash).
     async fn mint(
         &self,
-        repo_id: &str,
+        repo_id: &RepoId,
         scope: Scope,
         ttl: Option<Duration>,
-        subject: Option<&str>,
+        subject: Option<&Subject>,
     ) -> Result<String>;
 
     /// Resolve a token. `Ok(None)` means unknown, revoked, or expired —
     /// no distinction is made, since from the caller's perspective all
     /// three should fail closed as 401.
-    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>>;
+    async fn lookup(&self, token: &Token) -> Result<Option<TokenRecord>>;
 
     /// Revoke a token. Returns `Ok(true)` if the token existed and wasn't
     /// already revoked, `Ok(false)` otherwise. Idempotent.
-    async fn revoke(&self, token: &str) -> Result<bool>;
+    async fn revoke(&self, token: &Token) -> Result<bool>;
 
     /// Count rows that would currently authorize a request — i.e. not
     /// revoked, not expired (NULL or future). Powers the
@@ -141,7 +142,7 @@ pub trait TokenStore: Send + Sync {
     /// Default impl errors so trait callers get a clear "this backend
     /// doesn't implement bulk revoke" rather than a panic. Concrete
     /// stores override.
-    async fn revoke_all_for_repo(&self, _repo_id: &str) -> Result<u64> {
+    async fn revoke_all_for_repo(&self, _repo_id: &RepoId) -> Result<u64> {
         Err(Error::Other(anyhow::anyhow!(
             "TokenStore::revoke_all_for_repo not implemented"
         )))
@@ -152,8 +153,8 @@ pub trait TokenStore: Send + Sync {
     /// revoked + expired rows. Default impl errors.
     async fn list_for_repo(
         &self,
-        _repo_id: &str,
-        _subject_filter: Option<&str>,
+        _repo_id: &RepoId,
+        _subject_filter: Option<&Subject>,
     ) -> Result<Vec<TokenSummary>> {
         Err(Error::Other(anyhow::anyhow!(
             "TokenStore::list_for_repo not implemented"
@@ -318,10 +319,10 @@ pub fn spawn_active_gauge_refresher(store: Arc<dyn TokenStore>, tick: Duration) 
 impl TokenStore for SqliteTokenStore {
     async fn mint(
         &self,
-        repo_id: &str,
+        repo_id: &RepoId,
         scope: Scope,
         ttl: Option<Duration>,
-        subject: Option<&str>,
+        subject: Option<&Subject>,
     ) -> Result<String> {
         let token = random_token();
         let hash = sha256_hex(&token);
@@ -331,13 +332,20 @@ impl TokenStore for SqliteTokenStore {
         conn.execute(
             "INSERT INTO tokens (token_hash, repo_id, scope, created_at, expires_at, subject)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![hash, repo_id, scope.as_str(), now, expires_at, subject],
+            params![
+                hash,
+                repo_id.as_str(),
+                scope.as_str(),
+                now,
+                expires_at,
+                subject.map(|s| s.as_str())
+            ],
         )?;
         Ok(token)
     }
 
-    async fn lookup(&self, token: &str) -> Result<Option<TokenRecord>> {
-        let hash = sha256_hex(token);
+    async fn lookup(&self, token: &Token) -> Result<Option<TokenRecord>> {
+        let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // SELECT only the columns we surface. The expired-row filter
@@ -362,8 +370,8 @@ impl TokenStore for SqliteTokenStore {
         }))
     }
 
-    async fn revoke(&self, token: &str) -> Result<bool> {
-        let hash = sha256_hex(token);
+    async fn revoke(&self, token: &Token) -> Result<bool> {
+        let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         let affected = conn.execute(
@@ -384,7 +392,7 @@ impl TokenStore for SqliteTokenStore {
         Ok(())
     }
 
-    async fn revoke_all_for_repo(&self, repo_id: &str) -> Result<u64> {
+    async fn revoke_all_for_repo(&self, repo_id: &RepoId) -> Result<u64> {
         let now = now_secs() as i64;
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
         // We only flip rows that are still authorizing — already-expired
@@ -396,7 +404,7 @@ impl TokenStore for SqliteTokenStore {
              WHERE repo_id = ?2
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > ?1)",
-            params![now, repo_id],
+            params![now, repo_id.as_str()],
         )?;
         Ok(affected as u64)
     }
@@ -422,8 +430,8 @@ impl TokenStore for SqliteTokenStore {
 
     async fn list_for_repo(
         &self,
-        repo_id: &str,
-        subject_filter: Option<&str>,
+        repo_id: &RepoId,
+        subject_filter: Option<&Subject>,
     ) -> Result<Vec<TokenSummary>> {
         let now = now_secs() as i64;
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
@@ -436,18 +444,21 @@ impl TokenStore for SqliteTokenStore {
                AND (?3 IS NULL OR subject = ?3)
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(params![repo_id, now, subject_filter], |row| {
-            let token_hash: String = row.get(0)?;
-            let repo_id: String = row.get(1)?;
-            let scope: String = row.get(2)?;
-            let created_at: i64 = row.get(3)?;
-            let expires_at: Option<i64> = row.get(4)?;
-            let revoked_at: Option<i64> = row.get(5)?;
-            let subject: Option<String> = row.get(6)?;
-            Ok((
-                token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![repo_id.as_str(), now, subject_filter.map(|s| s.as_str())],
+            |row| {
+                let token_hash: String = row.get(0)?;
+                let repo_id: String = row.get(1)?;
+                let scope: String = row.get(2)?;
+                let created_at: i64 = row.get(3)?;
+                let expires_at: Option<i64> = row.get(4)?;
+                let revoked_at: Option<i64> = row.get(5)?;
+                let subject: Option<String> = row.get(6)?;
+                Ok((
+                    token_hash, repo_id, scope, created_at, expires_at, revoked_at, subject,
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
             let (hash, repo_id, scope_s, created, expires, revoked, subject) = row?;
@@ -494,6 +505,16 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    fn rid(s: &str) -> RepoId {
+        RepoId::try_from(s).unwrap()
+    }
+    fn sub(s: &str) -> Subject {
+        Subject::try_from(s).unwrap()
+    }
+    fn tok(s: &str) -> Token {
+        Token::try_from(s).unwrap()
+    }
+
     fn open_store() -> (tempfile::TempDir, SqliteTokenStore) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
@@ -505,16 +526,16 @@ mod tests {
     async fn mint_then_lookup_roundtrip() {
         let (_d, store) = open_store();
         let t = store
-            .mint("repo-a", Scope::Write, None, None)
+            .mint(&rid("repo-a"), Scope::Write, None, None)
             .await
             .unwrap();
-        let rec = store.lookup(&t).await.unwrap().unwrap();
+        let rec = store.lookup(&tok(&t)).await.unwrap().unwrap();
         assert_eq!(rec.repo_id, "repo-a");
         assert_eq!(rec.scope, Scope::Write);
         // expires_at = None round-trips: a row minted without a TTL
         // is verified via the listing path, which is the surface
         // that exposes the column to callers.
-        let listed = store.list_for_repo("repo-a", None).await.unwrap();
+        let listed = store.list_for_repo(&rid("repo-a"), None).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].expires_at.is_none());
     }
@@ -522,18 +543,21 @@ mod tests {
     #[tokio::test]
     async fn lookup_of_unknown_is_none() {
         let (_d, store) = open_store();
-        assert!(store.lookup("never-minted").await.unwrap().is_none());
+        assert!(store.lookup(&tok("never-minted")).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn revoke_makes_lookup_return_none() {
         let (_d, store) = open_store();
-        let t = store.mint("r", Scope::Read, None, None).await.unwrap();
-        assert!(store.lookup(&t).await.unwrap().is_some());
-        assert!(store.revoke(&t).await.unwrap());
-        assert!(store.lookup(&t).await.unwrap().is_none());
+        let t = store
+            .mint(&rid("rtst"), Scope::Read, None, None)
+            .await
+            .unwrap();
+        assert!(store.lookup(&tok(&t)).await.unwrap().is_some());
+        assert!(store.revoke(&tok(&t)).await.unwrap());
+        assert!(store.lookup(&tok(&t)).await.unwrap().is_none());
         // Second revoke is a no-op (idempotent).
-        assert!(!store.revoke(&t).await.unwrap());
+        assert!(!store.revoke(&tok(&t)).await.unwrap());
     }
 
     #[tokio::test]
@@ -542,11 +566,16 @@ mod tests {
         // TTL of zero seconds means "expires_at = created_at", and the
         // lookup predicate is `expires_at > now`, so it's immediately dead.
         let t = store
-            .mint("r", Scope::Read, Some(Duration::from_secs(0)), None)
+            .mint(
+                &rid("rtst"),
+                Scope::Read,
+                Some(Duration::from_secs(0)),
+                None,
+            )
             .await
             .unwrap();
         assert!(
-            store.lookup(&t).await.unwrap().is_none(),
+            store.lookup(&tok(&t)).await.unwrap().is_none(),
             "expected TTL=0 token to be unresolvable"
         );
     }
@@ -557,13 +586,17 @@ mod tests {
         let path = dir.path().join("tokens.db");
         let t = {
             let s = SqliteTokenStore::open(&path).unwrap();
-            s.mint("persistent", Scope::Write, None, None)
+            s.mint(&rid("persistent"), Scope::Write, None, None)
                 .await
                 .unwrap()
         };
         // Drop the first store, reopen on the same path.
         let s2 = SqliteTokenStore::open(&path).unwrap();
-        let rec = s2.lookup(&t).await.unwrap().expect("token survived reopen");
+        let rec = s2
+            .lookup(&tok(&t))
+            .await
+            .unwrap()
+            .expect("token survived reopen");
         assert_eq!(rec.repo_id, "persistent");
     }
 
@@ -574,11 +607,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let t = store.mint("r", Scope::Read, None, None).await.unwrap();
+        let t = store
+            .mint(&rid("rtst"), Scope::Read, None, None)
+            .await
+            .unwrap();
 
         let conn = Connection::open(&path).unwrap();
         let mut stmt = conn
-            .prepare("SELECT token_hash FROM tokens WHERE repo_id = 'r'")
+            .prepare("SELECT token_hash FROM tokens WHERE repo_id = 'rtst'")
             .unwrap();
         let rows: Vec<String> = stmt
             .query_map([], |row| row.get(0))
@@ -602,9 +638,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let t_live = store.mint("live", Scope::Read, None, None).await.unwrap();
-        let t_dead = store.mint("dead", Scope::Read, None, None).await.unwrap();
-        store.revoke(&t_dead).await.unwrap();
+        let t_live = store
+            .mint(&rid("live-r"), Scope::Read, None, None)
+            .await
+            .unwrap();
+        let t_dead = store
+            .mint(&rid("dead-r"), Scope::Read, None, None)
+            .await
+            .unwrap();
+        store.revoke(&tok(&t_dead)).await.unwrap();
         assert_eq!(count_rows(&path), 2);
 
         // Grace doesn't apply to revokes — revoked rows are always prunable.
@@ -612,7 +654,7 @@ mod tests {
         assert_eq!(pruned, 1);
         assert_eq!(count_rows(&path), 1);
         // The live token still resolves.
-        assert!(store.lookup(&t_live).await.unwrap().is_some());
+        assert!(store.lookup(&tok(&t_live)).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -622,7 +664,12 @@ mod tests {
         let store = SqliteTokenStore::open(&path).unwrap();
         // Ttl=0 → immediately expired (rows' expires_at == created_at).
         let _t = store
-            .mint("r", Scope::Read, Some(Duration::from_secs(0)), None)
+            .mint(
+                &rid("rtst"),
+                Scope::Read,
+                Some(Duration::from_secs(0)),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(count_rows(&path), 1);
@@ -645,10 +692,15 @@ mod tests {
         // round-trip there.
         let (_d, store) = open_store();
         let _t = store
-            .mint("r-acct", Scope::Read, None, Some("alice@example"))
+            .mint(
+                &rid("r-acct"),
+                Scope::Read,
+                None,
+                Some(&sub("alice@example")),
+            )
             .await
             .unwrap();
-        let listed = store.list_for_repo("r-acct", None).await.unwrap();
+        let listed = store.list_for_repo(&rid("r-acct"), None).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].subject.as_deref(), Some("alice@example"));
     }
@@ -657,26 +709,35 @@ mod tests {
     async fn list_for_repo_filters_by_subject_when_set() {
         let (_d, store) = open_store();
         let _alice = store
-            .mint("r1", Scope::Read, None, Some("alice"))
+            .mint(&rid("repo1"), Scope::Read, None, Some(&sub("alice")))
             .await
             .unwrap();
         let _bob = store
-            .mint("r1", Scope::Read, None, Some("bob"))
+            .mint(&rid("repo1"), Scope::Read, None, Some(&sub("bob")))
             .await
             .unwrap();
-        let _admin_minted = store.mint("r1", Scope::Read, None, None).await.unwrap();
+        let _admin_minted = store
+            .mint(&rid("repo1"), Scope::Read, None, None)
+            .await
+            .unwrap();
 
         // No filter: every live row.
-        let all = store.list_for_repo("r1", None).await.unwrap();
+        let all = store.list_for_repo(&rid("repo1"), None).await.unwrap();
         assert_eq!(all.len(), 3);
 
         // Filtered by subject: only that user's rows.
-        let alice_only = store.list_for_repo("r1", Some("alice")).await.unwrap();
+        let alice_only = store
+            .list_for_repo(&rid("repo1"), Some(&sub("alice")))
+            .await
+            .unwrap();
         assert_eq!(alice_only.len(), 1);
         assert_eq!(alice_only[0].subject.as_deref(), Some("alice"));
 
         // Subject that never minted anything → empty.
-        let chuck = store.list_for_repo("r1", Some("chuck")).await.unwrap();
+        let chuck = store
+            .list_for_repo(&rid("repo1"), Some(&sub("chuck")))
+            .await
+            .unwrap();
         assert!(chuck.is_empty());
     }
 
@@ -684,15 +745,15 @@ mod tests {
     async fn list_for_repo_excludes_revoked_rows() {
         let (_d, store) = open_store();
         let t = store
-            .mint("r1", Scope::Read, None, Some("alice"))
+            .mint(&rid("repo1"), Scope::Read, None, Some(&sub("alice")))
             .await
             .unwrap();
         let _ = store
-            .mint("r1", Scope::Read, None, Some("alice"))
+            .mint(&rid("repo1"), Scope::Read, None, Some(&sub("alice")))
             .await
             .unwrap();
-        store.revoke(&t).await.unwrap();
-        let live = store.list_for_repo("r1", None).await.unwrap();
+        store.revoke(&tok(&t)).await.unwrap();
+        let live = store.list_for_repo(&rid("repo1"), None).await.unwrap();
         assert_eq!(live.len(), 1, "revoked row must not be in listing");
     }
 
@@ -703,10 +764,10 @@ mod tests {
         // the URL-safe base64 token bytes.
         let (_d, store) = open_store();
         let t = store
-            .mint("r1", Scope::Read, None, Some("alice"))
+            .mint(&rid("repo1"), Scope::Read, None, Some(&sub("alice")))
             .await
             .unwrap();
-        let listed = store.list_for_repo("r1", None).await.unwrap();
+        let listed = store.list_for_repo(&rid("repo1"), None).await.unwrap();
         assert_eq!(listed.len(), 1);
         let id = &listed[0].id;
         assert_eq!(id.len(), 16);
@@ -736,7 +797,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO tokens(token_hash, repo_id, scope, created_at)
-             VALUES (?1, 'r1', 'read', 0)",
+             VALUES (?1, 'repo1', 'read', 0)",
             params!["fakehash"],
         )
         .unwrap();
@@ -746,7 +807,7 @@ mod tests {
         let store = SqliteTokenStore::open(&path).unwrap();
         // Now mint succeeds with a subject (column is there) and
         // lookup returns subject=None for the legacy row.
-        let listing = store.list_for_repo("r1", None).await.unwrap();
+        let listing = store.list_for_repo(&rid("repo1"), None).await.unwrap();
         assert_eq!(listing.len(), 1);
         assert!(listing[0].subject.is_none());
         // Reopening is idempotent — second open mustn't error
@@ -757,30 +818,42 @@ mod tests {
     #[tokio::test]
     async fn revoke_all_for_repo_kills_every_live_token_for_that_repo() {
         let (_d, store) = open_store();
-        let t1 = store.mint("r1", Scope::Read, None, None).await.unwrap();
-        let t2 = store.mint("r1", Scope::Write, None, None).await.unwrap();
-        let t3 = store.mint("r2", Scope::Read, None, None).await.unwrap();
+        let t1 = store
+            .mint(&rid("repo1"), Scope::Read, None, None)
+            .await
+            .unwrap();
+        let t2 = store
+            .mint(&rid("repo1"), Scope::Write, None, None)
+            .await
+            .unwrap();
+        let t3 = store
+            .mint(&rid("repo2"), Scope::Read, None, None)
+            .await
+            .unwrap();
 
         // Sanity: all three resolve.
-        assert!(store.lookup(&t1).await.unwrap().is_some());
-        assert!(store.lookup(&t2).await.unwrap().is_some());
-        assert!(store.lookup(&t3).await.unwrap().is_some());
+        assert!(store.lookup(&tok(&t1)).await.unwrap().is_some());
+        assert!(store.lookup(&tok(&t2)).await.unwrap().is_some());
+        assert!(store.lookup(&tok(&t3)).await.unwrap().is_some());
 
-        let revoked = store.revoke_all_for_repo("r1").await.unwrap();
+        let revoked = store.revoke_all_for_repo(&rid("repo1")).await.unwrap();
         assert_eq!(revoked, 2);
 
         // r1 tokens are dead, r2 is untouched.
-        assert!(store.lookup(&t1).await.unwrap().is_none());
-        assert!(store.lookup(&t2).await.unwrap().is_none());
-        assert!(store.lookup(&t3).await.unwrap().is_some());
+        assert!(store.lookup(&tok(&t1)).await.unwrap().is_none());
+        assert!(store.lookup(&tok(&t2)).await.unwrap().is_none());
+        assert!(store.lookup(&tok(&t3)).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn revoke_all_for_repo_is_idempotent() {
         let (_d, store) = open_store();
-        let _t = store.mint("r1", Scope::Read, None, None).await.unwrap();
-        let first = store.revoke_all_for_repo("r1").await.unwrap();
-        let second = store.revoke_all_for_repo("r1").await.unwrap();
+        let _t = store
+            .mint(&rid("repo1"), Scope::Read, None, None)
+            .await
+            .unwrap();
+        let first = store.revoke_all_for_repo(&rid("repo1")).await.unwrap();
+        let second = store.revoke_all_for_repo(&rid("repo1")).await.unwrap();
         assert_eq!(first, 1);
         assert_eq!(second, 0);
     }
@@ -792,12 +865,20 @@ mod tests {
         // "explicitly revoked". Verified by checking that prune (with
         // zero grace) sees one expired row before and after the call.
         let (_d, store) = open_store();
-        let _t_live = store.mint("r1", Scope::Read, None, None).await.unwrap();
-        let _t_dead = store
-            .mint("r1", Scope::Write, Some(Duration::from_secs(0)), None)
+        let _t_live = store
+            .mint(&rid("repo1"), Scope::Read, None, None)
             .await
             .unwrap();
-        let revoked = store.revoke_all_for_repo("r1").await.unwrap();
+        let _t_dead = store
+            .mint(
+                &rid("repo1"),
+                Scope::Write,
+                Some(Duration::from_secs(0)),
+                None,
+            )
+            .await
+            .unwrap();
+        let revoked = store.revoke_all_for_repo(&rid("repo1")).await.unwrap();
         assert_eq!(revoked, 1, "only the live row should flip to revoked");
     }
 
@@ -806,7 +887,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.db");
         let store = SqliteTokenStore::open(&path).unwrap();
-        let _t = store.mint("r", Scope::Read, None, None).await.unwrap();
+        let _t = store
+            .mint(&rid("rtst"), Scope::Read, None, None)
+            .await
+            .unwrap();
         store.prune(Duration::from_secs(0)).await.unwrap();
         assert_eq!(count_rows(&path), 1);
     }

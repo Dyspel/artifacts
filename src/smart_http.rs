@@ -478,7 +478,15 @@ async fn native_receive_pack_response(
         // path is sync so we briefly block the worker thread —
         // for typical small pushes the cost is the same ~50ms
         // `Bundle::write_to_directory` overhead noted upstream.
-        match objects.ingest_pack(repo_id, &req.pack) {
+        // Construct RepoId at the trait boundary. The git_handler
+        // dispatch already validated this id (validate_repo_id earlier
+        // in the request path); this is a re-validation that can't
+        // realistically fail.
+        let repo_id_typed = match crate::ids::RepoId::try_from(repo_id) {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        match objects.ingest_pack(&repo_id_typed, &req.pack) {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -558,19 +566,36 @@ async fn apply_ref_update(
     repo_id: &str,
     u: &RefUpdate,
 ) -> std::result::Result<(), String> {
+    let repo_id_typed = match crate::ids::RepoId::try_from(repo_id) {
+        Ok(r) => r,
+        Err(e) => return Err(format!("invalid repo id: {e}")),
+    };
+    let ref_name_typed = match crate::ids::RefName::try_from(u.name.as_str()) {
+        Ok(r) => r,
+        Err(e) => return Err(format!("invalid ref name: {e}")),
+    };
+    let old_typed = match crate::ids::Oid::try_from(u.old.as_str()) {
+        Ok(o) => o,
+        Err(e) => return Err(format!("invalid old oid: {e}")),
+    };
+    let new_typed = match crate::ids::Oid::try_from(u.new.as_str()) {
+        Ok(o) => o,
+        Err(e) => return Err(format!("invalid new oid: {e}")),
+    };
     let outcome = if u.is_delete() {
         // CAS delete with the client's expected old-OID. If the ref
         // moved between the client's last fetch and this push,
         // RefStore returns Conflict and we report non-fast-forward.
-        refs.cas_delete(repo_id, &u.name, Some(u.old.as_str()))
+        refs.cas_delete(&repo_id_typed, &ref_name_typed, Some(&old_typed))
             .await
     } else {
         let expected = if u.is_create() {
             None
         } else {
-            Some(u.old.as_str())
+            Some(&old_typed)
         };
-        refs.cas_update(repo_id, &u.name, expected, &u.new).await
+        refs.cas_update(&repo_id_typed, &ref_name_typed, expected, &new_typed)
+            .await
     };
     match outcome {
         Ok(crate::refs::CasOutcome::Updated) => Ok(()),

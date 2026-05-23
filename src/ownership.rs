@@ -26,6 +26,7 @@
 //! separate connection, separate table, WAL-mode concurrency.
 
 use crate::db_migrate::DbPool;
+use crate::ids::{RepoId, Subject};
 use crate::{
     auth::Principal,
     error::{Error, Result},
@@ -42,17 +43,17 @@ pub trait OwnershipStore: Send + Sync {
     /// Record that `repo_id` is owned by `owner` (a JWT subject). Pass
     /// `None` when the creator is admin — we still record the row so
     /// `get_owner` can distinguish "no such repo" from "admin-created".
-    async fn record_owner(&self, repo_id: &str, owner: Option<&str>) -> Result<()>;
+    async fn record_owner(&self, repo_id: &RepoId, owner: Option<&Subject>) -> Result<()>;
 
     /// Read the owner for a repo. Returns:
     /// - `Ok(Some(Some(subject)))` — user-owned
     /// - `Ok(Some(None))` — admin-created; no user owner
     /// - `Ok(None)` — no ownership record at all (legacy / pre-ownership)
-    async fn get_owner(&self, repo_id: &str) -> Result<Option<Option<String>>>;
+    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<String>>>;
 
     /// Remove the ownership record (called after a repo is deleted).
     /// Idempotent; returning Ok when the row didn't exist is fine.
-    async fn delete(&self, repo_id: &str) -> Result<()>;
+    async fn delete(&self, repo_id: &RepoId) -> Result<()>;
 
     /// Count the repos currently owned by `subject`. Used for the
     /// per-user repo-count quota check on create / fork.
@@ -64,7 +65,7 @@ pub trait OwnershipStore: Send + Sync {
     /// concurrent-create load you can overshoot by a few; if that ever
     /// matters, wrap this in a `SELECT count(*) ... FOR UPDATE` or move
     /// the check into the same transaction as the INSERT.
-    async fn count_by_owner(&self, subject: &str) -> Result<u64>;
+    async fn count_by_owner(&self, subject: &Subject) -> Result<u64>;
 
     /// List every repo the store knows about. Admin-only surface —
     /// intended for the inspection endpoint and the GUI visualizer.
@@ -101,7 +102,7 @@ pub trait OwnershipStore: Send + Sync {
     /// (owner_subject = NULL) are excluded; they belong to no user's
     /// fleet. Order is `created_at DESC`. Uses the `idx_repos_owner`
     /// index so this stays cheap as the table grows.
-    async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>>;
+    async fn list_by_owner(&self, subject: &Subject) -> Result<Vec<RepoRow>>;
 
     /// Page-shaped variant of `list_by_owner`. Symmetric with
     /// `list_paginated` but scoped to one owner — backs the paginated
@@ -111,7 +112,7 @@ pub trait OwnershipStore: Send + Sync {
     /// pushes `LIMIT`/`OFFSET` into the indexed query.
     async fn list_paginated_by_owner(
         &self,
-        subject: &str,
+        subject: &Subject,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<RepoRow>> {
@@ -128,7 +129,7 @@ pub trait OwnershipStore: Send + Sync {
     /// needs `created_at` alongside the ownership check. A dedicated
     /// PK-lookup is O(1); previously this was a `list_all().find(...)`
     /// scan over the whole table.
-    async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>>;
+    async fn get_row(&self, repo_id: &RepoId) -> Result<Option<RepoRow>>;
 
     /// Exercise the store's write path with a transient row that's
     /// immediately deleted. Mirrors `TokenStore::probe_write` — the
@@ -190,20 +191,20 @@ fn now_secs() -> i64 {
 
 #[async_trait]
 impl OwnershipStore for SqliteOwnershipStore {
-    async fn record_owner(&self, repo_id: &str, owner: Option<&str>) -> Result<()> {
+    async fn record_owner(&self, repo_id: &RepoId, owner: Option<&Subject>) -> Result<()> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         conn.execute(
             "INSERT OR REPLACE INTO repos (id, owner_subject, created_at)
              VALUES (?1, ?2, ?3)",
-            params![repo_id, owner, now_secs()],
+            params![repo_id.as_str(), owner.map(|s| s.as_str()), now_secs()],
         )?;
         Ok(())
     }
 
-    async fn get_owner(&self, repo_id: &str) -> Result<Option<Option<String>>> {
+    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<String>>> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
-        let mut rows = stmt.query(params![repo_id])?;
+        let mut rows = stmt.query(params![repo_id.as_str()])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
@@ -212,17 +213,17 @@ impl OwnershipStore for SqliteOwnershipStore {
         Ok(Some(owner))
     }
 
-    async fn delete(&self, repo_id: &str) -> Result<()> {
+    async fn delete(&self, repo_id: &RepoId) -> Result<()> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
-        conn.execute("DELETE FROM repos WHERE id = ?1", params![repo_id])?;
+        conn.execute("DELETE FROM repos WHERE id = ?1", params![repo_id.as_str()])?;
         Ok(())
     }
 
-    async fn count_by_owner(&self, subject: &str) -> Result<u64> {
+    async fn count_by_owner(&self, subject: &Subject) -> Result<u64> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt =
             conn.prepare_cached("SELECT COUNT(*) FROM repos WHERE owner_subject = ?1")?;
-        let mut rows = stmt.query(params![subject])?;
+        let mut rows = stmt.query(params![subject.as_str()])?;
         let row = rows.next()?.expect("COUNT(*) always returns one row");
         let n: i64 = row.get(0)?;
         Ok(n as u64)
@@ -290,7 +291,7 @@ impl OwnershipStore for SqliteOwnershipStore {
         Ok(())
     }
 
-    async fn list_by_owner(&self, subject: &str) -> Result<Vec<RepoRow>> {
+    async fn list_by_owner(&self, subject: &Subject) -> Result<Vec<RepoRow>> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, owner_subject, created_at
@@ -298,7 +299,7 @@ impl OwnershipStore for SqliteOwnershipStore {
              WHERE owner_subject = ?1
              ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(params![subject], |row| {
+        let rows = stmt.query_map(params![subject.as_str()], |row| {
             Ok(RepoRow {
                 id: row.get(0)?,
                 owner: row.get(1)?,
@@ -314,7 +315,7 @@ impl OwnershipStore for SqliteOwnershipStore {
 
     async fn list_paginated_by_owner(
         &self,
-        subject: &str,
+        subject: &Subject,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<RepoRow>> {
@@ -326,13 +327,16 @@ impl OwnershipStore for SqliteOwnershipStore {
              ORDER BY created_at DESC
              LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![subject, limit as i64, offset as i64], |row| {
-            Ok(RepoRow {
-                id: row.get(0)?,
-                owner: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![subject.as_str(), limit as i64, offset as i64],
+            |row| {
+                Ok(RepoRow {
+                    id: row.get(0)?,
+                    owner: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -340,11 +344,11 @@ impl OwnershipStore for SqliteOwnershipStore {
         Ok(out)
     }
 
-    async fn get_row(&self, repo_id: &str) -> Result<Option<RepoRow>> {
+    async fn get_row(&self, repo_id: &RepoId) -> Result<Option<RepoRow>> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt =
             conn.prepare_cached("SELECT id, owner_subject, created_at FROM repos WHERE id = ?1")?;
-        let mut rows = stmt.query(params![repo_id])?;
+        let mut rows = stmt.query(params![repo_id.as_str()])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
@@ -372,14 +376,15 @@ pub async fn check_repo_quota(
     if matches!(principal, Principal::Admin) {
         return Ok(());
     }
-    let subject = principal.subject().ok_or(Error::QuotaExceeded {
+    let subject_str = principal.subject().ok_or(Error::QuotaExceeded {
         subject: "<no-subject>".to_string(),
         limit,
     })?;
-    let current = ownership.count_by_owner(subject).await?;
+    let subject = Subject::try_from(subject_str)?;
+    let current = ownership.count_by_owner(&subject).await?;
     if current >= limit {
         return Err(Error::QuotaExceeded {
-            subject: subject.to_string(),
+            subject: subject.into_inner(),
             limit,
         });
     }
@@ -437,7 +442,8 @@ pub async fn enforce_owner(
     let caller = principal
         .subject()
         .ok_or(Error::Forbidden("non-admin principal has no subject"))?;
-    match ownership.get_owner(repo_id).await? {
+    let repo_id_typed = RepoId::try_from(repo_id)?;
+    match ownership.get_owner(&repo_id_typed).await? {
         Some(Some(owner)) if owner == caller => Ok(()),
         Some(Some(_)) => Err(Error::Forbidden("not the repo owner")),
         // Admin-created repo, or no record at all: non-admin can't touch.
@@ -458,36 +464,50 @@ mod tests {
         (dir, store)
     }
 
+    fn rid(s: &str) -> RepoId {
+        RepoId::try_from(s).unwrap()
+    }
+
+    fn sub(s: &str) -> Subject {
+        Subject::try_from(s).unwrap()
+    }
+
     #[tokio::test]
     async fn record_and_read_owner_roundtrip() {
         let (_d, store) = fresh_store();
-        store.record_owner("r1", Some("user-a")).await.unwrap();
-        let o = store.get_owner("r1").await.unwrap();
+        store
+            .record_owner(&rid("repo1"), Some(&sub("user-a")))
+            .await
+            .unwrap();
+        let o = store.get_owner(&rid("repo1")).await.unwrap();
         assert_eq!(o, Some(Some("user-a".to_string())));
     }
 
     #[tokio::test]
     async fn record_admin_owned_as_none() {
         let (_d, store) = fresh_store();
-        store.record_owner("r2", None).await.unwrap();
-        let o = store.get_owner("r2").await.unwrap();
+        store.record_owner(&rid("repo2"), None).await.unwrap();
+        let o = store.get_owner(&rid("repo2")).await.unwrap();
         assert_eq!(o, Some(None));
     }
 
     #[tokio::test]
     async fn unknown_repo_returns_none() {
         let (_d, store) = fresh_store();
-        assert_eq!(store.get_owner("ghost").await.unwrap(), None);
+        assert_eq!(store.get_owner(&rid("ghost")).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn delete_removes_row() {
         let (_d, store) = fresh_store();
-        store.record_owner("r3", Some("u")).await.unwrap();
-        store.delete("r3").await.unwrap();
-        assert_eq!(store.get_owner("r3").await.unwrap(), None);
+        store
+            .record_owner(&rid("repo3"), Some(&sub("u")))
+            .await
+            .unwrap();
+        store.delete(&rid("repo3")).await.unwrap();
+        assert_eq!(store.get_owner(&rid("repo3")).await.unwrap(), None);
         // Idempotent: second delete doesn't error.
-        store.delete("r3").await.unwrap();
+        store.delete(&rid("repo3")).await.unwrap();
     }
 
     #[tokio::test]
@@ -498,39 +518,47 @@ mod tests {
             .await
             .unwrap();
         // Admin-created.
-        store.record_owner("r", None).await.unwrap();
-        enforce_owner(&store, &Principal::Admin, "r").await.unwrap();
+        store.record_owner(&rid("rtst"), None).await.unwrap();
+        enforce_owner(&store, &Principal::Admin, "rtst")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn enforce_user_matches_owner() {
         let (_d, store) = fresh_store();
-        store.record_owner("r", Some("alice")).await.unwrap();
+        store
+            .record_owner(&rid("rtst"), Some(&sub("alice")))
+            .await
+            .unwrap();
         let p = Principal::User {
             subject: "alice".into(),
         };
-        enforce_owner(&store, &p, "r").await.unwrap();
+        enforce_owner(&store, &p, "rtst").await.unwrap();
     }
 
     #[tokio::test]
     async fn enforce_user_rejects_different_owner() {
         let (_d, store) = fresh_store();
-        store.record_owner("r", Some("alice")).await.unwrap();
+        store
+            .record_owner(&rid("rtst"), Some(&sub("alice")))
+            .await
+            .unwrap();
         let bob = Principal::User {
             subject: "bob".into(),
         };
-        let r = enforce_owner(&store, &bob, "r").await;
+        let r = enforce_owner(&store, &bob, "rtst").await;
         assert!(matches!(r, Err(Error::Forbidden(_))));
     }
 
     #[tokio::test]
     async fn enforce_user_rejects_admin_owned() {
         let (_d, store) = fresh_store();
-        store.record_owner("r", None).await.unwrap();
+        store.record_owner(&rid("rtst"), None).await.unwrap();
         let alice = Principal::User {
             subject: "alice".into(),
         };
-        let r = enforce_owner(&store, &alice, "r").await;
+        let r = enforce_owner(&store, &alice, "rtst").await;
         assert!(matches!(r, Err(Error::Forbidden(_))));
     }
 
@@ -549,19 +577,28 @@ mod tests {
     #[tokio::test]
     async fn count_by_owner_is_zero_without_rows() {
         let (_d, store) = fresh_store();
-        assert_eq!(store.count_by_owner("nobody").await.unwrap(), 0);
+        assert_eq!(store.count_by_owner(&sub("nobody")).await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn count_by_owner_tracks_inserts_and_deletes() {
         let (_d, store) = fresh_store();
-        store.record_owner("r1", Some("alice")).await.unwrap();
-        store.record_owner("r2", Some("alice")).await.unwrap();
-        store.record_owner("r3", Some("bob")).await.unwrap();
-        assert_eq!(store.count_by_owner("alice").await.unwrap(), 2);
-        assert_eq!(store.count_by_owner("bob").await.unwrap(), 1);
-        store.delete("r1").await.unwrap();
-        assert_eq!(store.count_by_owner("alice").await.unwrap(), 1);
+        store
+            .record_owner(&rid("repo1"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        store
+            .record_owner(&rid("repo2"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        store
+            .record_owner(&rid("repo3"), Some(&sub("bob")))
+            .await
+            .unwrap();
+        assert_eq!(store.count_by_owner(&sub("alice")).await.unwrap(), 2);
+        assert_eq!(store.count_by_owner(&sub("bob")).await.unwrap(), 1);
+        store.delete(&rid("repo1")).await.unwrap();
+        assert_eq!(store.count_by_owner(&sub("alice")).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -569,10 +606,13 @@ mod tests {
         // Admin-owned rows have owner_subject = NULL. They must not
         // count toward any user's quota.
         let (_d, store) = fresh_store();
-        store.record_owner("a1", None).await.unwrap();
-        store.record_owner("a2", None).await.unwrap();
-        store.record_owner("u1", Some("alice")).await.unwrap();
-        assert_eq!(store.count_by_owner("alice").await.unwrap(), 1);
+        store.record_owner(&rid("a1-r"), None).await.unwrap();
+        store.record_owner(&rid("a2-r"), None).await.unwrap();
+        store
+            .record_owner(&rid("u1-r"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        assert_eq!(store.count_by_owner(&sub("alice")).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -581,7 +621,10 @@ mod tests {
         // Record 5 admin-owned repos and check the admin's own principal
         // is still OK against a limit of 0.
         for i in 0..5 {
-            store.record_owner(&format!("r{i}"), None).await.unwrap();
+            store
+                .record_owner(&rid(&format!("repo-{i}")), None)
+                .await
+                .unwrap();
         }
         check_repo_quota(&store, &Principal::Admin, 0)
             .await
@@ -591,7 +634,10 @@ mod tests {
     #[tokio::test]
     async fn quota_user_allowed_under_limit() {
         let (_d, store) = fresh_store();
-        store.record_owner("r1", Some("alice")).await.unwrap();
+        store
+            .record_owner(&rid("repo1"), Some(&sub("alice")))
+            .await
+            .unwrap();
         let alice = Principal::User {
             subject: "alice".into(),
         };
@@ -603,7 +649,7 @@ mod tests {
         let (_d, store) = fresh_store();
         for i in 0..3u32 {
             store
-                .record_owner(&format!("r{i}"), Some("alice"))
+                .record_owner(&rid(&format!("repo-{i}")), Some(&sub("alice")))
                 .await
                 .unwrap();
         }
@@ -620,15 +666,22 @@ mod tests {
     #[tokio::test]
     async fn get_row_returns_none_for_unknown_repo() {
         let (_d, store) = fresh_store();
-        assert!(store.get_row("ghost").await.unwrap().is_none());
+        assert!(store.get_row(&rid("ghost")).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn get_row_returns_owner_and_created_at() {
         let (_d, store) = fresh_store();
-        store.record_owner("r1", Some("alice")).await.unwrap();
-        let row = store.get_row("r1").await.unwrap().expect("row present");
-        assert_eq!(row.id, "r1");
+        store
+            .record_owner(&rid("repo1"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        let row = store
+            .get_row(&rid("repo1"))
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(row.id, "repo1");
         assert_eq!(row.owner.as_deref(), Some("alice"));
         assert!(row.created_at > 0);
     }
@@ -636,10 +689,14 @@ mod tests {
     #[tokio::test]
     async fn get_row_distinguishes_admin_owned_from_missing() {
         let (_d, store) = fresh_store();
-        store.record_owner("admin-repo", None).await.unwrap();
-        let row = store.get_row("admin-repo").await.unwrap().expect("row");
+        store.record_owner(&rid("admin-repo"), None).await.unwrap();
+        let row = store
+            .get_row(&rid("admin-repo"))
+            .await
+            .unwrap()
+            .expect("row");
         assert!(row.owner.is_none());
-        assert!(store.get_row("ghost").await.unwrap().is_none());
+        assert!(store.get_row(&rid("ghost")).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -649,13 +706,19 @@ mod tests {
         // return newest first. SQLite's CURRENT_TIMESTAMP resolution is
         // second-level; `record_owner` uses epoch seconds via `now_secs()`,
         // so we sleep a beat to guarantee a distinct timestamp.
-        store.record_owner("old", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("oldr"), Some(&sub("u")))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.record_owner("new", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("newr"), Some(&sub("u")))
+            .await
+            .unwrap();
         let rows = store.list_all().await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].id, "new");
-        assert_eq!(rows[1].id, "old");
+        assert_eq!(rows[0].id, "newr");
+        assert_eq!(rows[1].id, "oldr");
     }
 
     #[tokio::test]
@@ -672,13 +735,25 @@ mod tests {
         // — the same slice the caller would compute by hand from
         // `list_all()`.
         let (_d, store) = fresh_store();
-        store.record_owner("oldest", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("oldest"), Some(&sub("u")))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.record_owner("older", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("older"), Some(&sub("u")))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.record_owner("newer", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("newer"), Some(&sub("u")))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.record_owner("newest", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("newest"), Some(&sub("u")))
+            .await
+            .unwrap();
 
         let page = store.list_paginated(2, 1).await.unwrap();
         let ids: Vec<&str> = page.iter().map(|r| r.id.as_str()).collect();
@@ -688,7 +763,10 @@ mod tests {
     #[tokio::test]
     async fn list_paginated_offset_past_end_returns_empty() {
         let (_d, store) = fresh_store();
-        store.record_owner("only", Some("u")).await.unwrap();
+        store
+            .record_owner(&rid("only"), Some(&sub("u")))
+            .await
+            .unwrap();
         let page = store.list_paginated(10, 5).await.unwrap();
         assert!(page.is_empty());
     }
@@ -700,9 +778,15 @@ mod tests {
         // test pins the equivalence rather than the implementation.
         let (_d, store) = fresh_store();
         assert_eq!(store.count_all().await.unwrap(), 0);
-        store.record_owner("a", Some("u")).await.unwrap();
-        store.record_owner("b", None).await.unwrap();
-        store.record_owner("c", Some("v")).await.unwrap();
+        store
+            .record_owner(&rid("repo-a"), Some(&sub("u")))
+            .await
+            .unwrap();
+        store.record_owner(&rid("repo-b"), None).await.unwrap();
+        store
+            .record_owner(&rid("repo-c"), Some(&sub("v")))
+            .await
+            .unwrap();
         assert_eq!(store.count_all().await.unwrap(), 3);
         assert_eq!(
             store.count_all().await.unwrap() as usize,
@@ -713,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn list_all_includes_admin_owned_as_none() {
         let (_d, store) = fresh_store();
-        store.record_owner("admin-repo", None).await.unwrap();
+        store.record_owner(&rid("admin-repo"), None).await.unwrap();
         let rows = store.list_all().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "admin-repo");
@@ -723,37 +807,56 @@ mod tests {
     #[tokio::test]
     async fn list_by_owner_filters_to_subject() {
         let (_d, store) = fresh_store();
-        store.record_owner("a1", Some("alice")).await.unwrap();
-        store.record_owner("b1", Some("bob")).await.unwrap();
-        store.record_owner("a2", Some("alice")).await.unwrap();
-        store.record_owner("admin", None).await.unwrap();
-        let alice = store.list_by_owner("alice").await.unwrap();
+        store
+            .record_owner(&rid("a1-r"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        store
+            .record_owner(&rid("b1-r"), Some(&sub("bob")))
+            .await
+            .unwrap();
+        store
+            .record_owner(&rid("a2-r"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        store.record_owner(&rid("admin-r"), None).await.unwrap();
+        let alice = store.list_by_owner(&sub("alice")).await.unwrap();
         let ids: Vec<&str> = alice.iter().map(|r| r.id.as_str()).collect();
         // Alice sees her own repos, nothing else. Admin-owned rows never
         // show up on a user's list.
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&"a1"));
-        assert!(ids.contains(&"a2"));
-        assert!(!ids.contains(&"b1"));
-        assert!(!ids.contains(&"admin"));
+        assert!(ids.contains(&"a1-r"));
+        assert!(ids.contains(&"a2-r"));
+        assert!(!ids.contains(&"b1-r"));
+        assert!(!ids.contains(&"admin-r"));
     }
 
     #[tokio::test]
     async fn list_by_owner_empty_when_no_rows() {
         let (_d, store) = fresh_store();
-        assert!(store.list_by_owner("nobody").await.unwrap().is_empty());
+        assert!(store
+            .list_by_owner(&sub("nobody"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn list_by_owner_returns_newest_first() {
         let (_d, store) = fresh_store();
-        store.record_owner("old", Some("alice")).await.unwrap();
+        store
+            .record_owner(&rid("oldr"), Some(&sub("alice")))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        store.record_owner("new", Some("alice")).await.unwrap();
-        let rows = store.list_by_owner("alice").await.unwrap();
+        store
+            .record_owner(&rid("newr"), Some(&sub("alice")))
+            .await
+            .unwrap();
+        let rows = store.list_by_owner(&sub("alice")).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].id, "new");
-        assert_eq!(rows[1].id, "old");
+        assert_eq!(rows[0].id, "newr");
+        assert_eq!(rows[1].id, "oldr");
     }
 
     #[tokio::test]
@@ -773,7 +876,7 @@ mod tests {
         let total: u32 = 100;
         for i in 0..total {
             store
-                .record_owner(&format!("repo-{i:03}"), Some("alice"))
+                .record_owner(&rid(&format!("repo-{i:03}")), Some(&sub("alice")))
                 .await
                 .unwrap();
         }
@@ -818,24 +921,27 @@ mod tests {
         let other: u32 = 40;
         for i in 0..owned {
             store
-                .record_owner(&format!("alice-{i:03}"), Some("alice"))
+                .record_owner(&rid(&format!("alice-{i:03}")), Some(&sub("alice")))
                 .await
                 .unwrap();
         }
         for i in 0..other {
             store
-                .record_owner(&format!("bob-{i:03}"), Some("bob"))
+                .record_owner(&rid(&format!("bob-{i:03}")), Some(&sub("bob")))
                 .await
                 .unwrap();
         }
-        assert_eq!(store.count_by_owner("alice").await.unwrap(), owned as u64);
+        assert_eq!(
+            store.count_by_owner(&sub("alice")).await.unwrap(),
+            owned as u64
+        );
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let chunk: u32 = 20;
         let mut offset: u32 = 0;
         loop {
             let page = store
-                .list_paginated_by_owner("alice", chunk, offset)
+                .list_paginated_by_owner(&sub("alice"), chunk, offset)
                 .await
                 .unwrap();
             if page.is_empty() {
@@ -854,7 +960,7 @@ mod tests {
         }
         assert_eq!(seen.len(), owned as usize);
         assert!(store
-            .list_paginated_by_owner("alice", 10, owned)
+            .list_paginated_by_owner(&sub("alice"), 10, owned)
             .await
             .unwrap()
             .is_empty());
@@ -879,6 +985,7 @@ mod tests {
         //! cost doesn't blow up the test runtime.
         use super::super::OwnershipStore;
         use super::super::SqliteOwnershipStore;
+        use super::{rid, sub};
         use proptest::prelude::*;
         use std::collections::HashSet;
         use tempfile::TempDir;
@@ -906,7 +1013,7 @@ mod tests {
                 rt.block_on(async {
                     let (_d, store) = fresh_blocking();
                     for i in 0..n {
-                        store.record_owner(&format!("r{i:03}"), Some("u")).await.unwrap();
+                        store.record_owner(&rid(&format!("r{i:03}")), Some(&sub("u"))).await.unwrap();
                     }
                     let total = store.count_all().await.unwrap();
                     prop_assert_eq!(total, n as u64);
@@ -948,7 +1055,7 @@ mod tests {
                 rt.block_on(async {
                     let (_d, store) = fresh_blocking();
                     for i in 0..n {
-                        store.record_owner(&format!("r{i:03}"), Some("u")).await.unwrap();
+                        store.record_owner(&rid(&format!("r{i:03}")), Some(&sub("u"))).await.unwrap();
                     }
                     let p0 = store.list_paginated(limit, 0).await.unwrap();
                     let p1 = store.list_paginated(limit, limit).await.unwrap();
