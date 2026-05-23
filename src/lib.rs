@@ -30,6 +30,7 @@ pub mod events;
 pub mod gc;
 pub mod git_cmd;
 pub mod git_wire;
+pub mod ids;
 pub mod ip_rate_limit;
 pub mod jwt;
 pub mod merge;
