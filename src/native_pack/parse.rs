@@ -117,12 +117,15 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
             "missing PACK magic at offset 0".to_string(),
         ));
     }
+    // pack.len() >= 12 was checked at the top of this function; the
+    // 4-byte slice → [u8; 4] conversion is infallible by that bound.
     let version = u32::from_be_bytes(pack[4..8].try_into().unwrap());
     if version != 2 {
         return Err(Error::PackParse(format!(
             "unsupported pack version: {version}"
         )));
     }
+    // Same bound: pack.len() >= 12 ⇒ pack[8..12] is a 4-byte slice.
     let n_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
 
     let mut entries = Vec::with_capacity(n_objects);

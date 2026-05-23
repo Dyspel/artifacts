@@ -79,9 +79,15 @@ impl Config {
     /// means JWT auth is disabled and only the admin token is
     /// accepted.
     pub fn jwt_secret(&self) -> Option<String> {
+        // Poison recovery: the value behind the lock is a single
+        // Option<String>; a panic during `rotate_jwt_secret` leaves
+        // either the pre- or post-update value in place, both valid
+        // states. Treating the lock as never-poisoned is correct
+        // here and matches the pattern used by MemObjectStore,
+        // SqliteWebhookRegistry, MemRefStore.
         self.jwt_secret
             .read()
-            .expect("jwt_secret lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
 
@@ -91,7 +97,7 @@ impl Config {
     /// disable JWT auth altogether (no clients can present any JWT
     /// after this).
     pub fn rotate_jwt_secret(&self, new: Option<String>) {
-        *self.jwt_secret.write().expect("jwt_secret lock poisoned") = new;
+        *self.jwt_secret.write().unwrap_or_else(|p| p.into_inner()) = new;
     }
 
     pub fn repos_dir(&self) -> PathBuf {
@@ -101,9 +107,11 @@ impl Config {
     /// Snapshot the current admin token. Allocates — call once per
     /// REST request at the auth boundary, not in inner loops.
     pub fn admin_token(&self) -> String {
+        // Same poison-recovery rationale as `jwt_secret`: single
+        // value behind the lock, atomic swap on rotate.
         self.admin_token
             .read()
-            .expect("admin_token lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
 
@@ -112,7 +120,7 @@ impl Config {
     /// immediately. Idempotent — rotating to the same value is a no-op
     /// from the caller's perspective.
     pub fn rotate_admin_token(&self, new: String) {
-        *self.admin_token.write().expect("admin_token lock poisoned") = new;
+        *self.admin_token.write().unwrap_or_else(|p| p.into_inner()) = new;
     }
 }
 

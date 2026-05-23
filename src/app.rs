@@ -771,7 +771,7 @@ async fn shutdown_signal(
         );
         tokio::time::sleep(drain_delay).await;
     }
-    *drain_started.lock().expect("drain_started mutex poisoned") = Some(std::time::Instant::now());
+    *drain_started.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
 }
 
 /// Classify the drain outcome for the `server.shutdown` audit event.
@@ -804,7 +804,7 @@ async fn emit_server_shutdown(
     drain_started: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 ) {
     let kind = classify_shutdown_kind(
-        *drain_started.lock().expect("drain_started mutex poisoned"),
+        *drain_started.lock().unwrap_or_else(|p| p.into_inner()),
         shutdown_timeout,
     );
     let uptime_secs = started_at.elapsed().as_secs();
