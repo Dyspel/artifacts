@@ -69,7 +69,7 @@ impl Scope {
 /// listing path returns the full row via [`TokenSummary`].
 #[derive(Debug, Clone)]
 pub struct TokenRecord {
-    pub repo_id: String,
+    pub repo_id: RepoId,
     pub scope: Scope,
 }
 
@@ -78,17 +78,22 @@ pub struct TokenRecord {
 /// shape — listing returns the row's metadata, never the raw secret.
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenSummary {
-    /// Stable per-row id (the SHA-256 hex of the token, truncated to
-    /// 16 chars for compactness in CLI output). Same value for the
-    /// same token across calls. Lets a caller cross-reference
+    /// Stable per-row id — the SHA-256 hex of the *token hash*,
+    /// truncated to 16 chars for compactness in CLI output. Same value
+    /// for the same token across calls. Lets a caller cross-reference
     /// `revoke` operations without ever holding the raw token.
+    ///
+    /// Deliberately NOT `Oid`: this is a SHA-256 prefix, not a SHA-1
+    /// git oid. The `Oid` newtype is strictly 40 lowercase hex chars
+    /// matching a git object identifier; conflating the two would let
+    /// a token-hash flow into `ObjectStore::read_loose` and vice versa.
     pub id: String,
-    pub repo_id: String,
+    pub repo_id: RepoId,
     pub scope: Scope,
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub revoked_at: Option<u64>,
-    pub subject: Option<String>,
+    pub subject: Option<Subject>,
 }
 
 /// The token-store contract.
@@ -111,7 +116,7 @@ pub trait TokenStore: Send + Sync {
         scope: Scope,
         ttl: Option<Duration>,
         subject: Option<&Subject>,
-    ) -> Result<String>;
+    ) -> Result<Token>;
 
     /// Resolve a token. `Ok(None)` means unknown, revoked, or expired —
     /// no distinction is made, since from the caller's perspective all
@@ -323,9 +328,14 @@ impl TokenStore for SqliteTokenStore {
         scope: Scope,
         ttl: Option<Duration>,
         subject: Option<&Subject>,
-    ) -> Result<String> {
-        let token = random_token();
-        let hash = sha256_hex(&token);
+    ) -> Result<Token> {
+        let raw = random_token();
+        // random_token produces a URL-safe-base64 32-byte string (≥ 1
+        // char, all ascii-graphic), so it satisfies the Token contract
+        // by construction. The expect documents the invariant.
+        let token = Token::try_from(raw.as_str())
+            .expect("random_token() output satisfies the Token contract");
+        let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
         let expires_at = ttl.map(|d| (now as u64 + d.as_secs()) as i64);
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
@@ -362,8 +372,21 @@ impl TokenStore for SqliteTokenStore {
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let repo_id: String = row.get(0)?;
+        let repo_id_raw: String = row.get(0)?;
         let scope: String = row.get(1)?;
+        // repo_id was inserted via `repo_id.as_str()` on a typed RepoId
+        // (mint enforces this); a malformed value here is DB corruption.
+        // Surface as "token unresolved" rather than poisoning auth.
+        let repo_id = match RepoId::try_from(repo_id_raw.as_str()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id_raw, error = %e,
+                    "tokens.lookup: row repo_id malformed; treating as absent"
+                );
+                return Ok(None);
+            }
+        };
         Ok(Some(TokenRecord {
             repo_id,
             scope: Scope::parse(&scope)?,
@@ -461,7 +484,33 @@ impl TokenStore for SqliteTokenStore {
         )?;
         let mut out = Vec::new();
         for row in rows {
-            let (hash, repo_id, scope_s, created, expires, revoked, subject) = row?;
+            let (hash, repo_id_raw, scope_s, created, expires, revoked, subject_raw) = row?;
+            // Rows in `tokens` were inserted via `repo_id.as_str()` /
+            // `subject.as_str()` so a malformed value here is corruption,
+            // not user input — log + skip rather than fail the whole list.
+            let repo_id = match RepoId::try_from(repo_id_raw.as_str()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        repo_id = %repo_id_raw, error = %e,
+                        "tokens.list_for_repo: row repo_id malformed; skipping"
+                    );
+                    continue;
+                }
+            };
+            let subject = match subject_raw.as_deref() {
+                Some(s) => match Subject::try_from(s) {
+                    Ok(sub) => Some(sub),
+                    Err(e) => {
+                        tracing::warn!(
+                            subject = %s, error = %e,
+                            "tokens.list_for_repo: row subject malformed; surfacing as admin-minted"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             out.push(TokenSummary {
                 id: hash.chars().take(16).collect(),
                 repo_id,
@@ -529,8 +578,8 @@ mod tests {
             .mint(&rid("repo-a"), Scope::Write, None, None)
             .await
             .unwrap();
-        let rec = store.lookup(&tok(&t)).await.unwrap().unwrap();
-        assert_eq!(rec.repo_id, "repo-a");
+        let rec = store.lookup(&t).await.unwrap().unwrap();
+        assert_eq!(rec.repo_id.as_str(), "repo-a");
         assert_eq!(rec.scope, Scope::Write);
         // expires_at = None round-trips: a row minted without a TTL
         // is verified via the listing path, which is the surface
@@ -553,11 +602,11 @@ mod tests {
             .mint(&rid("rtst"), Scope::Read, None, None)
             .await
             .unwrap();
-        assert!(store.lookup(&tok(&t)).await.unwrap().is_some());
-        assert!(store.revoke(&tok(&t)).await.unwrap());
-        assert!(store.lookup(&tok(&t)).await.unwrap().is_none());
+        assert!(store.lookup(&t).await.unwrap().is_some());
+        assert!(store.revoke(&t).await.unwrap());
+        assert!(store.lookup(&t).await.unwrap().is_none());
         // Second revoke is a no-op (idempotent).
-        assert!(!store.revoke(&tok(&t)).await.unwrap());
+        assert!(!store.revoke(&t).await.unwrap());
     }
 
     #[tokio::test]
@@ -575,7 +624,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            store.lookup(&tok(&t)).await.unwrap().is_none(),
+            store.lookup(&t).await.unwrap().is_none(),
             "expected TTL=0 token to be unresolvable"
         );
     }
@@ -592,12 +641,8 @@ mod tests {
         };
         // Drop the first store, reopen on the same path.
         let s2 = SqliteTokenStore::open(&path).unwrap();
-        let rec = s2
-            .lookup(&tok(&t))
-            .await
-            .unwrap()
-            .expect("token survived reopen");
-        assert_eq!(rec.repo_id, "persistent");
+        let rec = s2.lookup(&t).await.unwrap().expect("token survived reopen");
+        assert_eq!(rec.repo_id.as_str(), "persistent");
     }
 
     #[tokio::test]
@@ -623,8 +668,12 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         let stored = &rows[0];
-        assert_ne!(stored, &t, "raw token must not appear in db");
-        assert_eq!(stored, &sha256_hex(&t));
+        assert_ne!(
+            stored.as_str(),
+            t.as_str(),
+            "raw token must not appear in db"
+        );
+        assert_eq!(stored.as_str(), sha256_hex(t.as_str()).as_str());
     }
 
     fn count_rows(path: &std::path::Path) -> i64 {
@@ -646,7 +695,7 @@ mod tests {
             .mint(&rid("dead-r"), Scope::Read, None, None)
             .await
             .unwrap();
-        store.revoke(&tok(&t_dead)).await.unwrap();
+        store.revoke(&t_dead).await.unwrap();
         assert_eq!(count_rows(&path), 2);
 
         // Grace doesn't apply to revokes — revoked rows are always prunable.
@@ -654,7 +703,7 @@ mod tests {
         assert_eq!(pruned, 1);
         assert_eq!(count_rows(&path), 1);
         // The live token still resolves.
-        assert!(store.lookup(&tok(&t_live)).await.unwrap().is_some());
+        assert!(store.lookup(&t_live).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -702,7 +751,10 @@ mod tests {
             .unwrap();
         let listed = store.list_for_repo(&rid("r-acct"), None).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].subject.as_deref(), Some("alice@example"));
+        assert_eq!(
+            listed[0].subject.as_ref().map(|s| s.as_str()),
+            Some("alice@example")
+        );
     }
 
     #[tokio::test]
@@ -731,7 +783,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alice_only.len(), 1);
-        assert_eq!(alice_only[0].subject.as_deref(), Some("alice"));
+        assert_eq!(
+            alice_only[0].subject.as_ref().map(|s| s.as_str()),
+            Some("alice")
+        );
 
         // Subject that never minted anything → empty.
         let chuck = store
@@ -752,7 +807,7 @@ mod tests {
             .mint(&rid("repo1"), Scope::Read, None, Some(&sub("alice")))
             .await
             .unwrap();
-        store.revoke(&tok(&t)).await.unwrap();
+        store.revoke(&t).await.unwrap();
         let live = store.list_for_repo(&rid("repo1"), None).await.unwrap();
         assert_eq!(live.len(), 1, "revoked row must not be in listing");
     }
@@ -772,7 +827,7 @@ mod tests {
         let id = &listed[0].id;
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(id.as_str(), &t[..16.min(t.len())]);
+        assert_ne!(id.as_str(), &t.as_str()[..16.min(t.as_str().len())]);
     }
 
     #[tokio::test]
@@ -832,17 +887,17 @@ mod tests {
             .unwrap();
 
         // Sanity: all three resolve.
-        assert!(store.lookup(&tok(&t1)).await.unwrap().is_some());
-        assert!(store.lookup(&tok(&t2)).await.unwrap().is_some());
-        assert!(store.lookup(&tok(&t3)).await.unwrap().is_some());
+        assert!(store.lookup(&t1).await.unwrap().is_some());
+        assert!(store.lookup(&t2).await.unwrap().is_some());
+        assert!(store.lookup(&t3).await.unwrap().is_some());
 
         let revoked = store.revoke_all_for_repo(&rid("repo1")).await.unwrap();
         assert_eq!(revoked, 2);
 
         // r1 tokens are dead, r2 is untouched.
-        assert!(store.lookup(&tok(&t1)).await.unwrap().is_none());
-        assert!(store.lookup(&tok(&t2)).await.unwrap().is_none());
-        assert!(store.lookup(&tok(&t3)).await.unwrap().is_some());
+        assert!(store.lookup(&t1).await.unwrap().is_none());
+        assert!(store.lookup(&t2).await.unwrap().is_none());
+        assert!(store.lookup(&t3).await.unwrap().is_some());
     }
 
     #[tokio::test]

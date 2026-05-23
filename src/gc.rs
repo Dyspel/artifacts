@@ -147,11 +147,11 @@ pub fn preview(
     let mut sample: Vec<String> = Vec::new();
     let mut unreachable_count: u64 = 0;
     for info in &loose {
-        if !reachable.contains(&info.oid) {
+        if !reachable.contains(info.oid.as_str()) {
             unreachable_count += 1;
             unreachable_bytes += info.size;
             if sample.len() < SAMPLE_CAP {
-                sample.push(info.oid.clone());
+                sample.push(info.oid.as_str().to_owned());
             }
         }
     }
@@ -221,7 +221,7 @@ pub fn run(
     let mut deleted_bytes = 0u64;
     let mut skipped_too_young = 0u64;
     for info in &loose {
-        if reachable.contains(&info.oid) {
+        if reachable.contains(info.oid.as_str()) {
             continue;
         }
         // Anti-race guard: a push that landed objects seconds ago
@@ -238,17 +238,7 @@ pub fn run(
             );
             continue;
         }
-        // info.oid was produced by `list_loose` which guarantees a
-        // valid 40-char hex OID; the try_from below is the same
-        // predicate, can't realistically fail.
-        let oid_typed = match crate::ids::Oid::try_from(info.oid.as_str()) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(oid = %info.oid, error = %e, "gc: skipping malformed oid");
-                continue;
-            }
-        };
-        match objects.delete_loose(&repo_id_typed, &oid_typed) {
+        match objects.delete_loose(&repo_id_typed, &info.oid) {
             Ok(true) => {
                 deleted += 1;
                 deleted_bytes += info.size;

@@ -35,8 +35,8 @@ pub enum Error {
     #[error("ref conflict on branch {branch}")]
     RefConflict {
         branch: String,
-        expected: Option<String>,
-        current: Option<String>,
+        expected: Option<crate::ids::Oid>,
+        current: Option<crate::ids::Oid>,
     },
 
     #[error("merge conflict on branch {target_branch} ({} path{})", conflict_paths.len(), if conflict_paths.len() == 1 { "" } else { "s" })]
@@ -319,18 +319,20 @@ mod tests {
 
     #[tokio::test]
     async fn ref_conflict_emits_409_with_expected_and_current() {
+        let aaaa = crate::ids::Oid::try_from("a".repeat(40).as_str()).unwrap();
+        let bbbb = crate::ids::Oid::try_from("b".repeat(40).as_str()).unwrap();
         let resp = Error::RefConflict {
             branch: "main".to_string(),
-            expected: Some("aaaa".to_string()),
-            current: Some("bbbb".to_string()),
+            expected: Some(aaaa.clone()),
+            current: Some(bbbb.clone()),
         }
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["status"], 409);
         assert_eq!(v["body"]["error"]["code"], "ref_conflict");
         assert_eq!(v["body"]["error"]["branch"], "main");
-        assert_eq!(v["body"]["error"]["expected"], "aaaa");
-        assert_eq!(v["body"]["error"]["current"], "bbbb");
+        assert_eq!(v["body"]["error"]["expected"], aaaa.as_str());
+        assert_eq!(v["body"]["error"]["current"], bbbb.as_str());
     }
 
     #[tokio::test]

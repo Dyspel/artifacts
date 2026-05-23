@@ -140,14 +140,14 @@ pub struct RestState {
 pub struct RepoHandle {
     pub id: String,
     pub remote: String,
-    pub token: String,
+    pub token: crate::ids::Token,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AdminRepoSummary {
-    pub id: String,
+    pub id: crate::ids::RepoId,
     /// `None` for admin-created repos.
-    pub owner: Option<String>,
+    pub owner: Option<crate::ids::Subject>,
     /// Unix epoch seconds.
     #[serde(rename = "createdAt")]
     pub created_at: i64,
@@ -194,7 +194,7 @@ pub struct ListReposQuery {
 pub(crate) const LIST_REPOS_DEFAULT_LIMIT: u32 = 1000;
 pub(crate) const LIST_REPOS_MAX_LIMIT: u32 = 5000;
 
-pub(crate) fn remote_url(cfg: &Config, id: &str, token: &str) -> String {
+pub(crate) fn remote_url(cfg: &Config, id: &str, token: &crate::ids::Token) -> String {
     // https://x:TOKEN@host/git/:id.git — the form git clients parse natively.
     let base = cfg.public_base_url.trim_end_matches('/');
     if let Some(rest) = base.strip_prefix("https://") {

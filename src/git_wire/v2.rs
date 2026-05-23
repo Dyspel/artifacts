@@ -190,14 +190,14 @@ pub(crate) async fn native_ls_refs_response(
             match refs.read_head(&repo_id_typed).await? {
                 HeadState::Symbolic { target, oid } => {
                     rows.push(LsRefsRow {
-                        oid,
+                        oid: oid.into_inner(),
                         name: "HEAD".into(),
                         extra: args.symrefs.then(|| format!(" symref-target:{target}")),
                     });
                 }
                 HeadState::Detached { oid } => {
                     rows.push(LsRefsRow {
-                        oid,
+                        oid: oid.into_inner(),
                         name: "HEAD".into(),
                         extra: None,
                     });
@@ -222,16 +222,19 @@ pub(crate) async fn native_ls_refs_response(
 
         if !other_prefixes.is_empty() {
             let mut entries = refs.list(&repo_id_typed, &other_prefixes).await?;
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            entries.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
             for e in entries {
                 let extra = if args.peel {
                     e.peeled.as_ref().map(|p| format!(" peeled:{p}"))
                 } else {
                     None
                 };
+                // LsRefsRow is the wire-protocol shape — strings on the
+                // line. Convert here at the trait→wire boundary; the
+                // typed values stay inside the trait surface above.
                 rows.push(LsRefsRow {
-                    oid: e.oid,
-                    name: e.name,
+                    oid: e.oid.into_inner(),
+                    name: e.name.into_inner(),
                     extra,
                 });
             }

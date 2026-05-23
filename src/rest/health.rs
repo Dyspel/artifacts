@@ -186,7 +186,7 @@ mod tests {
             _: Scope,
             _: Option<Duration>,
             _: Option<&crate::ids::Subject>,
-        ) -> Result<String> {
+        ) -> Result<crate::ids::Token> {
             unreachable!("health_ready does not mint")
         }
         async fn lookup(&self, _: &crate::ids::Token) -> Result<Option<TokenRecord>> {
@@ -249,7 +249,10 @@ mod tests {
         ) -> Result<()> {
             unreachable!("health_ready does not record")
         }
-        async fn get_owner(&self, _: &crate::ids::RepoId) -> Result<Option<Option<String>>> {
+        async fn get_owner(
+            &self,
+            _: &crate::ids::RepoId,
+        ) -> Result<Option<Option<crate::ids::Subject>>> {
             unreachable!("health_ready does not get_owner")
         }
         async fn delete(&self, _: &crate::ids::RepoId) -> Result<()> {

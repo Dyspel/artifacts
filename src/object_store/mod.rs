@@ -65,7 +65,7 @@ use std::sync::{Arc, Mutex, RwLock};
 /// `oid + length(bytes) + created_at` in one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LooseInfo {
-    pub oid: String,
+    pub oid: Oid,
     pub size: u64,
     /// Unix epoch seconds when the object was last written. The FS
     /// impl reads from mtime; a future chunked-KV impl reads from
@@ -339,7 +339,24 @@ impl ObjectStore for FsObjectStore {
                 if fname.len() != 38 || !fname.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue;
                 }
-                let oid = format!("{name}{fname}");
+                let oid_hex = format!("{name}{fname}");
+                // Subdir+filename already passed 2-hex + 38-hex
+                // filtering above, so the concatenation is a valid
+                // 40-hex lowercase string by construction. A failure
+                // here would mean an FS-level path walked under an
+                // invariant we just enforced — corruption, not user
+                // input — so log + skip rather than panic, matching
+                // the G1 rule for trait-internal data shapes.
+                let oid = match Oid::try_from(oid_hex.as_str()) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(
+                            oid = %oid_hex, error = %e,
+                            "fs list_loose: skipping malformed loose path"
+                        );
+                        continue;
+                    }
+                };
                 let meta = match f.metadata() {
                     Ok(m) => m,
                     Err(_) => continue,
@@ -581,6 +598,10 @@ impl ObjectStore for MemObjectStore {
     }
 
     fn list_loose(&self, repo_id: &RepoId) -> Result<Vec<LooseInfo>> {
+        // Mem store only accepts inserts via `write_loose(&self,
+        // _: &RepoId, oid: &Oid, _)`, so every key in the map was a
+        // typed Oid at insert. `Oid::try_from` here is the symmetric
+        // reconstruction — infallible by construction.
         Ok(self
             .objects
             .read()
@@ -588,7 +609,8 @@ impl ObjectStore for MemObjectStore {
             .iter()
             .filter(|((r, _), _)| r.as_str() == repo_id.as_str())
             .map(|((_, oid), e)| LooseInfo {
-                oid: oid.clone(),
+                oid: Oid::try_from(oid.as_str())
+                    .expect("mem-store oid invariant: only typed Oids written"),
                 size: e.bytes.len() as u64,
                 created_secs: e.created_secs,
             })
@@ -719,16 +741,36 @@ impl ObjectStore for SqliteObjectStore {
              FROM loose_objects
              WHERE repo_id = ?1",
         )?;
+        // The oid column only ever receives `Oid::as_str()` via
+        // write_loose / ingest_pack, so every row should round-trip
+        // back to a valid Oid. A failure here means storage
+        // corruption (FS edit out-of-band, SQLite bit-rot) — log +
+        // skip rather than panic so gc keeps making progress on
+        // the surviving rows.
         let rows = stmt.query_map(rusqlite::params![repo_id.as_str()], |row| {
-            Ok(LooseInfo {
-                oid: row.get(0)?,
-                size: row.get::<_, i64>(1)? as u64,
-                created_secs: row.get(2)?,
-            })
+            let oid_hex: String = row.get(0)?;
+            let size: u64 = row.get::<_, i64>(1)? as u64;
+            let created_secs: i64 = row.get(2)?;
+            Ok((oid_hex, size, created_secs))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (oid_hex, size, created_secs) = r?;
+            let oid = match Oid::try_from(oid_hex.as_str()) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(
+                        oid = %oid_hex, error = %e,
+                        "sqlite list_loose: skipping row with malformed oid"
+                    );
+                    continue;
+                }
+            };
+            out.push(LooseInfo {
+                oid,
+                size,
+                created_secs,
+            });
         }
         Ok(out)
     }

@@ -103,7 +103,7 @@ pub async fn authorize_git(
         .lookup(&token_typed)
         .await?
         .ok_or(Error::UnauthorizedBasic)?;
-    if record.repo_id != repo_id {
+    if record.repo_id.as_str() != repo_id {
         return Err(Error::Forbidden("token not valid for this repo"));
     }
     if required == Scope::Write && record.scope != Scope::Write {

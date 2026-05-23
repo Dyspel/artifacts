@@ -403,9 +403,9 @@ fn sqlite_list_loose_is_repo_scoped() {
     let listed_a = store.list_loose(&ra).unwrap();
     let listed_b = store.list_loose(&rb).unwrap();
     assert_eq!(listed_a.len(), 1);
-    assert_eq!(listed_a[0].oid, oid_a.as_str());
+    assert_eq!(listed_a[0].oid, oid_a);
     assert_eq!(listed_b.len(), 1);
-    assert_eq!(listed_b[0].oid, oid_b.as_str());
+    assert_eq!(listed_b[0].oid, oid_b);
 }
 
 /// SQLite-specific: migrations are idempotent. Open the same

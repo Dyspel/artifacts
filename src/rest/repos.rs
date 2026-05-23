@@ -338,7 +338,10 @@ pub async fn list_repos(
     let summaries: Vec<AdminRepoSummary> = rows
         .into_iter()
         .map(|r| AdminRepoSummary {
-            source_id: state.data.alternates_cache.lookup(&repos_dir, &r.id),
+            source_id: state
+                .data
+                .alternates_cache
+                .lookup(&repos_dir, r.id.as_str()),
             id: r.id,
             owner: r.owner,
             created_at: r.created_at,

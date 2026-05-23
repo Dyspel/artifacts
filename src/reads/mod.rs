@@ -71,9 +71,9 @@ async fn authorize_read(
 
 #[derive(Debug, Serialize)]
 pub struct RepoDetail {
-    pub id: String,
+    pub id: crate::ids::RepoId,
     /// `None` for admin-created repos.
-    pub owner: Option<String>,
+    pub owner: Option<crate::ids::Subject>,
     #[serde(rename = "createdAt")]
     pub created_at: i64,
     #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]

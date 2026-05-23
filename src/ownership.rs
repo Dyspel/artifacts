@@ -49,7 +49,7 @@ pub trait OwnershipStore: Send + Sync {
     /// - `Ok(Some(Some(subject)))` — user-owned
     /// - `Ok(Some(None))` — admin-created; no user owner
     /// - `Ok(None)` — no ownership record at all (legacy / pre-ownership)
-    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<String>>>;
+    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<Subject>>>;
 
     /// Remove the ownership record (called after a repo is deleted).
     /// Idempotent; returning Ok when the row didn't exist is fine.
@@ -144,8 +144,8 @@ pub trait OwnershipStore: Send + Sync {
 /// repos (the owner_subject column is NULL).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RepoRow {
-    pub id: String,
-    pub owner: Option<String>,
+    pub id: RepoId,
+    pub owner: Option<Subject>,
     pub created_at: i64,
 }
 
@@ -189,6 +189,48 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Decode the three columns of `repos` into a typed `RepoRow`.
+///
+/// Both the `id` and `owner_subject` columns are populated via
+/// `RepoId::as_str()` / `Subject::as_str()` at insert time, so the
+/// reconstruction here is the symmetric `try_from` and should never
+/// fail under normal operation. If the row's id doesn't satisfy the
+/// `RepoId` contract we treat that as corruption (FS edit, bit-rot,
+/// pre-newtype legacy row written before validation existed) and
+/// log + skip — the alternative is poisoning every list call on a
+/// single bad row. `owner_subject` is gentler: a non-Subject string
+/// degrades the row to "admin-owned" rather than dropping it, because
+/// `Subject`'s validation is permissive enough that a malformed entry
+/// is almost certainly someone else's contract — admin tokens still
+/// surface in the listing.
+fn row_to_repo_row(id: String, owner: Option<String>, created_at: i64) -> Option<RepoRow> {
+    let id_typed = match RepoId::try_from(id.as_str()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(id = %id, error = %e, "ownership: skipping row with malformed id");
+            return None;
+        }
+    };
+    let owner_typed = match owner.as_deref() {
+        Some(s) => match Subject::try_from(s) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                tracing::warn!(
+                    id = %id, owner = %s, error = %e,
+                    "ownership: row has malformed owner; surfacing as admin-owned"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    Some(RepoRow {
+        id: id_typed,
+        owner: owner_typed,
+        created_at,
+    })
+}
+
 #[async_trait]
 impl OwnershipStore for SqliteOwnershipStore {
     async fn record_owner(&self, repo_id: &RepoId, owner: Option<&Subject>) -> Result<()> {
@@ -201,15 +243,28 @@ impl OwnershipStore for SqliteOwnershipStore {
         Ok(())
     }
 
-    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<String>>> {
+    async fn get_owner(&self, repo_id: &RepoId) -> Result<Option<Option<Subject>>> {
         let conn = crate::metrics::get_pooled(&self.conn, "ownership")?;
         let mut stmt = conn.prepare_cached("SELECT owner_subject FROM repos WHERE id = ?1")?;
         let mut rows = stmt.query(params![repo_id.as_str()])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        // SQLite nullable — returns Option<String> for an i64-nullable column.
-        let owner: Option<String> = row.get(0)?;
+        // SQLite nullable — returns Option<String> for a nullable column.
+        let owner_raw: Option<String> = row.get(0)?;
+        let owner = match owner_raw.as_deref() {
+            Some(s) => match Subject::try_from(s) {
+                Ok(sub) => Some(sub),
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo_id, owner = %s, error = %e,
+                        "ownership: stored owner_subject malformed; treating as admin-owned"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Some(owner))
     }
 
@@ -237,15 +292,17 @@ impl OwnershipStore for SqliteOwnershipStore {
              ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(RepoRow {
-                id: row.get(0)?,
-                owner: row.get(1)?,
-                created_at: row.get(2)?,
-            })
+            let id: String = row.get(0)?;
+            let owner: Option<String> = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            Ok((id, owner, created_at))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (id, owner, created_at) = r?;
+            if let Some(rr) = row_to_repo_row(id, owner, created_at) {
+                out.push(rr);
+            }
         }
         Ok(out)
     }
@@ -259,15 +316,17 @@ impl OwnershipStore for SqliteOwnershipStore {
              LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
-            Ok(RepoRow {
-                id: row.get(0)?,
-                owner: row.get(1)?,
-                created_at: row.get(2)?,
-            })
+            let id: String = row.get(0)?;
+            let owner: Option<String> = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            Ok((id, owner, created_at))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (id, owner, created_at) = r?;
+            if let Some(rr) = row_to_repo_row(id, owner, created_at) {
+                out.push(rr);
+            }
         }
         Ok(out)
     }
@@ -300,15 +359,17 @@ impl OwnershipStore for SqliteOwnershipStore {
              ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![subject.as_str()], |row| {
-            Ok(RepoRow {
-                id: row.get(0)?,
-                owner: row.get(1)?,
-                created_at: row.get(2)?,
-            })
+            let id: String = row.get(0)?;
+            let owner: Option<String> = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            Ok((id, owner, created_at))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (id, owner, created_at) = r?;
+            if let Some(rr) = row_to_repo_row(id, owner, created_at) {
+                out.push(rr);
+            }
         }
         Ok(out)
     }
@@ -330,16 +391,18 @@ impl OwnershipStore for SqliteOwnershipStore {
         let rows = stmt.query_map(
             params![subject.as_str(), limit as i64, offset as i64],
             |row| {
-                Ok(RepoRow {
-                    id: row.get(0)?,
-                    owner: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
+                let id: String = row.get(0)?;
+                let owner: Option<String> = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                Ok((id, owner, created_at))
             },
         )?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            let (id, owner, created_at) = r?;
+            if let Some(rr) = row_to_repo_row(id, owner, created_at) {
+                out.push(rr);
+            }
         }
         Ok(out)
     }
@@ -352,11 +415,10 @@ impl OwnershipStore for SqliteOwnershipStore {
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        Ok(Some(RepoRow {
-            id: row.get(0)?,
-            owner: row.get(1)?,
-            created_at: row.get(2)?,
-        }))
+        let id: String = row.get(0)?;
+        let owner: Option<String> = row.get(1)?;
+        let created_at: i64 = row.get(2)?;
+        Ok(row_to_repo_row(id, owner, created_at))
     }
 }
 
@@ -444,7 +506,7 @@ pub async fn enforce_owner(
         .ok_or(Error::Forbidden("non-admin principal has no subject"))?;
     let repo_id_typed = RepoId::try_from(repo_id)?;
     match ownership.get_owner(&repo_id_typed).await? {
-        Some(Some(owner)) if owner == caller => Ok(()),
+        Some(Some(owner)) if owner.as_str() == caller => Ok(()),
         Some(Some(_)) => Err(Error::Forbidden("not the repo owner")),
         // Admin-created repo, or no record at all: non-admin can't touch.
         Some(None) | None => Err(Error::Forbidden("repo is admin-owned or unregistered")),
@@ -480,7 +542,10 @@ mod tests {
             .await
             .unwrap();
         let o = store.get_owner(&rid("repo1")).await.unwrap();
-        assert_eq!(o, Some(Some("user-a".to_string())));
+        assert_eq!(
+            o.as_ref().and_then(|x| x.as_ref()).map(|s| s.as_str()),
+            Some("user-a")
+        );
     }
 
     #[tokio::test]
@@ -681,8 +746,8 @@ mod tests {
             .await
             .unwrap()
             .expect("row present");
-        assert_eq!(row.id, "repo1");
-        assert_eq!(row.owner.as_deref(), Some("alice"));
+        assert_eq!(row.id.as_str(), "repo1");
+        assert_eq!(row.owner.as_ref().map(|s| s.as_str()), Some("alice"));
         assert!(row.created_at > 0);
     }
 
@@ -717,8 +782,8 @@ mod tests {
             .unwrap();
         let rows = store.list_all().await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].id, "newr");
-        assert_eq!(rows[1].id, "oldr");
+        assert_eq!(rows[0].id.as_str(), "newr");
+        assert_eq!(rows[1].id.as_str(), "oldr");
     }
 
     #[tokio::test]
@@ -800,7 +865,7 @@ mod tests {
         store.record_owner(&rid("admin-repo"), None).await.unwrap();
         let rows = store.list_all().await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "admin-repo");
+        assert_eq!(rows[0].id.as_str(), "admin-repo");
         assert!(rows[0].owner.is_none());
     }
 
@@ -855,8 +920,8 @@ mod tests {
             .unwrap();
         let rows = store.list_by_owner(&sub("alice")).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].id, "newr");
-        assert_eq!(rows[1].id, "oldr");
+        assert_eq!(rows[0].id.as_str(), "newr");
+        assert_eq!(rows[1].id.as_str(), "oldr");
     }
 
     #[tokio::test]
@@ -893,7 +958,7 @@ mod tests {
             }
             for row in &page {
                 assert!(
-                    seen.insert(row.id.clone()),
+                    seen.insert(row.id.as_str().to_owned()),
                     "row {} appeared on more than one page (offset bug?)",
                     row.id,
                 );
@@ -948,9 +1013,13 @@ mod tests {
                 break;
             }
             for row in &page {
-                assert!(row.id.starts_with("alice-"), "bob's row leaked: {}", row.id);
                 assert!(
-                    seen.insert(row.id.clone()),
+                    row.id.as_str().starts_with("alice-"),
+                    "bob's row leaked: {}",
+                    row.id
+                );
+                assert!(
+                    seen.insert(row.id.as_str().to_owned()),
                     "row {} appeared on more than one page",
                     row.id,
                 );
@@ -1027,7 +1096,7 @@ mod tests {
                         }
                         for row in &page {
                             prop_assert!(
-                                seen.insert(row.id.clone()),
+                                seen.insert(row.id.as_str().to_owned()),
                                 "duplicate row across pages: {}",
                                 row.id,
                             );

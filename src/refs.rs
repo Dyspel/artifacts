@@ -33,21 +33,21 @@ pub enum CasOutcome {
     Conflict {
         /// The ref's current value, if we could read it back. Lets the
         /// caller return a useful 409 body without a second round trip.
-        current: Option<String>,
+        current: Option<Oid>,
     },
 }
 
 /// One row in a ref-listing response (the kind ls-refs produces).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefEntry {
-    pub name: String,
-    pub oid: String,
+    pub name: RefName,
+    pub oid: Oid,
     /// For annotated tags: the OID the tag dereferences to. `None` for
     /// branches, lightweight tags, and (today) all our native enumerations
     /// — peel resolution requires reading the tag object, which the
     /// FS-native lister doesn't do yet. Filled in by the fallback path
     /// when the upload-pack subprocess produces it.
-    pub peeled: Option<String>,
+    pub peeled: Option<Oid>,
 }
 
 /// HEAD's three possible states. Distinguishing them is the whole job of
@@ -57,18 +57,18 @@ pub struct RefEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadState {
     /// `ref: refs/heads/main` and that ref resolves to an OID.
-    Symbolic { target: String, oid: String },
+    Symbolic { target: RefName, oid: Oid },
     /// `ref: refs/heads/main` but the target has no commits yet.
-    Unborn { target: String },
+    Unborn { target: RefName },
     /// HEAD is a raw OID (detached).
-    Detached { oid: String },
+    Detached { oid: Oid },
 }
 
 /// Strongly-consistent per-repo ref CAS. The trait is the whole interface.
 #[async_trait]
 pub trait RefStore: Send + Sync {
     /// Read a ref by full name (e.g. `refs/heads/main`). `None` = absent.
-    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>>;
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<Oid>>;
 
     /// Atomically set `ref_name` to `new_sha`.
     ///
@@ -155,7 +155,7 @@ impl FsRefStore {
 
 #[async_trait]
 impl RefStore for FsRefStore {
-    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>> {
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<Oid>> {
         let git_dir = self.repo_path(repo_id);
         let (rc, stdout, _) = crate::git_cmd::run_git(
             &git_dir,
@@ -169,9 +169,21 @@ impl RefStore for FsRefStore {
         }
         let s = String::from_utf8(stdout)?.trim().to_string();
         if s.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(s))
+            return Ok(None);
+        }
+        // rev-parse emits a 40-char SHA-1. A non-conforming stdout
+        // means git itself returned something we don't understand —
+        // log + return None so callers see "ref absent" rather than
+        // a corruption surface.
+        match Oid::try_from(s.as_str()) {
+            Ok(o) => Ok(Some(o)),
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo_id, ref_name = %ref_name, stdout = %s, error = %e,
+                    "rev-parse stdout was not a valid Oid"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -301,8 +313,10 @@ pub struct MemRefStore {
 #[cfg(test)]
 #[derive(Default)]
 struct MemState {
-    /// `(repo_id, ref_name) -> oid`.
-    refs: std::collections::HashMap<(String, String), String>,
+    /// `(repo_id, ref_name) -> oid`. Keys stay String for the
+    /// HashMap-borrow ergonomics; the typed `Oid` value is the
+    /// contract the trait surface exposes.
+    refs: std::collections::HashMap<(String, String), Oid>,
     /// `repo_id -> head_state`. Defaults to the same `Unborn { target:
     /// "refs/heads/main" }` that `git init --bare --initial-branch=main`
     /// produces, so callers can treat MemRefStore as drop-in for a
@@ -337,7 +351,7 @@ impl MemRefStore {
 #[cfg(test)]
 #[async_trait]
 impl RefStore for MemRefStore {
-    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<String>> {
+    async fn read(&self, repo_id: &RepoId, ref_name: &RefName) -> Result<Option<Oid>> {
         let g = self.lock();
         Ok(g.refs
             .get(&(repo_id.to_string(), ref_name.to_string()))
@@ -354,7 +368,7 @@ impl RefStore for MemRefStore {
         let mut g = self.lock();
         let key = (repo_id.to_string(), ref_name.to_string());
         let current = g.refs.get(&key).cloned();
-        let matches = match (expected.map(|o| o.as_str()), current.as_deref()) {
+        let matches = match (expected, current.as_ref()) {
             (None, None) => true,
             (Some(e), Some(c)) => e == c,
             _ => false,
@@ -362,7 +376,7 @@ impl RefStore for MemRefStore {
         if !matches {
             return Ok(CasOutcome::Conflict { current });
         }
-        g.refs.insert(key, new_sha.to_string());
+        g.refs.insert(key, new_sha.clone());
         Ok(CasOutcome::Updated)
     }
 
@@ -375,13 +389,20 @@ impl RefStore for MemRefStore {
             .filter(|((_, name), _)| {
                 prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p))
             })
-            .map(|((_, name), oid)| RefEntry {
-                name: name.clone(),
-                oid: oid.clone(),
-                peeled: None,
+            .filter_map(|((_, name), oid)| {
+                // MemRefStore is test-only; inserts go through cas_update
+                // which already had a typed `ref_name`. The map's String
+                // key was constructed via `ref_name.to_string()`, so
+                // try_from is the symmetric reconstruction.
+                let n = RefName::try_from(name.as_str()).ok()?;
+                Some(RefEntry {
+                    name: n,
+                    oid: oid.clone(),
+                    peeled: None,
+                })
             })
             .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         Ok(out)
     }
 
@@ -391,7 +412,8 @@ impl RefStore for MemRefStore {
             .get(repo_id.as_str())
             .cloned()
             .unwrap_or_else(|| HeadState::Unborn {
-                target: "refs/heads/main".to_string(),
+                target: RefName::try_from("refs/heads/main")
+                    .expect("'refs/heads/main' satisfies RefName contract"),
             }))
     }
 
@@ -404,7 +426,7 @@ impl RefStore for MemRefStore {
         let mut g = self.lock();
         let key = (repo_id.to_string(), ref_name.to_string());
         let current = g.refs.get(&key).cloned();
-        let matches = match (expected.map(|o| o.as_str()), current.as_deref()) {
+        let matches = match (expected, current.as_ref()) {
             (None, _) => true, // unconditional delete
             (Some(e), Some(c)) => e == c,
             (Some(_), None) => false,
@@ -448,19 +470,31 @@ fn enumerate_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
             if let Some(peel) = line.strip_prefix('^') {
                 if let Some(name) = &last_name {
                     if let Some(e) = by_name.get_mut(name) {
-                        e.peeled = Some(peel.trim().to_string());
+                        // packed-refs is git-emitted, so a non-Oid
+                        // here means corruption. Drop the peel
+                        // rather than fail enumeration.
+                        if let Ok(o) = Oid::try_from(peel.trim()) {
+                            e.peeled = Some(o);
+                        }
                     }
                 }
                 continue;
             }
             // `<sha> <name>`
             if let Some((sha, name)) = line.split_once(' ') {
+                let (Ok(name_typed), Ok(oid_typed)) = (RefName::try_from(name), Oid::try_from(sha))
+                else {
+                    // Skip lines whose oid or name don't satisfy our
+                    // newtype contracts. packed-refs is small + git-emitted,
+                    // so this is corruption, not user input.
+                    continue;
+                };
                 let entry = RefEntry {
-                    name: name.to_string(),
-                    oid: sha.to_string(),
+                    name: name_typed,
+                    oid: oid_typed,
                     peeled: None,
                 };
-                by_name.insert(entry.name.clone(), entry);
+                by_name.insert(name.to_string(), entry);
                 last_name = Some(name.to_string());
             }
         }
@@ -485,13 +519,14 @@ fn enumerate_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                let oid = s.trim().to_string();
-                // 40-hex check; symbolic-ref files (`ref: ...`) under
-                // refs/ are theoretically possible but not produced by
-                // anything we run — skip them defensively.
-                if oid.len() != 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+                let oid_hex = s.trim().to_string();
+                // 40-hex check via Oid::try_from; symbolic-ref files
+                // (`ref: ...`) under refs/ are theoretically possible
+                // but not produced by anything we run — skip them
+                // defensively.
+                let Ok(oid) = Oid::try_from(oid_hex.as_str()) else {
                     continue;
-                }
+                };
                 let rel = match path.strip_prefix(git_dir) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -499,13 +534,16 @@ fn enumerate_refs(git_dir: &Path) -> Result<Vec<RefEntry>> {
                 // Build the full ref name with forward slashes regardless
                 // of platform. We control the format on creation, so
                 // backslashes shouldn't appear, but be explicit.
-                let name = rel
+                let name_str = rel
                     .components()
                     .filter_map(|c| c.as_os_str().to_str())
                     .collect::<Vec<_>>()
                     .join("/");
+                let Ok(name) = RefName::try_from(name_str.as_str()) else {
+                    continue;
+                };
                 by_name.insert(
-                    name.clone(),
+                    name_str,
                     RefEntry {
                         name,
                         oid,
@@ -532,13 +570,13 @@ fn head_state(git_dir: &Path) -> Result<HeadState> {
     let head_path = git_dir.join("HEAD");
     let raw = std::fs::read_to_string(&head_path)?;
     let trimmed = raw.trim();
-    if let Some(target) = trimmed.strip_prefix("ref: ") {
-        let target = target.trim().to_string();
+    if let Some(target_raw) = trimmed.strip_prefix("ref: ") {
+        let target_str = target_raw.trim();
+        let target = RefName::try_from(target_str)?;
         // Try the loose ref file first.
-        let loose = git_dir.join(&target);
+        let loose = git_dir.join(target_str);
         if let Ok(s) = std::fs::read_to_string(&loose) {
-            let oid = s.trim().to_string();
-            if oid.len() == 40 {
+            if let Ok(oid) = Oid::try_from(s.trim()) {
                 return Ok(HeadState::Symbolic { target, oid });
             }
         }
@@ -550,20 +588,17 @@ fn head_state(git_dir: &Path) -> Result<HeadState> {
                     continue;
                 }
                 if let Some((sha, name)) = line.split_once(' ') {
-                    if name == target {
-                        return Ok(HeadState::Symbolic {
-                            target,
-                            oid: sha.to_string(),
-                        });
+                    if name == target_str {
+                        if let Ok(oid) = Oid::try_from(sha) {
+                            return Ok(HeadState::Symbolic { target, oid });
+                        }
                     }
                 }
             }
         }
         Ok(HeadState::Unborn { target })
-    } else if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(HeadState::Detached {
-            oid: trimmed.to_string(),
-        })
+    } else if let Ok(oid) = Oid::try_from(trimmed) {
+        Ok(HeadState::Detached { oid })
     } else {
         Err(Error::Other(anyhow::anyhow!(
             "unrecognized HEAD format: {trimmed:?}"
@@ -646,7 +681,7 @@ mod tests {
             .unwrap();
         assert_eq!(out, CasOutcome::Updated);
         let r = refs.read(&repo, &rn("refs/test/t")).await.unwrap();
-        assert_eq!(r.as_deref(), Some(sha.as_str()));
+        assert_eq!(r.as_ref(), Some(&sha));
     }
 
     /// Conformance: any `RefStore` impl must satisfy the same CAS
@@ -683,7 +718,7 @@ mod tests {
                 .unwrap()
             {
                 CasOutcome::Conflict { current } => {
-                    assert_eq!(current.as_deref(), Some(oid2.as_str()),);
+                    assert_eq!(current.as_ref(), Some(&oid2),);
                 }
                 other => panic!("expected Conflict, got {other:?}"),
             }
@@ -703,7 +738,7 @@ mod tests {
         async fn read_head_defaults_to_unborn_main() {
             let s = MemRefStore::new();
             match s.read_head(&rid("rtst")).await.unwrap() {
-                HeadState::Unborn { target } => assert_eq!(target, "refs/heads/main"),
+                HeadState::Unborn { target } => assert_eq!(target.as_str(), "refs/heads/main"),
                 other => panic!("expected Unborn, got {other:?}"),
             }
         }
@@ -721,7 +756,7 @@ mod tests {
                 .unwrap();
             let heads = s.list(&repo, &["refs/heads/".into()]).await.unwrap();
             assert_eq!(heads.len(), 1);
-            assert_eq!(heads[0].name, "refs/heads/main");
+            assert_eq!(heads[0].name.as_str(), "refs/heads/main");
         }
 
         #[tokio::test]
@@ -754,7 +789,7 @@ mod tests {
             // return current.
             match s.cas_delete(&repo, &rname, Some(&oid_old)).await.unwrap() {
                 CasOutcome::Conflict { current } => {
-                    assert_eq!(current.as_deref(), Some(oid_new.as_str()));
+                    assert_eq!(current.as_ref(), Some(&oid_new));
                 }
                 other => panic!("expected Conflict, got {other:?}"),
             }
@@ -852,7 +887,7 @@ mod tests {
         // but the ref doesn't exist yet — that's "unborn".
         let st = refs.read_head(&repo).await.unwrap();
         match st {
-            HeadState::Unborn { target } => assert_eq!(target, "refs/heads/main"),
+            HeadState::Unborn { target } => assert_eq!(target.as_str(), "refs/heads/main"),
             other => panic!("expected Unborn, got {other:?}"),
         }
     }
@@ -873,8 +908,8 @@ mod tests {
         let st = refs.read_head(&repo).await.unwrap();
         match st {
             HeadState::Symbolic { target, oid } => {
-                assert_eq!(target, "refs/test/x");
-                assert_eq!(oid, s.as_str());
+                assert_eq!(target.as_str(), "refs/test/x");
+                assert_eq!(oid.as_str(), s.as_str());
             }
             other => panic!("expected Symbolic, got {other:?}"),
         }
@@ -925,10 +960,13 @@ mod tests {
         let all = refs.list(&repo, &[]).await.unwrap();
         let entry = all
             .iter()
-            .find(|e| e.name == "refs/tags/annot")
+            .find(|e| e.name.as_str() == "refs/tags/annot")
             .expect("annotated tag missing");
-        assert_eq!(entry.oid, tag_oid);
-        assert_eq!(entry.peeled.as_deref(), Some(peeled_oid.as_str()));
+        assert_eq!(entry.oid.as_str(), tag_oid.as_str());
+        assert_eq!(
+            entry.peeled.as_ref().map(|o| o.as_str()),
+            Some(peeled_oid.as_str())
+        );
     }
 
     #[tokio::test]
@@ -959,7 +997,7 @@ mod tests {
             .unwrap()
         {
             CasOutcome::Conflict { current } => {
-                assert_eq!(current.as_deref(), Some(s2.as_str()));
+                assert_eq!(current.as_ref(), Some(&s2));
             }
             other => panic!("wanted conflict, got {other:?}"),
         }

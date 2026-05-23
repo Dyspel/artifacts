@@ -211,7 +211,7 @@ pub async fn merge_branches(
             CasOutcome::Conflict { current } => {
                 return Err(Error::RefConflict {
                     branch: body.target_branch,
-                    expected: target_sha,
+                    expected: target_sha_typed,
                     current,
                 });
             }
@@ -312,7 +312,7 @@ pub async fn merge_branches(
             );
             return Err(Error::RefConflict {
                 branch: body.target_branch,
-                expected: Some(target_sha),
+                expected: Some(target_sha_typed),
                 current,
             });
         }

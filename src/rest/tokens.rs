@@ -28,7 +28,7 @@ pub struct MintTokenBody {
 
 #[derive(Debug, Serialize)]
 pub struct TokenMinted {
-    pub token: String,
+    pub token: crate::ids::Token,
     pub remote: String,
     /// Unix epoch seconds. `null` if the token doesn't expire.
     #[serde(rename = "expiresAt")]
@@ -133,7 +133,7 @@ pub async fn revoke_token(
         .await
         .ok()
         .flatten()
-        .map(|rec| rec.repo_id.clone());
+        .map(|rec| rec.repo_id.as_str().to_owned());
 
     if !matches!(principal, crate::auth::Principal::Admin) {
         // Look up the token's bound repo and require ownership. Any
@@ -178,7 +178,7 @@ pub struct RotateTokenResponse {
     pub revoked: u64,
     /// The fresh token, the same way `mint_token` would surface it.
     /// Caller stores it — we never hold the raw form server-side.
-    pub token: String,
+    pub token: crate::ids::Token,
     pub remote: String,
 }
 

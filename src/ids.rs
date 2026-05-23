@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 /// `crate::storage::validate_repo_id` enforces: 1–63 chars of
 /// `[A-Za-z0-9_-]`, no path separators, no leading dash, no `.git`
 /// suffix collisions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepoId(String);
 
@@ -94,7 +94,7 @@ impl TryFrom<String> for RepoId {
 }
 
 /// A git object id — exactly 40 lowercase hex characters (SHA-1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Oid(String);
 
@@ -144,7 +144,7 @@ impl TryFrom<String> for Oid {
 /// Validated against git's check-ref-format rules — no whitespace,
 /// no `..`, no `@{`, no control characters, components separated by
 /// `/` with no empty parts.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RefName(String);
 
@@ -291,7 +291,7 @@ impl TryFrom<String> for Token {
 /// ≤ 256 chars; everything else is allowed because the issuing
 /// identity provider has its own conventions we don't want to
 /// second-guess.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Subject(String);
 

@@ -281,7 +281,7 @@ pub async fn create_commit(
             );
             return Err(Error::RefConflict {
                 branch: body.branch,
-                expected: body.parent.clone(),
+                expected: parent_typed,
                 current,
             });
         }
