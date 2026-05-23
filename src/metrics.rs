@@ -211,6 +211,14 @@ pub(crate) fn path_label_for(matched: Option<&str>, raw_uri: &str) -> String {
 /// On pool-exhaustion / r2d2 error, the error is mapped into
 /// `crate::error::Error::Other` so the trait-level `Result` types
 /// don't have to carry an `r2d2` import.
+// F4 (Rust type-system discipline) considered making this generic
+// over a marker-type-based store label (`fn get_pooled<L: StoreLabel>(...)`)
+// to resolve the histogram label-key at compile time. Bench result on
+// 2026-05-23 host: the bench_concurrent.sh noise floor for p99 across
+// 3 runs was ±40 ms — far larger than the ~10 ns per-call indirection
+// the marker-type rewrite would save. Reverted before commit per the
+// goal's "revert any change that doesn't show measurable p99
+// improvement" clause. Keeping the `&'static str` shape.
 pub(crate) fn get_pooled(
     pool: &crate::db_migrate::DbPool,
     store: &'static str,
