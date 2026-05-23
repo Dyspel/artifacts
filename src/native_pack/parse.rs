@@ -107,19 +107,19 @@ pub(crate) enum ParsedKind {
 /// rationale.
 pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
     if pack.len() < 12 {
-        return Err(Error::Other(anyhow::anyhow!(
+        return Err(Error::PackParse(format!(
             "pack too short for header: {} bytes",
             pack.len()
         )));
     }
     if &pack[..4] != b"PACK" {
-        return Err(Error::Other(anyhow::anyhow!(
-            "missing PACK magic at offset 0"
-        )));
+        return Err(Error::PackParse(
+            "missing PACK magic at offset 0".to_string(),
+        ));
     }
     let version = u32::from_be_bytes(pack[4..8].try_into().unwrap());
     if version != 2 {
-        return Err(Error::Other(anyhow::anyhow!(
+        return Err(Error::PackParse(format!(
             "unsupported pack version: {version}"
         )));
     }
@@ -131,9 +131,7 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
     for i in 0..n_objects {
         let entry_offset = cursor;
         let (kind_byte, _size, header_len) = parse_entry_header(&pack[cursor..]).map_err(|e| {
-            Error::Other(anyhow::anyhow!(
-                "entry {i} at offset {cursor}: header parse: {e}"
-            ))
+            Error::PackParse(format!("entry {i} at offset {cursor}: header parse: {e}"))
         })?;
         cursor += header_len;
 
@@ -144,7 +142,7 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
             OBJ_TAG => ParsedKind::Direct(ObjectKind::Tag),
             OBJ_REF_DELTA => {
                 if pack.len() < cursor + 20 {
-                    return Err(Error::Other(anyhow::anyhow!(
+                    return Err(Error::PackParse(format!(
                         "entry {i}: truncated REF_DELTA base OID at offset {cursor}"
                     )));
                 }
@@ -156,7 +154,7 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
             OBJ_OFS_DELTA => {
                 let (base_offset_delta, consumed) = parse_ofs_delta_offset(&pack[cursor..])
                     .map_err(|e| {
-                        Error::Other(anyhow::anyhow!(
+                        Error::PackParse(format!(
                             "entry {i}: OFS_DELTA base-offset parse at {cursor}: {e}"
                         ))
                     })?;
@@ -164,14 +162,14 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
                 ParsedKind::OfsDelta { base_offset_delta }
             }
             other => {
-                return Err(Error::Other(anyhow::anyhow!(
+                return Err(Error::PackParse(format!(
                     "entry {i}: unknown object type {other}"
                 )));
             }
         };
 
         let (decompressed, compressed_len) = decompress_zlib(&pack[cursor..]).map_err(|e| {
-            Error::Other(anyhow::anyhow!(
+            Error::PackParse(format!(
                 "entry {i} at offset {entry_offset}: zlib decompress: {e}"
             ))
         })?;
@@ -192,7 +190,7 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
 /// pre-applied size for deltas — the spec uses the same field).
 fn parse_entry_header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
     if bytes.is_empty() {
-        return Err(Error::Other(anyhow::anyhow!("empty header buffer")));
+        return Err(Error::PackParse("empty header buffer".to_string()));
     }
     let first = bytes[0];
     let kind = (first >> 4) & 0b0111;
@@ -202,18 +200,18 @@ fn parse_entry_header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
     let mut byte = first;
     while byte & 0x80 != 0 {
         if idx >= bytes.len() {
-            return Err(Error::Other(anyhow::anyhow!(
-                "truncated entry header (size continuation)"
-            )));
+            return Err(Error::PackParse(
+                "truncated entry header (size continuation)".to_string(),
+            ));
         }
         byte = bytes[idx];
         idx += 1;
         size |= u64::from(byte & 0x7f) << shift;
         shift += 7;
         if shift > 63 {
-            return Err(Error::Other(anyhow::anyhow!(
-                "entry header size overflows u64"
-            )));
+            return Err(Error::PackParse(
+                "entry header size overflows u64".to_string(),
+            ));
         }
     }
     Ok((kind, size, idx))
@@ -229,7 +227,7 @@ fn parse_entry_header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
 /// distinct byte streams can't decode to the same number).
 fn parse_ofs_delta_offset(bytes: &[u8]) -> Result<(u64, usize)> {
     if bytes.is_empty() {
-        return Err(Error::Other(anyhow::anyhow!("empty OFS_DELTA buffer")));
+        return Err(Error::PackParse("empty OFS_DELTA buffer".to_string()));
     }
     let mut idx = 0usize;
     let mut byte = bytes[idx];
@@ -237,16 +235,16 @@ fn parse_ofs_delta_offset(bytes: &[u8]) -> Result<(u64, usize)> {
     let mut value = u64::from(byte & 0x7f);
     while byte & 0x80 != 0 {
         if idx >= bytes.len() {
-            return Err(Error::Other(anyhow::anyhow!(
-                "truncated OFS_DELTA offset (continuation)"
-            )));
+            return Err(Error::PackParse(
+                "truncated OFS_DELTA offset (continuation)".to_string(),
+            ));
         }
         byte = bytes[idx];
         idx += 1;
         value = value
             .checked_add(1)
             .and_then(|v| v.checked_shl(7))
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("OFS_DELTA offset overflow")))?;
+            .ok_or_else(|| Error::PackParse("OFS_DELTA offset overflow".to_string()))?;
         value |= u64::from(byte & 0x7f);
     }
     Ok((value, idx))
@@ -271,7 +269,7 @@ fn decompress_zlib(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
         }
         let status = decoder
             .decompress(buf, &mut out[out_before..], FlushDecompress::None)
-            .map_err(|e| Error::Other(anyhow::anyhow!("zlib: {e}")))?;
+            .map_err(|e| Error::PackParse(format!("zlib: {e}")))?;
         match status {
             Status::Ok | Status::BufError => {
                 // BufError means out buffer is full; loop again with
@@ -280,9 +278,9 @@ fn decompress_zlib(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
                 let progressed = decoder.total_in() as usize > in_before
                     || decoder.total_out() as usize > out_before;
                 if !progressed {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "zlib stalled (no progress on Ok/BufError)"
-                    )));
+                    return Err(Error::PackParse(
+                        "zlib stalled (no progress on Ok/BufError)".to_string(),
+                    ));
                 }
             }
             Status::StreamEnd => break,
@@ -324,11 +322,11 @@ pub(crate) fn loose_format_bytes(kind: ObjectKind, payload: &[u8]) -> Result<Vec
     {
         let mut enc = ZlibEncoder::new(&mut buf, Compression::default());
         write!(enc, "{} {}\0", kind_str(kind), payload.len())
-            .map_err(|e| Error::Other(anyhow::anyhow!("loose header write: {e}")))?;
+            .map_err(|e| Error::PackParse(format!("loose header write: {e}")))?;
         enc.write_all(payload)
-            .map_err(|e| Error::Other(anyhow::anyhow!("loose payload write: {e}")))?;
+            .map_err(|e| Error::PackParse(format!("loose payload write: {e}")))?;
         enc.finish()
-            .map_err(|e| Error::Other(anyhow::anyhow!("loose zlib finish: {e}")))?;
+            .map_err(|e| Error::PackParse(format!("loose zlib finish: {e}")))?;
     }
     Ok(buf)
 }
@@ -362,7 +360,7 @@ pub(crate) fn store_non_delta_entries<S: ObjectStore + ?Sized>(
                 count += 1;
             }
             ParsedKind::RefDelta { .. } | ParsedKind::OfsDelta { .. } => {
-                return Err(Error::Other(anyhow::anyhow!(
+                return Err(Error::PackParse(format!(
                     "entry {i}: delta entries not yet supported (D2/D3)"
                 )));
             }
@@ -402,7 +400,7 @@ fn read_delta_varint(bytes: &[u8], mut idx: usize) -> Result<(u64, usize)> {
     let mut shift: u32 = 0;
     loop {
         if idx >= bytes.len() {
-            return Err(Error::Other(anyhow::anyhow!(
+            return Err(Error::PackParse(format!(
                 "delta varint: truncated at offset {idx}"
             )));
         }
@@ -414,7 +412,7 @@ fn read_delta_varint(bytes: &[u8], mut idx: usize) -> Result<(u64, usize)> {
         }
         shift += 7;
         if shift > 63 {
-            return Err(Error::Other(anyhow::anyhow!("delta varint: overflows u64")));
+            return Err(Error::PackParse("delta varint: overflows u64".to_string()));
         }
     }
 }
@@ -425,7 +423,7 @@ fn read_delta_varint(bytes: &[u8], mut idx: usize) -> Result<(u64, usize)> {
 pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let (source_size, mut idx) = read_delta_varint(delta, 0)?;
     if source_size != base.len() as u64 {
-        return Err(Error::Other(anyhow::anyhow!(
+        return Err(Error::PackParse(format!(
             "delta source size {source_size} != base len {}",
             base.len()
         )));
@@ -434,7 +432,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     idx += consumed;
 
     let target_size_usize = usize::try_from(target_size)
-        .map_err(|_| Error::Other(anyhow::anyhow!("delta target size too large for usize")))?;
+        .map_err(|_| Error::PackParse("delta target size too large for usize".to_string()))?;
     let mut out = Vec::with_capacity(target_size_usize);
 
     while idx < delta.len() {
@@ -446,9 +444,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             for shift in 0..4 {
                 if op & (1 << shift) != 0 {
                     if idx >= delta.len() {
-                        return Err(Error::Other(anyhow::anyhow!(
-                            "delta COPY: truncated offset"
-                        )));
+                        return Err(Error::PackParse("delta COPY: truncated offset".to_string()));
                     }
                     offset |= u32::from(delta[idx]) << (shift * 8);
                     idx += 1;
@@ -458,7 +454,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             for shift in 0..3 {
                 if op & (1 << (4 + shift)) != 0 {
                     if idx >= delta.len() {
-                        return Err(Error::Other(anyhow::anyhow!("delta COPY: truncated size")));
+                        return Err(Error::PackParse("delta COPY: truncated size".to_string()));
                     }
                     size |= u32::from(delta[idx]) << (shift * 8);
                     idx += 1;
@@ -471,7 +467,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             let start = offset as usize;
             let end = start.saturating_add(size as usize);
             if end > base.len() {
-                return Err(Error::Other(anyhow::anyhow!(
+                return Err(Error::PackParse(format!(
                     "delta COPY: range {start}..{end} out of base len {}",
                     base.len()
                 )));
@@ -481,12 +477,12 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             // INSERT. Low 7 bits of op = literal byte count.
             let n = (op & 0x7f) as usize;
             if n == 0 {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "delta INSERT: zero-byte op is reserved"
-                )));
+                return Err(Error::PackParse(
+                    "delta INSERT: zero-byte op is reserved".to_string(),
+                ));
             }
             if idx + n > delta.len() {
-                return Err(Error::Other(anyhow::anyhow!(
+                return Err(Error::PackParse(format!(
                     "delta INSERT: {n} bytes wanted, {} available",
                     delta.len() - idx
                 )));
@@ -497,7 +493,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     }
 
     if out.len() as u64 != target_size {
-        return Err(Error::Other(anyhow::anyhow!(
+        return Err(Error::PackParse(format!(
             "delta applied: got {} bytes, target_size said {}",
             out.len(),
             target_size
@@ -525,24 +521,24 @@ fn read_loose_inflated<S: ObjectStore + ?Sized>(
     let mut decoder = flate2::read::ZlibDecoder::new(bytes.as_slice());
     let mut inflated = Vec::new();
     std::io::Read::read_to_end(&mut decoder, &mut inflated)
-        .map_err(|e| Error::Other(anyhow::anyhow!("loose inflate {oid}: {e}")))?;
+        .map_err(|e| Error::PackParse(format!("loose inflate {oid}: {e}")))?;
     let nul = inflated
         .iter()
         .position(|&b| b == 0)
-        .ok_or_else(|| Error::Other(anyhow::anyhow!("loose {oid}: header has no NUL")))?;
+        .ok_or_else(|| Error::PackParse(format!("loose {oid}: header has no NUL")))?;
     let header = std::str::from_utf8(&inflated[..nul])
-        .map_err(|e| Error::Other(anyhow::anyhow!("loose {oid}: header utf8: {e}")))?;
+        .map_err(|e| Error::PackParse(format!("loose {oid}: header utf8: {e}")))?;
     let mut split = header.splitn(2, ' ');
     let kind = split
         .next()
-        .ok_or_else(|| Error::Other(anyhow::anyhow!("loose {oid}: missing kind")))?;
+        .ok_or_else(|| Error::PackParse(format!("loose {oid}: missing kind")))?;
     let kind = match kind {
         "commit" => ObjectKind::Commit,
         "tree" => ObjectKind::Tree,
         "blob" => ObjectKind::Blob,
         "tag" => ObjectKind::Tag,
         other => {
-            return Err(Error::Other(anyhow::anyhow!(
+            return Err(Error::PackParse(format!(
                 "loose {oid}: unknown kind {other:?}"
             )));
         }
@@ -621,19 +617,16 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
                 }
                 ParsedKind::OfsDelta { base_offset_delta } => {
                     let delta = usize::try_from(*base_offset_delta).map_err(|_| {
-                        Error::Other(anyhow::anyhow!(
-                            "entry {i}: OFS_DELTA offset doesn't fit usize"
-                        ))
+                        Error::PackParse(format!("entry {i}: OFS_DELTA offset doesn't fit usize"))
                     })?;
                     let base_offset = entry.offset.checked_sub(delta).ok_or_else(|| {
-                        Error::Other(anyhow::anyhow!(
+                        Error::PackParse(format!(
                             "entry {i}: OFS_DELTA base offset underflow ({} - {})",
-                            entry.offset,
-                            delta
+                            entry.offset, delta
                         ))
                     })?;
                     let base_idx = *offset_to_idx.get(&base_offset).ok_or_else(|| {
-                        Error::Other(anyhow::anyhow!(
+                        Error::PackParse(format!(
                             "entry {i}: OFS_DELTA base offset {base_offset} doesn't match any entry"
                         ))
                     })?;
@@ -645,7 +638,7 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
                 continue;
             };
             let target = apply_delta(&base_payload, &entry.data)
-                .map_err(|e| Error::Other(anyhow::anyhow!("entry {i}: apply_delta: {e}")))?;
+                .map_err(|e| Error::PackParse(format!("entry {i}: apply_delta: {e}")))?;
             let oid = loose_oid_hex(base_kind, &target);
             let loose = loose_format_bytes(base_kind, &target)?;
             store.write_loose(repo_id, &oid, &loose)?;
@@ -653,7 +646,7 @@ pub(crate) fn store_with_full_resolution<S: ObjectStore + ?Sized>(
             count += 1;
         }
         if still_pending.len() == before {
-            return Err(Error::Other(anyhow::anyhow!(
+            return Err(Error::PackParse(format!(
                 "delta resolution stuck: {} entries with missing bases",
                 still_pending.len()
             )));
@@ -725,7 +718,7 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
     // burning passes.
     for &i in &pending {
         if matches!(entries[i].kind, ParsedKind::OfsDelta { .. }) {
-            return Err(Error::Other(anyhow::anyhow!(
+            return Err(Error::PackParse(format!(
                 "entry {i}: OFS_DELTA not yet supported (D3)"
             )));
         }
@@ -747,7 +740,7 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
                 continue;
             };
             let target = apply_delta(&base_payload, &entry.data).map_err(|e| {
-                Error::Other(anyhow::anyhow!(
+                Error::PackParse(format!(
                     "entry {i}: REF_DELTA apply against {base_oid_hex}: {e}"
                 ))
             })?;
@@ -764,7 +757,7 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
         }
         if still_pending.len() == before {
             // No progress — some delta's base is genuinely missing.
-            return Err(Error::Other(anyhow::anyhow!(
+            return Err(Error::PackParse(format!(
                 "ref_delta resolution: {} entries with missing bases",
                 still_pending.len()
             )));

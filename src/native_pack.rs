@@ -67,7 +67,7 @@ pub fn index_pack_into_repo(repo_path: &Path, pack_bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(&pack_dir)?;
 
     let repo = gix::open(repo_path)
-        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open({}): {e}", repo_path.display())))?;
+        .map_err(|e| Error::GixError(format!("gix::open({}): {e}", repo_path.display())))?;
 
     let mut buf = std::io::Cursor::new(pack_bytes);
     let mut progress = prodash::progress::Discard;
@@ -112,7 +112,7 @@ pub fn generate_pack(repo_path: &Path, wants: &[String], haves: &[String]) -> Re
     }
 
     let mut repo = gix::open(repo_path)
-        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open({}): {e}", repo_path.display())))?;
+        .map_err(|e| Error::GixError(format!("gix::open({}): {e}", repo_path.display())))?;
     // A small object cache amortizes repeated lookups during walks.
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 

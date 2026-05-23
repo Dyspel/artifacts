@@ -349,7 +349,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
     } = input;
 
     let repo = gix::open(&git_dir)
-        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open {}: {e}", git_dir.display())))?;
+        .map_err(|e| Error::GixError(format!("gix::open {}: {e}", git_dir.display())))?;
 
     // Base tree: parent's tree, or git's canonical empty-tree id.
     let base_tree_id = match &parent {
@@ -359,10 +359,10 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
             })?;
             let commit = repo
                 .find_commit(oid)
-                .map_err(|e| Error::Other(anyhow::anyhow!("find parent {sha}: {e}")))?;
+                .map_err(|e| Error::GixError(format!("find parent {sha}: {e}")))?;
             commit
                 .tree_id()
-                .map_err(|e| Error::Other(anyhow::anyhow!("parent {sha} tree_id: {e}")))?
+                .map_err(|e| Error::GixError(format!("parent {sha} tree_id: {e}")))?
                 .detach()
         }
         None => gix::ObjectId::empty_tree(gix::hash::Kind::Sha1),
@@ -370,30 +370,30 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
 
     let mut editor = repo
         .edit_tree(base_tree_id)
-        .map_err(|e| Error::Other(anyhow::anyhow!("edit_tree on {base_tree_id}: {e}")))?;
+        .map_err(|e| Error::GixError(format!("edit_tree on {base_tree_id}: {e}")))?;
 
     for change in &changes {
         match change {
             PreparedChange::Write { path, bytes, kind } => {
                 let blob_id = repo
                     .write_blob(bytes.as_slice())
-                    .map_err(|e| Error::Other(anyhow::anyhow!("write_blob {path}: {e}")))?
+                    .map_err(|e| Error::GixError(format!("write_blob {path}: {e}")))?
                     .detach();
                 editor
                     .upsert(path.as_str(), *kind, blob_id)
-                    .map_err(|e| Error::Other(anyhow::anyhow!("tree upsert {path}: {e}")))?;
+                    .map_err(|e| Error::GixError(format!("tree upsert {path}: {e}")))?;
             }
             PreparedChange::Delete { path } => {
                 editor
                     .remove(path.as_str())
-                    .map_err(|e| Error::Other(anyhow::anyhow!("tree remove {path}: {e}")))?;
+                    .map_err(|e| Error::GixError(format!("tree remove {path}: {e}")))?;
             }
         }
     }
 
     let tree_id = editor
         .write()
-        .map_err(|e| Error::Other(anyhow::anyhow!("write tree object: {e}")))?
+        .map_err(|e| Error::GixError(format!("write tree object: {e}")))?
         .detach();
 
     // Time: `gix-date::Time` is a plain `{ seconds, offset }` struct;
@@ -416,7 +416,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
     let parents = match &parent {
         Some(sha) => {
             let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes())
-                .map_err(|e| Error::Other(anyhow::anyhow!("parent {sha}: {e}")))?;
+                .map_err(|e| Error::GixError(format!("parent {sha}: {e}")))?;
             smallvec::smallvec![oid]
         }
         None => smallvec::SmallVec::new(),
@@ -433,7 +433,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
     };
     let commit_id = repo
         .write_object(&commit)
-        .map_err(|e| Error::Other(anyhow::anyhow!("write commit object: {e}")))?
+        .map_err(|e| Error::GixError(format!("write commit object: {e}")))?
         .detach();
 
     Ok((commit_id.to_string(), tree_id.to_string()))

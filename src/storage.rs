@@ -340,13 +340,13 @@ fn snapshot_refs_to_packed(src: &Path, dst: &Path) -> Result<()> {
     // here would require a separate find-object lookup per tag we
     // don't want to pay at fork time.
     let repo = gix::open(src)
-        .map_err(|e| Error::Other(anyhow::anyhow!("gix::open({}): {e}", src.display())))?;
+        .map_err(|e| Error::GixError(format!("gix::open({}): {e}", src.display())))?;
     let platform = repo
         .references()
-        .map_err(|e| Error::Other(anyhow::anyhow!("repo.references(): {e}")))?;
+        .map_err(|e| Error::GixError(format!("repo.references(): {e}")))?;
     let iter = platform
         .all()
-        .map_err(|e| Error::Other(anyhow::anyhow!("references.all(): {e}")))?;
+        .map_err(|e| Error::GixError(format!("references.all(): {e}")))?;
 
     let mut entries: Vec<(String, String)> = Vec::new();
     for reference in iter {

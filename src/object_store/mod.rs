@@ -483,7 +483,7 @@ fn read_object_fs_inner(
         // `Find::NotFound` for absent objects — translate to None.
         // Any other error (corruption, IO) bubbles.
         Err(gix::object::find::existing::Error::Find(_)) => Ok(None),
-        Err(e) => Err(Error::Other(anyhow::anyhow!("gix find_object({oid}): {e}"))),
+        Err(e) => Err(Error::GixError(format!("gix find_object({oid}): {e}"))),
     };
     result
 }

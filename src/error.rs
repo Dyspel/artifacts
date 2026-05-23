@@ -72,6 +72,23 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Pack-parser failure. Covers everything the hand-rolled
+    /// `native_pack::parse` family rejects: short headers, wrong
+    /// magic, unknown object kinds, zlib errors, delta-resolution
+    /// failures. Previously every site produced `Error::Other(anyhow!())`
+    /// with the same shape — one variant centralizes the category
+    /// without losing any per-site detail since the String carries it.
+    #[error("pack parse: {0}")]
+    PackParse(String),
+
+    /// gix operation failure. Wraps the common
+    /// `repo.find_object(...)` / `repo.write_blob(...)` / `gix::open(...)`
+    /// error sites. Each call site formats the operation + path/oid
+    /// context into the String; the variant just names the category
+    /// so a 5xx with `"code":"gix"` is recognizable in logs.
+    #[error("gix: {0}")]
+    GixError(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -246,7 +263,14 @@ impl IntoResponse for Error {
                 }));
                 return (StatusCode::CONFLICT, body).into_response();
             }
-            Error::Io(_) | Error::Other(_) => {
+            Error::PackParse(_) => {
+                // 400 — the pack body the client sent didn't parse.
+                // Distinct code so dashboards can chart bad-push rates
+                // separately from genuine 5xxs.
+                tracing::warn!(error = %self, "pack parse failure");
+                (StatusCode::BAD_REQUEST, "pack_parse")
+            }
+            Error::Io(_) | Error::Other(_) | Error::GixError(_) => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
