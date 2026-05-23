@@ -91,7 +91,10 @@ pub async fn mint_token(
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeBody {
-    pub token: String,
+    /// The token to revoke. Validated at decode time (1–256 graphic
+    /// ASCII chars per `Token::try_from`); a malformed value becomes
+    /// a 400 with the field path.
+    pub token: crate::ids::Token,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,11 +128,10 @@ pub async fn revoke_token(
     // ownership check. Admins skip the ownership check but we
     // still want the audit field populated; for a stale-or-fake
     // token there's nothing to bind to so log "unknown".
-    let body_token_typed = crate::ids::Token::try_from(body.token.as_str())?;
     let target_repo: Option<String> = state
         .authn
         .tokens
-        .lookup(&body_token_typed)
+        .lookup(&body.token)
         .await
         .ok()
         .flatten()
@@ -147,7 +149,7 @@ pub async fn revoke_token(
         enforce_owner(&*state.data.ownership, &principal, repo_id).await?;
     }
 
-    let revoked = state.authn.tokens.revoke(&body_token_typed).await?;
+    let revoked = state.authn.tokens.revoke(&body.token).await?;
     crate::audit::record(
         &*state.observ.audit,
         "token.revoke",

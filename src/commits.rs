@@ -78,14 +78,20 @@ pub struct Author {
 
 #[derive(Debug, Deserialize)]
 pub struct CommitBody {
-    /// Branch to update. Short form — we always prepend `refs/heads/`.
+    /// Branch to update. Short form (`"main"`, not `"refs/heads/main"`) —
+    /// we always prepend `refs/heads/` before talking to the RefStore.
+    /// Stays a `String` because the prefix-strip is load-bearing and a
+    /// "BranchName" newtype would just wrap `valid_branch_name`.
     pub branch: String,
 
     /// SHA-1 of the expected current commit on `branch`. `None` means the
     /// branch must not yet exist (orphan commit / new branch). This doubles
-    /// as the CAS predicate for `update-ref`.
+    /// as the CAS predicate for `update-ref`. `Oid`'s Deserialize impl
+    /// validates the 40-char-lowercase-hex shape at JSON decode time,
+    /// so a bad value becomes a 400 with a useful field path rather
+    /// than propagating untyped into the handler.
     #[serde(default)]
-    pub parent: Option<String>,
+    pub parent: Option<crate::ids::Oid>,
 
     pub message: String,
 
@@ -159,17 +165,14 @@ pub async fn create_commit(
     // Pre-validate the parent exists before we go anywhere near gix —
     // `ObjectStore::exists` works against loose + packed (FS impl) or
     // a KV lookup (future chunked-KV impl), and is cheaper than gix's
-    // find_object error path.
-    if let Some(parent_sha) = &body.parent {
-        validate_sha(parent_sha)?;
-        // RepoId/Oid construction at the trait boundary; validation
-        // is the same predicate as validate_repo_id/validate_sha
-        // above so this can't realistically fail.
-        let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
-        let parent_oid = crate::ids::Oid::try_from(parent_sha.as_str())?;
-        if !state.data.objects.exists(&repo_id_typed, &parent_oid)? {
+    // find_object error path. The Oid shape itself is already valid
+    // (validated by serde at JSON decode); we only check repo-side
+    // presence here.
+    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    if let Some(parent_oid) = &body.parent {
+        if !state.data.objects.exists(&repo_id_typed, parent_oid)? {
             return Err(Error::BadRequest(format!(
-                "parent commit not found: {parent_sha}"
+                "parent commit not found: {parent_oid}"
             )));
         }
     }
@@ -253,21 +256,18 @@ pub async fn create_commit(
     // 7. CAS the ref. This is the atomicity boundary — delegated to the
     // RefStore trait so the guts are swappable (M3-proper replaces the
     // single-node FsRefStore with a distributed state machine; this call
-    // site stays identical).
-    let repo_id_typed = crate::ids::RepoId::try_from(repo_id.as_str())?;
+    // site stays identical). `repo_id_typed` was constructed at the top
+    // of the handler; `body.parent` is already an `Option<Oid>` since
+    // serde validated it at JSON decode time.
     let ref_name_typed = crate::ids::RefName::try_from(ref_name.as_str())?;
     let commit_sha_typed = crate::ids::Oid::try_from(commit_sha.as_str())?;
-    let parent_typed = match body.parent.as_deref() {
-        Some(s) => Some(crate::ids::Oid::try_from(s)?),
-        None => None,
-    };
     match state
         .data
         .refs
         .cas_update(
             &repo_id_typed,
             &ref_name_typed,
-            parent_typed.as_ref(),
+            body.parent.as_ref(),
             &commit_sha_typed,
         )
         .await?
@@ -281,7 +281,7 @@ pub async fn create_commit(
             );
             return Err(Error::RefConflict {
                 branch: body.branch,
-                expected: parent_typed,
+                expected: body.parent,
                 current,
             });
         }
@@ -324,7 +324,7 @@ enum PreparedChange {
 /// closure signature stays one argument.
 struct BuildCommitInput {
     git_dir: std::path::PathBuf,
-    parent: Option<String>,
+    parent: Option<crate::ids::Oid>,
     changes: Vec<PreparedChange>,
     message: String,
     author_name: String,
@@ -354,7 +354,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
     // Base tree: parent's tree, or git's canonical empty-tree id.
     let base_tree_id = match &parent {
         Some(sha) => {
-            let oid = gix::ObjectId::from_hex(sha.as_bytes()).map_err(|e| {
+            let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| {
                 Error::Other(anyhow::anyhow!("parent {sha} is not a valid sha-1: {e}"))
             })?;
             let commit = repo
@@ -415,7 +415,7 @@ fn build_and_write_commit(input: BuildCommitInput) -> Result<(String, String)> {
 
     let parents = match &parent {
         Some(sha) => {
-            let oid = gix::ObjectId::from_hex(sha.as_bytes())
+            let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes())
                 .map_err(|e| Error::Other(anyhow::anyhow!("parent {sha}: {e}")))?;
             smallvec::smallvec![oid]
         }

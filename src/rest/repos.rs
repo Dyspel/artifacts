@@ -24,7 +24,10 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct CreateRepoBody {
     /// Optional caller-supplied id. If omitted we generate one.
-    pub id: Option<String>,
+    /// `RepoId`'s Deserialize impl enforces the same `[a-z0-9_-]{4..=64}`
+    /// rule `validate_repo_id` enforces, so a bad value becomes a 400
+    /// at decode time with the field path.
+    pub id: Option<crate::ids::RepoId>,
 }
 
 /// POST /v1/repos
@@ -50,11 +53,16 @@ pub async fn create_repo(
         state.cfg.max_repos_per_user,
     )
     .await?;
-    let id = body.and_then(|Json(b)| b.id).unwrap_or_else(new_repo_id);
-    state.data.storage.create(&id)?;
+    // body.id is already a validated RepoId (serde checked) or None.
+    // If absent, generate via new_repo_id — also valid by construction.
+    let id_typed = body.and_then(|Json(b)| b.id).unwrap_or_else(|| {
+        crate::ids::RepoId::try_from(new_repo_id().as_str())
+            .expect("new_repo_id() output satisfies the RepoId contract")
+    });
+    let id_str = id_typed.as_str().to_owned();
+    state.data.storage.create(&id_str)?;
     // Record ownership *before* minting the token so a crash between the
     // two leaves a repo we can identify the owner of.
-    let id_typed = crate::ids::RepoId::try_from(id.as_str())?;
     let owner_typed = match principal.subject() {
         Some(s) => Some(crate::ids::Subject::try_from(s)?),
         None => None,
@@ -69,12 +77,12 @@ pub async fn create_repo(
         .tokens
         .mint(&id_typed, Scope::Write, None, owner_typed.as_ref())
         .await?;
-    let remote = remote_url(&state.cfg, &id, &token);
+    let remote = remote_url(&state.cfg, &id_str, &token);
     crate::audit::record(
         &*state.observ.audit,
         "repo.create",
         principal.audit_label(),
-        Some(&id),
+        Some(&id_str),
         serde_json::json!({}),
         None,
     )
@@ -85,14 +93,20 @@ pub async fn create_repo(
     state
         .observ
         .events
-        .publish(crate::events::Event::status(&id, "unknown", "idle"));
-    Ok(Json(RepoHandle { id, remote, token }))
+        .publish(crate::events::Event::status(&id_str, "unknown", "idle"));
+    Ok(Json(RepoHandle {
+        id: id_str,
+        remote,
+        token,
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct ForkBody {
-    pub id: Option<String>,
+    /// Optional caller-supplied id for the fork. Validated at decode
+    /// time (see `RepoId`); a malformed value becomes a 400.
+    pub id: Option<crate::ids::RepoId>,
     #[serde(rename = "readOnly")]
     pub read_only: bool,
 }
@@ -126,12 +140,15 @@ pub async fn fork_repo(
         state.cfg.max_repos_per_user,
     )
     .await?;
-    let (fork_id, read_only) = body
+    let (fork_id_opt, read_only) = body
         .map(|Json(b)| (b.id, b.read_only))
         .unwrap_or((None, false));
-    let fork_id = fork_id.unwrap_or_else(new_repo_id);
-    state.data.storage.fork(&source_id, &fork_id)?;
-    let fork_id_typed = crate::ids::RepoId::try_from(fork_id.as_str())?;
+    let fork_id_typed = fork_id_opt.unwrap_or_else(|| {
+        crate::ids::RepoId::try_from(new_repo_id().as_str())
+            .expect("new_repo_id() output satisfies the RepoId contract")
+    });
+    let fork_id_str = fork_id_typed.as_str().to_owned();
+    state.data.storage.fork(&source_id, &fork_id_str)?;
     let owner_typed = match principal.subject() {
         Some(s) => Some(crate::ids::Subject::try_from(s)?),
         None => None,
@@ -147,12 +164,12 @@ pub async fn fork_repo(
         .tokens
         .mint(&fork_id_typed, scope, None, owner_typed.as_ref())
         .await?;
-    let remote = remote_url(&state.cfg, &fork_id, &token);
+    let remote = remote_url(&state.cfg, &fork_id_str, &token);
     crate::audit::record(
         &*state.observ.audit,
         "repo.fork",
         principal.audit_label(),
-        Some(&fork_id),
+        Some(&fork_id_str),
         serde_json::json!({ "source_id": source_id, "read_only": read_only }),
         None,
     )
@@ -160,9 +177,9 @@ pub async fn fork_repo(
     state
         .observ
         .events
-        .publish(crate::events::Event::fork(&source_id, &fork_id));
+        .publish(crate::events::Event::fork(&source_id, &fork_id_str));
     Ok(Json(RepoHandle {
-        id: fork_id,
+        id: fork_id_str,
         remote,
         token,
     }))

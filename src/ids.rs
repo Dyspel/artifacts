@@ -48,9 +48,19 @@ use serde::{Deserialize, Serialize};
 /// `crate::storage::validate_repo_id` enforces: 1–63 chars of
 /// `[A-Za-z0-9_-]`, no path separators, no leading dash, no `.git`
 /// suffix collisions.
+// `try_from` makes Deserialize run validation; `into` keeps Serialize
+// transparent over the inner String. The pair beats plain
+// `#[serde(transparent)]`, which would deserialize without validation
+// and silently let a malformed value into the trait surface.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct RepoId(String);
+
+impl From<RepoId> for String {
+    fn from(r: RepoId) -> Self {
+        r.0
+    }
+}
 
 impl RepoId {
     pub fn as_str(&self) -> &str {
@@ -95,8 +105,14 @@ impl TryFrom<String> for RepoId {
 
 /// A git object id — exactly 40 lowercase hex characters (SHA-1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct Oid(String);
+
+impl From<Oid> for String {
+    fn from(o: Oid) -> Self {
+        o.0
+    }
+}
 
 impl Oid {
     pub fn as_str(&self) -> &str {
@@ -145,8 +161,14 @@ impl TryFrom<String> for Oid {
 /// no `..`, no `@{`, no control characters, components separated by
 /// `/` with no empty parts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct RefName(String);
+
+impl From<RefName> for String {
+    fn from(r: RefName) -> Self {
+        r.0
+    }
+}
 
 impl RefName {
     pub fn as_str(&self) -> &str {
@@ -231,8 +253,14 @@ impl TryFrom<String> for RefName {
 /// non-empty + printable ASCII + ≤ 256 chars so the audit log + URL
 /// embedding never see garbage.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct Token(String);
+
+impl From<Token> for String {
+    fn from(t: Token) -> Self {
+        t.0
+    }
+}
 
 impl Token {
     pub fn as_str(&self) -> &str {
@@ -292,8 +320,14 @@ impl TryFrom<String> for Token {
 /// identity provider has its own conventions we don't want to
 /// second-guess.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct Subject(String);
+
+impl From<Subject> for String {
+    fn from(s: Subject) -> Self {
+        s.0
+    }
+}
 
 impl Subject {
     pub fn as_str(&self) -> &str {
@@ -446,12 +480,75 @@ mod tests {
 
     #[test]
     fn newtypes_serialize_as_bare_strings() {
-        // The transparent serde form keeps wire compatibility — a
-        // RepoId in a JSON body is `"abc123"`, not `{"0":"abc123"}`.
+        // The `try_from = String, into = String` serde form keeps wire
+        // compatibility — a RepoId in a JSON body is `"abc123"`, not
+        // `{"0":"abc123"}`. Same shape as plain `serde(transparent)`
+        // would produce, but with TryFrom-driven deserialization.
         let repo = RepoId::try_from("abc123").unwrap();
         let json = serde_json::to_string(&repo).unwrap();
         assert_eq!(json, "\"abc123\"");
         let back: RepoId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, repo);
+    }
+
+    /// The whole point of G2 — Deserialize MUST run the same validation
+    /// `TryFrom<String>` runs, not just blindly accept the inner String.
+    /// A bad value in JSON has to fail at decode time, not silently let
+    /// a malformed RepoId into the trait surface where it'd take a
+    /// runtime check three layers deeper to catch.
+    #[test]
+    fn deserialize_rejects_malformed_repo_id() {
+        let err = serde_json::from_str::<RepoId>("\"AaA\"").unwrap_err();
+        // serde's error wraps our `Display`; the field-shape rule is in
+        // the message, plus the wire layer (axum's `Json` extractor)
+        // turns that into a 400 with the path of the offending field.
+        assert!(
+            err.to_string().contains("invalid repo id")
+                || err.to_string().contains("InvalidRepoId"),
+            "expected validation error, got {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_oid() {
+        let cases = [
+            "\"deadbeef\"",
+            "\"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\"",
+        ];
+        for c in cases {
+            let err = serde_json::from_str::<Oid>(c).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid oid"),
+                "expected oid validation error for {c}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_ref_name() {
+        for c in ["\"\"", "\"refs/heads/..\"", "\"refs/heads/@{0}\""] {
+            assert!(
+                serde_json::from_str::<RefName>(c).is_err(),
+                "expected ref-name validation error for {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_token() {
+        for c in ["\"\"", "\"with space\""] {
+            assert!(
+                serde_json::from_str::<Token>(c).is_err(),
+                "expected token validation error for {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_malformed_subject() {
+        // Subject only rejects empty + NUL byte; \\u0000 in a JSON
+        // string is the literal NUL byte after decode.
+        assert!(serde_json::from_str::<Subject>("\"\"").is_err());
+        assert!(serde_json::from_str::<Subject>("\"alice\\u0000bob\"").is_err());
     }
 }
