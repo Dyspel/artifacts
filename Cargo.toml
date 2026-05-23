@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["full"] }
 # to a Stream usable by axum's Sse response.
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.5"
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["trace", "limit", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OTLP exporter — opt-in via `--otlp-endpoint` / ARTIFACTS_OTLP_ENDPOINT.

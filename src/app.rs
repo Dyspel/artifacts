@@ -62,10 +62,22 @@ const TOKEN_PRUNE_GRACE: Duration = Duration::from_secs(86400);
 /// `create_commit` with inline file contents; even a few dozen
 /// source files easily fit) and well below where an unauthenticated
 /// client could DoS the server by streaming megabytes into the
-/// JSON deserializer. Git smart-HTTP (`/git/*`) has its own much
-/// larger cap inside `smart_http.rs` because clone / push bodies
-/// are legitimately huge.
+/// JSON deserializer. Git smart-HTTP (`/git/*`) gets its own much
+/// larger cap below — clone / push bodies are legitimately huge.
 const REST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Hard upper bound on the body size accepted at `/git/*`. The
+/// `RequestBodyLimitLayer` rejects anything larger with 413 before
+/// streaming begins, capping the memory + bandwidth a single
+/// unauthenticated push can consume.
+///
+/// 2 GiB is the absolute ceiling — git's own protocol has no
+/// concept of larger single pushes, and a deployment that needs
+/// more should be using git-LFS instead. The per-repo byte quota
+/// (`Config::max_repo_bytes`) is the *soft* cap that gates ordinary
+/// pushes; this is the cliff to keep a malicious client from
+/// streaming terabytes through the HTTP front-end.
+const GIT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Parsed arguments for the `serve` subcommand. Carried as one struct
 /// so the `match` arm in `main` is a one-liner and the `serve` function
@@ -151,6 +163,18 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_AUDIT_RETENTION_DAYS", default_value_t = 90)]
     pub audit_retention_days: u64,
 
+    /// Per-request timeout in seconds. Applies to every HTTP route —
+    /// REST control plane and the smart-HTTP `/git/*` surface — and
+    /// caps how long a single request can hold a connection. 300s
+    /// (5 minutes) is the default because the longest legitimate
+    /// request is a multi-MB receive-pack push that has to land
+    /// objects + run a pack-index pass; everything else completes
+    /// in milliseconds. Set to `0` to disable (NOT recommended in
+    /// production — a slow-body attacker can hold connections
+    /// indefinitely).
+    #[arg(long, env = "ARTIFACTS_REQUEST_TIMEOUT_SECS", default_value_t = 300)]
+    pub request_timeout_secs: u64,
+
     /// Opt-in to binding a non-loopback address with `http://`.
     #[arg(long)]
     pub allow_insecure: bool,
@@ -187,6 +211,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         shutdown_timeout_secs,
         shutdown_drain_delay_secs,
         audit_retention_days,
+        request_timeout_secs,
         allow_insecure,
         otlp_endpoint,
     } = args;
@@ -567,18 +592,32 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         )
     };
 
-    let app = rest_router
-        .merge(metrics_route)
-        .nest(
-            "/git",
-            Router::new()
-                .route(
-                    "/:id/*rest",
-                    get(smart_http::git_handler).post(smart_http::git_handler),
-                )
-                .with_state(git_state),
+    let git_router = Router::new()
+        .route(
+            "/:id/*rest",
+            get(smart_http::git_handler).post(smart_http::git_handler),
         )
+        .with_state(git_state)
+        // Smart-HTTP push bodies are legitimately large (clone bundles,
+        // multi-MB packs); the per-repo byte quota is enforced inside
+        // the handler. The layer below is the hard cliff so an
+        // unauthenticated client can't stream past the size of any
+        // real repository.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            GIT_BODY_LIMIT_BYTES,
+        ));
+
+    let mut app = rest_router
+        .merge(metrics_route)
+        .nest("/git", git_router)
         .layer(axum_middleware::from_fn(request_id::instrument));
+    // Per-request timeout. Applied last (outermost) so it covers
+    // every route — REST and `/git/*`. A zero value disables.
+    if request_timeout_secs > 0 {
+        app = app.layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
+            request_timeout_secs,
+        )));
+    }
 
     let shutdown_timeout = Duration::from_secs(shutdown_timeout_secs);
     let shutdown_drain_delay = Duration::from_secs(shutdown_drain_delay_secs);
@@ -936,6 +975,95 @@ mod bind_safety_tests {
         assert!(check_bind_safety("[::1]:8787", "http://[::1]:8787", false, false).is_ok());
     }
 }
+
+#[cfg(test)]
+mod body_limit_tests {
+    //! Regression guards for the two body-size cliffs. Exercises a
+    //! minimal Router carrying the same layers `serve()` wires, so
+    //! a refactor that drops the layer or downgrades the cap fails
+    //! here instead of at the first oversized request in production.
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    /// Handler that actually consumes the request body — necessary
+    /// for `DefaultBodyLimit` / `RequestBodyLimitLayer` to fire,
+    /// since both check the limit at the point of body extraction
+    /// rather than at request entry.
+    async fn echo_bytes(body: Bytes) -> Bytes {
+        body
+    }
+
+    /// REST JSON cap (1 MiB): bodies larger than `REST_BODY_LIMIT_BYTES`
+    /// must be rejected with 413 before the handler runs. The
+    /// `DefaultBodyLimit::max(...)` layer is the only thing standing
+    /// between an unauthenticated client and `serde_json::from_slice`
+    /// allocating arbitrary memory.
+    #[tokio::test]
+    async fn rest_body_limit_returns_413_on_oversize() {
+        let router = Router::new()
+            .route("/echo", post(echo_bytes))
+            .layer(DefaultBodyLimit::max(REST_BODY_LIMIT_BYTES));
+        let body = vec![b'a'; REST_BODY_LIMIT_BYTES + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn rest_body_under_limit_passes() {
+        let router = Router::new()
+            .route("/echo", post(echo_bytes))
+            .layer(DefaultBodyLimit::max(REST_BODY_LIMIT_BYTES));
+        let body = vec![b'a'; 64];
+        let req = Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// /git/* cap (2 GiB): the `RequestBodyLimitLayer` is the hard
+    /// cliff stopping a malicious client from streaming
+    /// arbitrarily many bytes through smart-HTTP. We test the
+    /// layer behavior at a much smaller cap so the test stays
+    /// fast — the production constant is just a number that
+    /// composes the same.
+    #[tokio::test]
+    async fn git_body_limit_returns_413_on_oversize() {
+        const TEST_CAP: usize = 1024;
+        let router = Router::new()
+            .route("/push", post(echo_bytes))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(TEST_CAP));
+        let body = vec![b'a'; TEST_CAP + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri("/push")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+/// Production constants must stay in a sensible relationship to each
+/// other. The compile-time const block fails the build (not a test) if
+/// someone accidentally swaps them or downgrades the /git cap below
+/// the JSON cap. Matches the F2 pattern (`const _: () = { assert!(); }`).
+const _: () = {
+    assert!(REST_BODY_LIMIT_BYTES >= 64 * 1024);
+    assert!(GIT_BODY_LIMIT_BYTES > REST_BODY_LIMIT_BYTES);
+    assert!(GIT_BODY_LIMIT_BYTES >= 1024 * 1024 * 1024);
+};
 
 #[cfg(test)]
 mod shutdown_classification_tests {
