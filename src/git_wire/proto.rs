@@ -285,8 +285,8 @@ pub fn parse_v2_fetch(body: &[u8]) -> Option<V2FetchRequest> {
     None
 }
 
-pub(crate) fn is_hex40(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+pub const fn is_hex40(s: &str) -> bool {
+    crate::object_store::is_hex40_bytes(s.as_bytes())
 }
 
 /// Parse the receive-pack body up to and including the flush-pkt that

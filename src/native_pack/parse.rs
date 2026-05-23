@@ -329,13 +329,11 @@ pub(crate) fn loose_format_bytes(kind: ObjectKind, payload: &[u8]) -> Result<Vec
     Ok(buf)
 }
 
-fn kind_str(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Commit => "commit",
-        ObjectKind::Tree => "tree",
-        ObjectKind::Blob => "blob",
-        ObjectKind::Tag => "tag",
-    }
+/// Backwards-compat shim — callers in this module write `kind_str(k)`
+/// in dozens of places and the `ObjectKind::as_str` const fn now
+/// owns the logic. One-line passthrough keeps the call sites readable.
+const fn kind_str(kind: ObjectKind) -> &'static str {
+    kind.as_str()
 }
 
 /// D1 entry point. Parse `pack_bytes`, store every non-delta entry

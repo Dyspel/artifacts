@@ -86,6 +86,33 @@ pub enum ObjectKind {
     Tag,
 }
 
+impl ObjectKind {
+    /// git's canonical kind name, as it appears in the loose-object
+    /// `<kind> <size>\0...` header. `const fn` so the pack parser's
+    /// hot loop can match against compile-time-evaluated strings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ObjectKind::Commit => "commit",
+            ObjectKind::Tree => "tree",
+            ObjectKind::Blob => "blob",
+            ObjectKind::Tag => "tag",
+        }
+    }
+
+    /// Decode a pack-format object-type code (1..=4 for the four
+    /// direct kinds; deltas use 6/7 and are handled elsewhere).
+    /// Returns `None` for any code outside the direct-kind range.
+    pub const fn from_pack_type(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(ObjectKind::Commit),
+            2 => Some(ObjectKind::Tree),
+            3 => Some(ObjectKind::Blob),
+            4 => Some(ObjectKind::Tag),
+            _ => None,
+        }
+    }
+}
+
 /// Read + write view into a repo's git object database.
 ///
 /// Production paths route through this for `gc`, the
@@ -771,12 +798,55 @@ impl ObjectStore for SqliteObjectStore {
     }
 }
 
+/// Byte-level "exactly 40 hex characters" check. `const fn` so callers
+/// in const contexts (and the compiler's reachability prover) can use
+/// it directly. Used by both [`oid_is_valid`] and
+/// [`crate::git_wire::proto::is_hex40`].
+pub(crate) const fn is_hex40_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() != 40 {
+        return false;
+    }
+    let mut i = 0;
+    while i < 40 {
+        let b = bytes[i];
+        // ascii-hex: 0..9 | a..f | A..F. Branchless on x86-64.
+        let is_hex =
+            (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F');
+        if !is_hex {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// 40-char lowercase hex. The validation contract both impls share —
 /// keeping it in one place means the conformance test for malformed
 /// oids exercises the same predicate against both backends.
-fn oid_is_valid(oid: &str) -> bool {
-    oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit())
+pub(crate) const fn oid_is_valid(oid: &str) -> bool {
+    is_hex40_bytes(oid.as_bytes())
 }
+
+// Compile-time proof that these are actually const-evaluable. If a
+// future edit accidentally introduces a non-const dependency the
+// build breaks here instead of silently degrading to runtime
+// evaluation.
+const _: () = {
+    assert!(is_hex40_bytes(b"4b825dc642cb6eb9a060e54bf8d69288fbee4904"));
+    assert!(!is_hex40_bytes(b"deadbeef"));
+    assert!(oid_is_valid("4b825dc642cb6eb9a060e54bf8d69288fbee4904"));
+    assert!(matches!(
+        ObjectKind::from_pack_type(1),
+        Some(ObjectKind::Commit)
+    ));
+    assert!(ObjectKind::from_pack_type(6).is_none());
+    // ObjectKind::as_str returns the canonical loose-header strings.
+    // Use a byte slice comparison since &str's PartialEq isn't
+    // const-stable yet.
+    let blob_str = ObjectKind::Blob.as_str();
+    assert!(blob_str.len() == 4);
+    assert!(blob_str.as_bytes()[0] == b'b');
+};
 
 #[cfg(test)]
 mod conformance;
