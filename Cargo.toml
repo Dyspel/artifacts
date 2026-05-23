@@ -45,8 +45,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 base64 = "0.22"
 dashmap = "6"
-bytes = "1"
-http-body-util = "0.1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
@@ -78,10 +76,7 @@ gix = { version = "0.83", features = ["tree-editor"] }
 # up with `repo.objects` (a gix_odb::Handle that implements
 # gix_pack::Find).
 gix-pack = "0.70"
-gix-features = "0.48"
 gix-hash = "0.25"
-gix-odb = "0.80"
-gix-object = "0.51"
 # Already in the dep graph transitively via gix; named here so the
 # SqliteObjectStore::ingest_pack code (loose-object zlib deflate) can
 # import it without going through a private gix module.
@@ -94,7 +89,7 @@ smallvec = "1"
 sha1 = "0.10"
 # prodash::Discard is used as the no-op progress sink for
 # pack-generation routines that take a Count. Pinned to the version
-# gix-features 0.48 brings in transitively so the trait types unify
+# gix-pack 0.70 brings in transitively so the trait types unify
 # (gix-pack's iter_from_counts requires the same prodash types).
 prodash = { version = "31", default-features = false, features = ["progress-tree"] }
 
