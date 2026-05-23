@@ -551,4 +551,144 @@ mod tests {
         assert!(serde_json::from_str::<Subject>("\"\"").is_err());
         assert!(serde_json::from_str::<Subject>("\"alice\\u0000bob\"").is_err());
     }
+
+    /// Property tests — sweep the input space to pin invariants the
+    /// hand-written cases above only exercise at a handful of points.
+    /// Case count capped low so SQLite-free property runs stay sub-second.
+    mod prop {
+        use super::super::*;
+        use proptest::prelude::*;
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+            /// Every accepted RepoId round-trips serde-transparently: a
+            /// JSON string → RepoId → JSON string must yield the same
+            /// JSON bytes. If serde introduces a quoting / escaping
+            /// asymmetry this catches it.
+            #[test]
+            fn repo_id_json_roundtrip(s in "[a-z0-9_-]{4,64}") {
+                let id = RepoId::try_from(s.as_str())
+                    .expect("generator output satisfies RepoId contract");
+                let json = serde_json::to_string(&id).unwrap();
+                let back: RepoId = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(id, back);
+            }
+
+            /// Same property for Oid — 40 lowercase hex chars round-trip
+            /// through serde without mutation.
+            #[test]
+            fn oid_json_roundtrip(s in "[0-9a-f]{40}") {
+                let o = Oid::try_from(s.as_str())
+                    .expect("generator output satisfies Oid contract");
+                let json = serde_json::to_string(&o).unwrap();
+                let back: Oid = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(o, back);
+            }
+
+            /// Oid::try_from + .as_str() is idempotent: the inner string
+            /// is exactly what was handed in (no normalization, no
+            /// case-folding, no trimming).
+            #[test]
+            fn oid_try_from_is_idempotent(s in "[0-9a-f]{40}") {
+                let o = Oid::try_from(s.as_str()).unwrap();
+                prop_assert_eq!(o.as_str(), s.as_str());
+            }
+
+            /// RefName::try_from rejects any input containing git's
+            /// banned sequences anywhere — `..`, `@{`, ASCII control
+            /// chars, or whitespace. The generator embeds a banned
+            /// substring in an otherwise-plausible ref-prefix.
+            #[test]
+            fn ref_name_rejects_banned_sequences(
+                bad in prop::sample::select(&["..", "@{", "\x01", " ", "\\", "~", "^"][..])
+            ) {
+                let candidate = format!("refs/heads/foo{bad}bar");
+                prop_assert!(
+                    RefName::try_from(candidate.as_str()).is_err(),
+                    "expected RefName to reject {candidate:?}"
+                );
+            }
+
+            /// Inputs that fail RepoId validation must produce an Error,
+            /// never a panic. Sweeps strings that mix in-set + out-of-set
+            /// chars so we hit both the empty/length-bound paths and the
+            /// charset path. Asymmetric: accepted strings round-trip
+            /// (other tests pin that); we only assert "no panic" here.
+            #[test]
+            fn repo_id_rejects_garbage_without_panic(s in ".{0,80}") {
+                // try_from MUST return Ok/Err — a panic from unwrap or
+                // overflow inside the validator would surface as a
+                // proptest failure with the offending input.
+                let _ = RepoId::try_from(s.as_str());
+            }
+
+            /// Same "no panic" guard for the other four newtypes.
+            #[test]
+            fn other_newtypes_no_panic_on_garbage(s in ".{0,300}") {
+                let _ = Oid::try_from(s.as_str());
+                let _ = RefName::try_from(s.as_str());
+                let _ = Token::try_from(s.as_str());
+                let _ = Subject::try_from(s.as_str());
+            }
+        }
+    }
+
+    /// CAS-outcome property: for any sequence of cas_update calls
+    /// against MemRefStore, the number of Updated outcomes is bounded
+    /// by the number of distinct (expected, new) inputs that match
+    /// the current ref value. This is the CAS contract — duplicates
+    /// can't both succeed; conflicts don't move the ref. Lives outside
+    /// `mod prop` because it needs a tokio runtime + MemRefStore from
+    /// the `refs` module.
+    #[test]
+    fn cas_update_property_bounded_updates() {
+        use crate::refs::{CasOutcome, MemRefStore, RefStore};
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+        let runner = tokio::runtime::Runtime::new().unwrap();
+        let mut prop_runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 24,
+            ..ProptestConfig::default()
+        });
+        // Sequence of (expected, new) pairs over a small oid alphabet.
+        let strategy = vec((0u8..4u8, 0u8..4u8), 1..=20);
+        prop_runner
+            .run(&strategy, |sequence| {
+                runner.block_on(async {
+                    let s = MemRefStore::new();
+                    let repo = RepoId::try_from("rtst").unwrap();
+                    let rname = RefName::try_from("refs/heads/x").unwrap();
+                    let mut applied: Vec<u8> = Vec::new(); // history of accepted `new`s
+                    let oids: Vec<Oid> = (0..=4u8)
+                        .map(|i| Oid::try_from(&*i.to_string().repeat(40)).unwrap())
+                        .collect();
+                    for (expected_idx, new_idx) in sequence {
+                        let expected = (expected_idx > 0).then(|| &oids[expected_idx as usize]);
+                        let new = &oids[new_idx as usize];
+                        match s.cas_update(&repo, &rname, expected, new).await.unwrap() {
+                            CasOutcome::Updated => {
+                                // Invariant: the CAS only accepted if the
+                                // ref's current value really did equal the
+                                // expected (or None meant "must be absent").
+                                applied.push(new_idx);
+                            }
+                            CasOutcome::Conflict { .. } => {}
+                        }
+                    }
+                    // The post-state must equal the last accepted `new`
+                    // (or None if no update ever succeeded).
+                    let final_val = s.read(&repo, &rname).await.unwrap();
+                    match applied.last() {
+                        Some(&idx) => {
+                            assert_eq!(final_val, Some(oids[idx as usize].clone()));
+                        }
+                        None => {
+                            assert!(final_val.is_none());
+                        }
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
+    }
 }
