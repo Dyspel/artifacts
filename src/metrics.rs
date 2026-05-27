@@ -50,12 +50,16 @@
 //!   retried), `exhausted` (gave up after MAX_ATTEMPTS retries on
 //!   5xx / transport error)}.
 //! - `artifacts_sqlite_lock_wait_seconds{store}` — histogram
-//!   recording how long each handler waits to acquire the per-store
-//!   `tokio::sync::Mutex<Connection>` before issuing its SQL. Each
-//!   store has one connection and one mutex, so this is the
-//!   contention signal: if p99 climbs the SQLite-serialization is
-//!   becoming a bottleneck and a connection pool (`deadpool-sqlite`)
-//!   would help. `store` ∈ {`tokens`, `ownership`, `audit`}.
+//!   recording how long each handler waits on `r2d2::Pool::get()`
+//!   before issuing its SQL. Each store carries its own r2d2 pool
+//!   (default 10 connections) and WAL-mode SQLite, so this is the
+//!   pool-exhaustion signal: if p99 climbs the pool is sized too
+//!   small for offered concurrency, or a slow query is hogging a
+//!   connection. Pre-A5 every store was an `Arc<TokioMutex
+//!   <Connection>>` and this histogram measured serialization
+//!   wait; the pool moved the contention point but the name stayed
+//!   the same so dashboards survive the swap. `store` ∈ {`tokens`,
+//!   `ownership`, `audit`, `webhooks`}.
 //! - `artifacts_object_reads_total{backend, outcome}` — counter,
 //!   incremented once per `ObjectStore::read_object` call. `backend`
 //!   names the impl (`fs` today; a future chunked-KV impl would
