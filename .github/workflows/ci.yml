@@ -74,3 +74,40 @@ jobs:
         run: git --version
       - run: cargo build --all-features --all-targets
       - run: cargo test --all-features --all-targets
+
+  supply-chain:
+    name: cargo deny + cargo machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      # Cache only the registry index + advisory-db so subsequent runs
+      # don't re-clone RustSec on every PR. cargo-deny itself is fast
+      # once installed; the binary is cached by the next step.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: supply-chain
+          # cargo-deny / cargo-machete don't build the project; skip
+          # the target/ cache that the other jobs share.
+          cache-targets: "false"
+      # Pinned versions so a surprise upstream behavior change in
+      # either tool doesn't break CI silently — bump in lockstep with
+      # deny.toml schema changes.
+      - name: Install cargo-deny + cargo-machete
+        run: |
+          cargo install --locked --version 0.19.7 cargo-deny
+          cargo install --locked --version 0.9.2 cargo-machete
+      # `check` runs advisories + bans + licenses + sources in one
+      # pass; the deny.toml in the repo root drives the policy. New
+      # rules belong in deny.toml with a why-comment, not in this
+      # workflow.
+      - name: cargo deny check
+        run: cargo deny check
+      # Recurring guard for the H4 unused-dep sweep. cargo-machete
+      # scans Cargo.toml against actual use; a future PR that adds
+      # a dep and doesn't reference it gets caught here.
+      - name: cargo machete
+        run: cargo machete

@@ -1,0 +1,130 @@
+# cargo-deny policy for the `artifacts` crate.
+#
+# Run locally with:
+#   cargo deny check advisories bans licenses sources
+#
+# CI runs the same command on every push / PR via
+# .github/workflows/ci.yml. K1 added this file + the CI job; the goal
+# is a recurring guard for the three failure modes that escape clippy
+# and tests:
+#
+#   advisories — a known-CVE crate appears in the dep graph
+#   bans       — a yanked / duplicated / suspicious crate slips in
+#   licenses   — a copyleft (or unknown-license) crate flows into the
+#                Apache-2.0 distribution accidentally
+#   sources    — a dep is pulled from a non-crates.io registry / git
+#                URL without explicit allow-listing
+#
+# Any change to the allowed-licenses set, the source allow-list, or
+# the advisory exceptions belongs here with a comment explaining the
+# *why*. Future maintainers shouldn't have to dig through git blame to
+# learn that, e.g., we accept Unicode-DFS-2016 because `unicode-ident`
+# uses it.
+
+[graph]
+# Check every target's dep graph. The default `targets = []` means
+# "active host", which would miss platform-specific deps that ship
+# in published builds. Listing the targets we actually compile for
+# keeps deny consistent with what CI produces.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Exclude dev-deps from the scan. cargo-deny's default already does
+# this conceptually, but spelling it out documents the boundary:
+# we audit what ships, not what only builds tests.
+all-features = false
+no-default-features = false
+
+[advisories]
+# Pull from the official RustSec advisory db, refreshed on each run.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Any unmaintained / unsound / yanked package is a hard fail. The
+# project's "report it, then ignore once we have a tracking issue"
+# escape hatch is the `ignore` list below — entries require an
+# explicit reason string so no advisory can slip through silently.
+yanked = "deny"
+ignore = [
+    # rustls-pemfile is unmaintained (archived August 2025); upstream
+    # recommends migrating to rustls-pki-types' PemObject API. The
+    # advisory has no security impact — the crate is still functional
+    # for our use, axum-server 0.7.x still pulls it. K1 declines to
+    # do the axum-server 0.8 major bump as part of the CI-gate
+    # commit; tracked for a dedicated PR. Re-evaluate when bumping
+    # axum-server.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via axum-server 0.7; bump deferred to its own commit" },
+]
+
+[licenses]
+# Permissive licenses only. Adding to this list is a deliberate
+# policy decision; document the dep that needs it inline.
+#
+# - Apache-2.0 / MIT / BSD-*  — the standard Rust ecosystem set
+# - ISC                       — `rustls` family
+# - Unicode-3.0               — `icu_*` / `unicode-ident`
+# - 0BSD / BSL-1.0 / Unlicense — fully-permissive options exposed by
+#                               crates that dual-license MIT + X
+#                               (e.g. ryu = "BSL-1.0 OR Apache-2.0")
+# - Zlib                      — `tinyvec`, `miniz_oxide`, `zlib-rs`
+# - MPL-2.0                   — `uluru`; per-file copyleft is compatible
+#                               with redistribution of unmodified files,
+#                               which is all this dep does
+# - CDLA-Permissive-2.0       — `webpki-roots` data file
+# - CC0-1.0 / MIT-0           — explicit-public-domain options exposed
+#                               by dunce / aws-lc-sys
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+# Confidence threshold for license detection. The default (0.8) is
+# fine for our dep set; raising it would force more clarifications
+# than it'd catch real issues.
+confidence-threshold = 0.8
+
+
+[bans]
+# A single source-tree-shape dependency arriving from two different
+# versions usually means a coarse version bump was forgotten; warn
+# loudly. `deny` would force an exception every time a transitive
+# bumps before our direct dep catches up.
+multiple-versions = "warn"
+# Walking the tree once on `deny` keeps the report linear.
+wildcards = "deny"
+# Highlight which path winds up activating each multi-version dep —
+# useful for the "who pulled the duplicate" question without `cargo tree`.
+highlight = "all"
+# Explicit deny list. Add a crate here only when a known-bad shape
+# (typosquats, vulnerable-without-an-advisory, replaced-by-X) needs
+# to stay out — comment the why.
+deny = []
+# Skip lists for the unavoidable duplicates that come from the
+# Rust ecosystem's still-bumping ABI surface (windows-sys, syn, etc).
+# Kept short on purpose: every skip is a license to ignore a real
+# version-skew issue.
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io. Git URLs and alternate registries require an
+# explicit allow-list entry — block by default so a `git = "..."`
+# dep in a PR has to justify itself in this file.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
