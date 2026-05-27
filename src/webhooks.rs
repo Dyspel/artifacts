@@ -153,6 +153,18 @@ pub trait WebhookRegistry: Send + Sync {
         Ok(())
     }
 
+    /// L4: delete finalized delivery rows older than `cutoff_ts`
+    /// (unix-seconds). Returns the number of rows removed. Mirrors
+    /// the audit-prune shape — finalized rows accumulate after K3
+    /// landed; without this they'd grow unbounded. Pending rows
+    /// (`finalized_at IS NULL`) are NEVER pruned, even if they're
+    /// older than cutoff — they're still in flight.
+    /// Default impl returns Ok(0) — MemRegistry has nothing
+    /// retainable.
+    fn prune_finalized(&self, _cutoff_ts: i64) -> crate::error::Result<u64> {
+        Ok(0)
+    }
+
     /// Replace the in-process master key, re-encrypting every existing
     /// secret under it. Returns the count of rows re-encrypted (0
     /// for backends that don't store encrypted secrets — `MemRegistry`,
@@ -664,6 +676,22 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         Ok(())
     }
 
+    fn prune_finalized(&self, cutoff_ts: i64) -> crate::error::Result<u64> {
+        let conn = self.lock();
+        // Two guards:
+        //   - finalized_at IS NOT NULL: skip in-flight (pending) rows.
+        //   - finalized_at < cutoff_ts: keep recently-finalized rows
+        //     within the retention window so admin tooling can still
+        //     audit "what just got delivered" before the row is gone.
+        let n = conn.execute(
+            "DELETE FROM webhook_deliveries
+             WHERE finalized_at IS NOT NULL
+               AND finalized_at < ?1",
+            rusqlite::params![cutoff_ts],
+        )?;
+        Ok(n as u64)
+    }
+
     /// Re-encrypt every secret-bearing row under `new`, then atomically
     /// install `new` as the current master key. Holds the connection
     /// mutex for the full operation, so concurrent `add` and `list`
@@ -989,6 +1017,43 @@ pub fn spawn_delivery_worker(
             }
         }
     })
+}
+
+/// L4: periodic retention sweep for the finalized rows in
+/// `webhook_deliveries`. Mirrors `audit::spawn_prune_task`'s shape:
+/// a `retention == Duration::ZERO` disables pruning entirely (returns
+/// `None` rather than spawning a no-op task — matches the audit shape
+/// so the caller doesn't have to reason about whether the task would
+/// run). Picks up the K4 CancellationToken pattern so server shutdown
+/// drains it cleanly.
+pub fn spawn_prune_task(
+    registry: Arc<dyn WebhookRegistry>,
+    tick: std::time::Duration,
+    retention: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if retention.is_zero() {
+        tracing::info!("webhook-delivery retention disabled — prune task not spawned");
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Skip the immediate fire so prune doesn't run during boot.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let cutoff = now_unix_secs().saturating_sub(retention.as_secs() as i64);
+                    match registry.prune_finalized(cutoff) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(pruned = n, "webhook delivery prune"),
+                        Err(e) => tracing::error!(error = %e, "webhook delivery prune failed"),
+                    }
+                }
+                _ = cancel.cancelled() => return,
+            }
+        }
+    }))
 }
 
 fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
@@ -1896,6 +1961,110 @@ mod tests {
         assert!(
             resolved.is_ok(),
             "dispatcher did not resolve within 1s of cancel"
+        );
+    }
+
+    // L4 — finalized-row retention prune.
+
+    #[tokio::test]
+    async fn prune_finalized_drops_old_rows_and_keeps_pending() {
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere.invalid".into(),
+            secret: None,
+            events: vec![],
+        });
+        // Enqueue three rows; finalize two of them at very old
+        // timestamps via raw SQL so the cutoff arithmetic is
+        // unambiguous.
+        r.enqueue_delivery("r1", "commit", br#"{"k":1}"#).unwrap();
+        r.enqueue_delivery("r1", "commit", br#"{"k":2}"#).unwrap();
+        r.enqueue_delivery("r1", "commit", br#"{"k":3}"#).unwrap();
+
+        // Two of them: stamp finalized_at = 100 (epoch+100s, very old).
+        {
+            let conn = r.lock();
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET finalized_at = 100, finalized_outcome = 'success'
+                 WHERE id IN (1, 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Cutoff at 1000 (well past 100) — both finalized rows
+        // are older than cutoff and should be deleted; the third
+        // pending row survives.
+        let pruned = r.prune_finalized(1000).unwrap();
+        assert_eq!(pruned, 2, "two finalized rows should be pruned");
+
+        let surviving: u64 = {
+            let conn = r.lock();
+            conn.query_row("SELECT COUNT(*) FROM webhook_deliveries", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| n as u64)
+            .unwrap()
+        };
+        assert_eq!(surviving, 1, "exactly one pending row should survive");
+        // And that survivor is still claimable — pruning didn't
+        // accidentally touch the in-flight row.
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_finalized_respects_cutoff_keeps_recent_rows() {
+        // A recently-finalized row (after cutoff) must NOT be
+        // pruned — the retention window exists so admin tooling
+        // can still audit "what just got delivered."
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere.invalid".into(),
+            secret: None,
+            events: vec![],
+        });
+        r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
+        // Finalize at a "recent" timestamp.
+        let recent = now_unix_secs();
+        {
+            let conn = r.lock();
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET finalized_at = ?1, finalized_outcome = 'success'
+                 WHERE id = 1",
+                [recent],
+            )
+            .unwrap();
+        }
+        // Cutoff at recent - 100 (i.e., row is on the "keep" side
+        // of the cutoff).
+        let pruned = r.prune_finalized(recent - 100).unwrap();
+        assert_eq!(pruned, 0, "recently finalized rows must survive");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_task_handle_resolves_on_cancel() {
+        let registry: Arc<dyn WebhookRegistry> = Arc::new(open_sqlite_registry().1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_prune_task(
+            registry,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(86400),
+            cancel.clone(),
+        )
+        .expect("retention nonzero -> handle returned");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "prune task did not resolve within 1s of cancel"
         );
     }
 

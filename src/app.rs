@@ -197,6 +197,18 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_REQUEST_TIMEOUT_SECS", default_value_t = 300)]
     pub request_timeout_secs: u64,
 
+    /// L4: retention window for finalized webhook-delivery rows,
+    /// in days. K3's outbox keeps a finalized row around for audit
+    /// — "what got delivered, when, with which outcome" — but
+    /// without pruning the table grows monotonically. Mirrors
+    /// `audit_retention_days`. `0` disables pruning.
+    #[arg(
+        long,
+        env = "ARTIFACTS_WEBHOOK_DELIVERY_RETENTION_DAYS",
+        default_value_t = 30
+    )]
+    pub webhook_delivery_retention_days: u64,
+
     /// L3: cadence for the periodic GC sweep, in seconds. The
     /// sweep walks every repo on disk and runs the existing
     /// alternates-aware preview+run cycle against each. `0`
@@ -278,6 +290,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         shutdown_drain_delay_secs,
         audit_retention_days,
         request_timeout_secs,
+        webhook_delivery_retention_days,
         gc_interval_secs,
         gc_min_object_age_secs,
         rest_body_limit_bytes,
@@ -576,6 +589,18 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         GAUGE_REFRESH_INTERVAL,
         bg_cancel.child_token(),
     ));
+    // L4: prune finalized rows from webhook_deliveries on the same
+    // hourly cadence as the audit prune. Mirrors that shape:
+    // `webhook_delivery_retention_days = 0` opts out + the helper
+    // returns None.
+    if let Some(h) = webhooks::spawn_prune_task(
+        webhook_registry.clone(),
+        PRUNE_INTERVAL,
+        Duration::from_secs(webhook_delivery_retention_days * 86400),
+        bg_cancel.child_token(),
+    ) {
+        bg_handles.push(h);
+    }
 
     // One task that refreshes every store's pool gauges. Populated by
     // each `SqliteXxxStore::open` call above; an empty `sqlite_pools`
