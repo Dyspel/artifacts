@@ -358,6 +358,16 @@ impl TokenStore for SqliteTokenStore {
         let hash = sha256_hex(token.as_str());
         let now = now_secs() as i64;
         let conn = crate::metrics::get_pooled(&self.conn, "tokens")?;
+        // Side note on the `WHERE token_hash = ?1` compare: SQLite's
+        // btree comparator is not byte-wise constant-time, but the
+        // value it compares is `sha256_hex(token)`. A timing oracle
+        // can only narrow the search on bytes of the *hash*, and an
+        // attacker controls only the *preimage* — moving toward any
+        // target hash requires inverting SHA-256. The hash dominates
+        // the analysis; using subtle::ConstantTimeEq here would not
+        // raise the bar. The admin-token path in auth.rs is a
+        // different shape (the secret IS the bytes that are
+        // compared), which is why that path *does* use ct_eq.
         // SELECT only the columns we surface. The expired-row filter
         // is enforced by the predicate, not by reading expires_at into
         // the struct; the subject column is exposed through the

@@ -9,8 +9,16 @@
 //!
 //! - Signature (HS256 via shared secret from `--jwt-secret` /
 //!   `ARTIFACTS_JWT_SECRET`).
+//! - Algorithm allow-list — `Validation::new(Algorithm::HS256)` seeds
+//!   `algorithms` with `[HS256]`. `jsonwebtoken` v9 has no
+//!   `Algorithm::None` variant at all (tokens claiming `alg: none`
+//!   fail to decode), and the decode path rejects any algorithm not
+//!   in the allow-list, so asymmetric-via-HMAC confusion isn't
+//!   possible against this configuration.
 //! - `exp` — required; we deliberately reject tokens without expiry so a
 //!   leaked admin-scope JWT has a bounded lifetime.
+//! - `nbf` — when present, the token must already be valid. The default
+//!   60-second leeway covers clock skew between issuer and verifier.
 //! - Subject — accepted from either `userId` (Dyspel convention) or the
 //!   standard `sub` claim. At least one must be present.
 //!
@@ -67,10 +75,16 @@ pub fn verify(secret: &str, token: &str) -> Result<Claims> {
     // Require `exp`. jsonwebtoken's default already validates exp when
     // present, but it doesn't *require* the claim to be set. We do.
     validation.set_required_spec_claims(&["exp"]);
-    // We don't check `aud`, `iss`, or `nbf` — Dyspel doesn't set them.
-    // This means we'd happily accept a JWT that was issued for some
-    // *other* service using the same secret. Acceptable for a
-    // single-secret prototype; documented in the module header.
+    // Honor `nbf` when the issuer set it. Default is off in
+    // jsonwebtoken; we enable so a delayed-issue token can't authorize
+    // before its declared start. The 60s default leeway absorbs clock
+    // skew, same as for `exp`. We do not *require* `nbf` (Dyspel
+    // doesn't set it) — only validate when present.
+    validation.validate_nbf = true;
+    // We don't check `aud` or `iss` — Dyspel doesn't set them. This
+    // means we'd happily accept a JWT that was issued for some *other*
+    // service using the same secret. Acceptable for a single-secret
+    // prototype; documented in the module header.
     validation.validate_aud = false;
 
     let data = decode::<Claims>(
@@ -184,5 +198,58 @@ mod tests {
             verify("sec", "not-a-jwt"),
             Err(Error::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn rejects_nbf_in_the_future() {
+        // `nbf` (not-before) well outside the 60s leeway window must
+        // reject. Confirms validate_nbf is honored — without it
+        // jsonwebtoken would ignore the claim entirely.
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "exp": future_ts(), "nbf": future }),
+        );
+        assert!(matches!(verify("sec", &tok), Err(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn accepts_nbf_in_the_past() {
+        // `nbf` already elapsed — token is currently valid. Pin the
+        // happy path so a stricter future Validation default doesn't
+        // silently break tokens that set nbf for legitimate reasons.
+        let past = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 60;
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "exp": future_ts(), "nbf": past }),
+        );
+        let claims = verify("sec", &tok).unwrap();
+        assert_eq!(claims.subject(), Some("u"));
+    }
+
+    #[test]
+    fn rejects_token_signed_with_different_family_algorithm() {
+        // The Validation allow-list is `[HS256]`. A token whose header
+        // claims `alg: HS512` must not authorize even if we somehow had
+        // a matching key — different algorithm = reject. This pins the
+        // "no algorithm confusion" property at runtime; the jsonwebtoken
+        // crate has no `Algorithm::None` variant at all, so the more
+        // dangerous "downgrade to none" attack isn't representable.
+        let header = Header::new(Algorithm::HS512);
+        let tok = encode(
+            &header,
+            &json!({ "userId": "u", "exp": future_ts() }),
+            &EncodingKey::from_secret(b"sec"),
+        )
+        .unwrap();
+        assert!(matches!(verify("sec", &tok), Err(Error::Unauthorized)));
     }
 }

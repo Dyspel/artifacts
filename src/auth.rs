@@ -91,6 +91,26 @@ pub fn basic_token(headers: &HeaderMap) -> Result<String> {
 /// `async` because `TokenStore::lookup` is async (see tokens module for
 /// why). `.await` is cheap in the common path; the only real I/O is the
 /// SQLite row read in `SqliteTokenStore`, which takes microseconds.
+///
+/// ## Status-code oracle (deliberate)
+///
+/// The three failure modes return different statuses:
+///
+/// - **401** (`UnauthorizedBasic`): no/malformed Authorization header
+///   **or** token not in the store (or expired/revoked).
+/// - **403** (`Forbidden, "token not valid for this repo"`): token
+///   exists and currently authorizes some repo — just not this one.
+/// - **403** (`Forbidden, "token is read-only"`): token authorizes
+///   this repo at read scope, request requires write.
+///
+/// The 401-vs-403 split reveals "I authenticate against the server"
+/// to any caller who already holds a live token; the wrong-repo vs
+/// wrong-scope split reveals which of those mismatched. These leaks
+/// are by design — same shape every "auth + role" system gives —
+/// and the secret material (the token bytes) is never reflected.
+/// The REST surface (`authorize_rest`) does collapse all auth
+/// failures to a single 401, since there is no equivalent "role"
+/// split there.
 pub async fn authorize_git(
     tokens: &dyn TokenStore,
     headers: &HeaderMap,
