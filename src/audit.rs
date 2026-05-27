@@ -899,6 +899,109 @@ mod tests {
         assert!(s.verify_chain().await.is_err());
     }
 
+    /// Tampering a mid-chain row must (a) be detected and (b) report the
+    /// offending row id — not the last row, not a generic "chain broken"
+    /// without the specific id. This is the property that makes admin
+    /// tooling useful for forensics: "row K is corrupt" tells a
+    /// responder which entry to investigate.
+    #[tokio::test]
+    async fn tampered_mid_chain_row_names_offending_id() {
+        let (dir, s) = store();
+        for i in 0..5 {
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
+        }
+        // Tamper row 3's fields_json. The verifier walks ASC and must
+        // halt on row 3 — not row 4 or row 5 — because the chain is
+        // self-recomputing and the first mismatch wins.
+        let conn = rusqlite::Connection::open(dir.path().join("audit.db")).unwrap();
+        conn.execute(
+            "UPDATE audit_events SET fields_json = '{\"x\":1}' WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let err = s.verify_chain().await.expect_err("expected ChainBreak");
+        let msg = err.to_string();
+        assert!(msg.contains("audit chain broken"), "msg was: {msg}");
+        assert!(
+            msg.contains("id=3"),
+            "error must identify the offending row (id=3); was: {msg}"
+        );
+        // And NOT mention the later rows — those aren't where the
+        // first break occurred. If the verifier kept walking and
+        // reported the last mismatch, a responder would chase the
+        // wrong row.
+        assert!(
+            !msg.contains("id=4") && !msg.contains("id=5"),
+            "first-mismatch-wins violated; msg: {msg}"
+        );
+    }
+
+    /// Tampering by ROW DELETION must also be detected — an attacker
+    /// who removes a damaging audit row can't slip past verification.
+    /// When row K is deleted, row K+1's stored `prev_hash` still
+    /// references the (now-missing) row K's hash, but the verifier's
+    /// running `expected_prev` was set from row K-1. The mismatch
+    /// catches the gap. The offending row reported is K+1, the first
+    /// row that fails the walk.
+    #[tokio::test]
+    async fn deleted_row_breaks_chain_at_successor() {
+        let (dir, s) = store();
+        for i in 0..5 {
+            s.record(evt(&format!("e{i}"), "admin", None))
+                .await
+                .unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("audit.db")).unwrap();
+        // Delete row 3.
+        conn.execute("DELETE FROM audit_events WHERE id = 3", [])
+            .unwrap();
+        drop(conn);
+        let err = s
+            .verify_chain()
+            .await
+            .expect_err("expected ChainBreak after deletion");
+        let msg = err.to_string();
+        assert!(msg.contains("audit chain broken"), "msg was: {msg}");
+        // The successor row (id=4) is where the chain first
+        // detects the gap.
+        assert!(
+            msg.contains("id=4"),
+            "deletion must surface at the successor row (id=4); was: {msg}"
+        );
+    }
+
+    /// Direct row_hash overwrite (not prev_hash, not the row fields):
+    /// the stored hash diverges from `hash_row(prev_hash, evt)` so
+    /// the row_hash branch of the verifier fires. Pins that the
+    /// verifier's recompute step actually runs.
+    #[tokio::test]
+    async fn tampered_row_hash_breaks_chain() {
+        let (dir, s) = store();
+        s.record(evt("a", "admin", None)).await.unwrap();
+        s.record(evt("b", "admin", None)).await.unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("audit.db")).unwrap();
+        // Stomp row 1's stored row_hash with bogus 32 bytes. prev_hash
+        // is fine, fields are fine — only the stored hash is wrong.
+        conn.execute(
+            "UPDATE audit_events SET row_hash = randomblob(32) WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let err = s
+            .verify_chain()
+            .await
+            .expect_err("expected ChainBreak on row_hash mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("audit chain broken") && msg.contains("id=1"),
+            "row_hash tamper must surface at id=1; was: {msg}"
+        );
+    }
+
     #[test]
     fn hash_row_is_deterministic_and_distinguishes_inputs() {
         let evt_a = AuditEvent {
