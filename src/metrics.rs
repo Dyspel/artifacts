@@ -75,6 +75,45 @@
 //! The `path` label is the *matched route template* (`/v1/repos/:id`),
 //! not the raw URI (`/v1/repos/abc123`). Otherwise the cardinality
 //! explodes as repos are created.
+//!
+//! ## Label cardinality audit (J2)
+//!
+//! Every metric label is checked against an enumerable value set —
+//! no Prometheus series is keyed on a user-controllable string. The
+//! OOM-class bug here is "label keyed on `repo_id`/`subject`/`oid`",
+//! which gives one time-series per distinct value and never collects
+//! — current state has zero such labels:
+//!
+//! - `artifacts_requests_total{method,path,status}` /
+//!   `artifacts_request_duration_seconds{method,path}` —
+//!   `path` is the matched route template (or `<unmatched>`); both
+//!   bounded by the router. `method` and `status` are tiny HTTP enums.
+//! - `artifacts_audit_events_total{event}` — `event` is bounded by
+//!   the 11-kind audit vocabulary (see `audit::record_silent`).
+//!   Enforced by convention; J2 audit confirmed all call sites pass
+//!   a string literal.
+//! - `artifacts_webhook_deliveries_total{kind,outcome}` —
+//!   `kind` ∈ {commit, fork, status}; `outcome` ∈ {success,
+//!   client_error, exhausted}. 9 series max.
+//! - `artifacts_object_reads_total{backend,outcome}` /
+//!   `artifacts_object_read_duration_seconds{backend}` —
+//!   `backend` ∈ {fs} today; `outcome` ∈ {hit, miss, error}.
+//! - `artifacts_sqlite_pool_size{store}` /
+//!   `artifacts_sqlite_pool_in_use{store}` /
+//!   `artifacts_sqlite_lock_wait_seconds{store}` —
+//!   `store` ∈ {tokens, ownership, audit, webhooks}, passed as
+//!   `&'static str` at every call site.
+//! - `artifacts_build_info{version}` — one series per binary build.
+//! - All other counters / gauges are label-less.
+//!
+//! ## Tracing PII audit (J2)
+//!
+//! `tracing::*!` call sites swept for secret material: zero leaks.
+//! Token::Debug redacts (G4 prop-tested); no caller hands a `Token`
+//! value to a tracing macro today. Webhook secret tracing logs error
+//! chains and hook_ids only — never the secret bytes. `subject` is
+//! a low-cardinality label (one per JWT user) and acceptable for
+//! tracing fields; raw JWT bytes are never logged.
 
 use axum::{
     body::Body,

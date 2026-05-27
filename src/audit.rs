@@ -531,9 +531,15 @@ async fn record_silent(
 ) {
     // Prometheus counter — labeled by event kind so dashboards can
     // chart `repo.create` rate vs `token.revoke` rate independently.
-    // Always-on (cardinality is bounded by the audit-event vocabulary,
-    // currently 7 kinds), and incremented up front so a SQLite hiccup
-    // doesn't drop the count.
+    // Always-on (cardinality is bounded by the audit-event vocabulary
+    // — currently 11 kinds: server.{start,shutdown}, repo.{create,
+    // fork,delete}, token.{mint,revoke,rotate}, admin.{token,jwt_key,
+    // webhook_key}.rotate) and incremented up front so a SQLite hiccup
+    // doesn't drop the count. The `event` parameter is `&str` rather
+    // than an enum to keep callers ergonomic; the vocabulary is
+    // enforced by convention. J2 audit confirmed every audit::record
+    // call site passes a string literal from the list above — no
+    // user-controllable value reaches this label.
     metrics::counter!("artifacts_audit_events_total", "event" => event.to_string()).increment(1);
     let evt = AuditEvent {
         id: 0,
