@@ -156,6 +156,8 @@ pub fn authorize_rest(
     headers: &HeaderMap,
     admin_token: &str,
     jwt_secret: Option<&str>,
+    jwt_expected_aud: Option<&str>,
+    jwt_expected_iss: Option<&str>,
 ) -> Result<Principal> {
     let value = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -177,8 +179,14 @@ pub fn authorize_rest(
     }
 
     // JWT path: only enabled when a secret was configured at startup.
+    // expected_aud / expected_iss come from CLI / env (K2); when set,
+    // jwt::verify pins them. When unset, the legacy "any token signed
+    // with the secret passes" behavior holds — documented in
+    // src/jwt.rs as the shared-secret-prototype trust boundary.
     if let Some(secret) = jwt_secret {
-        if let Ok(claims) = crate::jwt::verify(secret, presented) {
+        if let Ok(claims) =
+            crate::jwt::verify(secret, presented, jwt_expected_aud, jwt_expected_iss)
+        {
             if let Some(sub) = claims.subject() {
                 return Ok(Principal::User {
                     subject: sub.to_string(),
@@ -224,7 +232,8 @@ mod tests {
 
     #[test]
     fn admin_token_yields_admin_principal() {
-        let p = authorize_rest(&headers(Some("Bearer sekret")), "sekret", None).unwrap();
+        let p =
+            authorize_rest(&headers(Some("Bearer sekret")), "sekret", None, None, None).unwrap();
         assert_eq!(p, Principal::Admin);
     }
 
@@ -235,6 +244,8 @@ mod tests {
             &headers(Some(&format!("Bearer {jwt}"))),
             "admin-tok",
             Some("shared-secret"),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -251,7 +262,13 @@ mod tests {
         // A valid JWT should NOT authorize when the server has no secret
         // configured — otherwise an attacker who knows what secret the
         // Dyspel instance uses could bypass by turning off our --jwt-secret.
-        let r = authorize_rest(&headers(Some(&format!("Bearer {jwt}"))), "admin-tok", None);
+        let r = authorize_rest(
+            &headers(Some(&format!("Bearer {jwt}"))),
+            "admin-tok",
+            None,
+            None,
+            None,
+        );
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -262,13 +279,15 @@ mod tests {
             &headers(Some(&format!("Bearer {jwt}"))),
             "admin-tok",
             Some("wrong-secret"),
+            None,
+            None,
         );
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
     #[test]
     fn missing_header_rejects() {
-        let r = authorize_rest(&headers(None), "sekret", None);
+        let r = authorize_rest(&headers(None), "sekret", None, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -277,20 +296,32 @@ mod tests {
         // A git-client-style Basic credential should not authorize REST,
         // even if the password half matches the admin token.
         let b64 = STANDARD.encode("x:sekret");
-        let r = authorize_rest(&headers(Some(&format!("Basic {b64}"))), "sekret", None);
+        let r = authorize_rest(
+            &headers(Some(&format!("Basic {b64}"))),
+            "sekret",
+            None,
+            None,
+            None,
+        );
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
     #[test]
     fn wrong_admin_token_rejects() {
-        let r = authorize_rest(&headers(Some("Bearer wrong")), "right", None);
+        let r = authorize_rest(&headers(Some("Bearer wrong")), "right", None, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
     #[test]
     fn admin_length_mismatch_rejects() {
         assert!(matches!(
-            authorize_rest(&headers(Some("Bearer short")), "much-longer-token", None),
+            authorize_rest(
+                &headers(Some("Bearer short")),
+                "much-longer-token",
+                None,
+                None,
+                None
+            ),
             Err(Error::Unauthorized)
         ));
     }

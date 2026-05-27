@@ -31,11 +31,14 @@
 //!   the prototype. Swapping to RS256 + a JWKS endpoint is a localized
 //!   change inside this module plus a config shape tweak, and is what a
 //!   real multi-service deployment would want.
-//! - **No audience check.** If Dyspel ever issues JWTs for other
-//!   services using the same secret, those would incorrectly validate
-//!   here. For a single-tenant prototype that shares a secret between
-//!   two services this is acceptable; for anything more, add `aud` and
-//!   require it.
+//! - **No audience or issuer check by default.** When `--jwt-expected-aud`
+//!   / `--jwt-expected-iss` are unset, any JWT verifying against the
+//!   shared secret authorizes — including JWTs originally issued for a
+//!   sibling service that shares the secret. K2 added the per-deploy
+//!   strict-mode flags: setting either pins the corresponding claim,
+//!   rejecting tokens whose `aud` / `iss` doesn't match (and rejecting
+//!   tokens missing the claim altogether). Production deployments that
+//!   share a JWT secret across services SHOULD set both.
 
 use crate::error::{Error, Result};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
@@ -66,26 +69,51 @@ impl Claims {
     }
 }
 
-/// Verify an HS256 JWT against `secret`. Returns the decoded claims on
-/// success. Any failure — bad signature, expired, missing subject — is
-/// collapsed into `Error::Unauthorized` so the error surface doesn't
-/// leak *why* it failed.
-pub fn verify(secret: &str, token: &str) -> Result<Claims> {
+/// Verify an HS256 JWT against `secret`, optionally enforcing
+/// audience / issuer claims. Returns the decoded claims on success.
+/// Any failure — bad signature, expired, wrong aud, wrong iss,
+/// missing subject — is collapsed into `Error::Unauthorized` so the
+/// error surface doesn't leak *why* it failed.
+///
+/// `expected_aud` / `expected_iss`: when `Some`, the corresponding
+/// claim is REQUIRED to be present in the token AND must equal the
+/// configured value. When `None`, the claim is not inspected (legacy
+/// mode — see module-header note).
+pub fn verify(
+    secret: &str,
+    token: &str,
+    expected_aud: Option<&str>,
+    expected_iss: Option<&str>,
+) -> Result<Claims> {
     let mut validation = Validation::new(Algorithm::HS256);
     // Require `exp`. jsonwebtoken's default already validates exp when
     // present, but it doesn't *require* the claim to be set. We do.
-    validation.set_required_spec_claims(&["exp"]);
+    let mut required: Vec<&str> = vec!["exp"];
     // Honor `nbf` when the issuer set it. Default is off in
     // jsonwebtoken; we enable so a delayed-issue token can't authorize
     // before its declared start. The 60s default leeway absorbs clock
     // skew, same as for `exp`. We do not *require* `nbf` (Dyspel
     // doesn't set it) — only validate when present.
     validation.validate_nbf = true;
-    // We don't check `aud` or `iss` — Dyspel doesn't set them. This
-    // means we'd happily accept a JWT that was issued for some *other*
-    // service using the same secret. Acceptable for a single-secret
-    // prototype; documented in the module header.
-    validation.validate_aud = false;
+    // Audience: when expected_aud is set we require the claim, populate
+    // the allow-set, and let jsonwebtoken's validator do the compare.
+    // When unset we explicitly disable validate_aud — without this,
+    // jsonwebtoken's `validate_aud = true` default would require an
+    // `aud` claim that the legacy Dyspel-shape token doesn't carry.
+    match expected_aud {
+        Some(aud) => {
+            validation.set_audience(&[aud]);
+            required.push("aud");
+        }
+        None => validation.validate_aud = false,
+    }
+    // Issuer: same shape. set_issuer populates the allow-set; we add
+    // `iss` to required-claims so a token without one is rejected.
+    if let Some(iss) = expected_iss {
+        validation.set_issuer(&[iss]);
+        required.push("iss");
+    }
+    validation.set_required_spec_claims(&required);
 
     let data = decode::<Claims>(
         token,
@@ -131,14 +159,14 @@ mod tests {
             "sec",
             json!({ "userId": "u-42", "email": "a@b", "tier": "lite", "exp": future_ts() }),
         );
-        let claims = verify("sec", &tok).unwrap();
+        let claims = verify("sec", &tok, None, None).unwrap();
         assert_eq!(claims.subject(), Some("u-42"));
     }
 
     #[test]
     fn accepts_standard_sub_claim() {
         let tok = sign("sec", json!({ "sub": "u-17", "exp": future_ts() }));
-        let claims = verify("sec", &tok).unwrap();
+        let claims = verify("sec", &tok, None, None).unwrap();
         assert_eq!(claims.subject(), Some("u-17"));
     }
 
@@ -148,14 +176,14 @@ mod tests {
             "sec",
             json!({ "userId": "primary", "sub": "fallback", "exp": future_ts() }),
         );
-        let claims = verify("sec", &tok).unwrap();
+        let claims = verify("sec", &tok, None, None).unwrap();
         assert_eq!(claims.subject(), Some("primary"));
     }
 
     #[test]
     fn rejects_wrong_secret() {
         let tok = sign("right", json!({ "userId": "u", "exp": future_ts() }));
-        let r = verify("wrong", &tok);
+        let r = verify("wrong", &tok, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -171,7 +199,7 @@ mod tests {
             .as_secs()
             - 3600;
         let tok = sign("sec", json!({ "userId": "u", "exp": past }));
-        let r = verify("sec", &tok);
+        let r = verify("sec", &tok, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -180,7 +208,7 @@ mod tests {
         // No `exp` claim at all — we require one so a leaked token has a
         // bounded lifetime.
         let tok = sign("sec", json!({ "userId": "u" }));
-        let r = verify("sec", &tok);
+        let r = verify("sec", &tok, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
@@ -188,14 +216,14 @@ mod tests {
     fn rejects_no_subject() {
         // exp present, but no userId or sub — we can't identify the caller.
         let tok = sign("sec", json!({ "email": "a@b", "exp": future_ts() }));
-        let r = verify("sec", &tok);
+        let r = verify("sec", &tok, None, None);
         assert!(matches!(r, Err(Error::Unauthorized)));
     }
 
     #[test]
     fn rejects_malformed_token() {
         assert!(matches!(
-            verify("sec", "not-a-jwt"),
+            verify("sec", "not-a-jwt", None, None),
             Err(Error::Unauthorized)
         ));
     }
@@ -214,7 +242,10 @@ mod tests {
             "sec",
             json!({ "userId": "u", "exp": future_ts(), "nbf": future }),
         );
-        assert!(matches!(verify("sec", &tok), Err(Error::Unauthorized)));
+        assert!(matches!(
+            verify("sec", &tok, None, None),
+            Err(Error::Unauthorized)
+        ));
     }
 
     #[test]
@@ -231,7 +262,7 @@ mod tests {
             "sec",
             json!({ "userId": "u", "exp": future_ts(), "nbf": past }),
         );
-        let claims = verify("sec", &tok).unwrap();
+        let claims = verify("sec", &tok, None, None).unwrap();
         assert_eq!(claims.subject(), Some("u"));
     }
 
@@ -250,6 +281,106 @@ mod tests {
             &EncodingKey::from_secret(b"sec"),
         )
         .unwrap();
-        assert!(matches!(verify("sec", &tok), Err(Error::Unauthorized)));
+        assert!(matches!(
+            verify("sec", &tok, None, None),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    // K2 — audience strict-mode triple.
+
+    #[test]
+    fn aud_set_matching_aud_accepts() {
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "aud": "artifacts", "exp": future_ts() }),
+        );
+        let claims = verify("sec", &tok, Some("artifacts"), None).unwrap();
+        assert_eq!(claims.subject(), Some("u"));
+    }
+
+    #[test]
+    fn aud_set_wrong_aud_rejects() {
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "aud": "some-other-service", "exp": future_ts() }),
+        );
+        assert!(matches!(
+            verify("sec", &tok, Some("artifacts"), None),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn aud_set_missing_aud_rejects() {
+        // Token has no `aud` claim at all — strict mode must reject
+        // rather than silently accepting it.
+        let tok = sign("sec", json!({ "userId": "u", "exp": future_ts() }));
+        assert!(matches!(
+            verify("sec", &tok, Some("artifacts"), None),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    // K2 — issuer strict-mode triple.
+
+    #[test]
+    fn iss_set_matching_iss_accepts() {
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "iss": "dyspel", "exp": future_ts() }),
+        );
+        let claims = verify("sec", &tok, None, Some("dyspel")).unwrap();
+        assert_eq!(claims.subject(), Some("u"));
+    }
+
+    #[test]
+    fn iss_set_wrong_iss_rejects() {
+        let tok = sign(
+            "sec",
+            json!({ "userId": "u", "iss": "other-issuer", "exp": future_ts() }),
+        );
+        assert!(matches!(
+            verify("sec", &tok, None, Some("dyspel")),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn iss_set_missing_iss_rejects() {
+        let tok = sign("sec", json!({ "userId": "u", "exp": future_ts() }));
+        assert!(matches!(
+            verify("sec", &tok, None, Some("dyspel")),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn aud_and_iss_both_set_both_match_accepts() {
+        // Combined-strict-mode sanity: production deployments that
+        // share a JWT secret across services SHOULD set both.
+        let tok = sign(
+            "sec",
+            json!({
+                "userId": "u",
+                "aud": "artifacts",
+                "iss": "dyspel",
+                "exp": future_ts(),
+            }),
+        );
+        let claims = verify("sec", &tok, Some("artifacts"), Some("dyspel")).unwrap();
+        assert_eq!(claims.subject(), Some("u"));
+    }
+
+    #[test]
+    fn aud_and_iss_unset_legacy_token_accepts() {
+        // Pin the "no breakage" property explicitly: when neither
+        // strict-mode flag is set, a token without aud/iss (the
+        // current Dyspel shape) still authorizes. Without this test
+        // a future bump to jsonwebtoken that flips a default would
+        // silently break every existing deployment.
+        let tok = sign("sec", json!({ "userId": "u", "exp": future_ts() }));
+        let claims = verify("sec", &tok, None, None).unwrap();
+        assert_eq!(claims.subject(), Some("u"));
     }
 }

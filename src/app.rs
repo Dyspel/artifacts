@@ -108,6 +108,21 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
+    /// Expected JWT `aud` (audience) claim. When set, jwt::verify
+    /// requires the token to carry an `aud` matching this value
+    /// exactly — tokens missing the claim or carrying a different
+    /// audience are rejected. When unset (legacy default), no `aud`
+    /// check happens. Deployments that share the JWT secret across
+    /// services SHOULD set this to the audience their issuer uses.
+    #[arg(long, env = "ARTIFACTS_JWT_EXPECTED_AUD")]
+    pub jwt_expected_aud: Option<String>,
+
+    /// Expected JWT `iss` (issuer) claim. Same shape as
+    /// `--jwt-expected-aud`: when set, jwt::verify pins the
+    /// claim; when unset, no `iss` check happens.
+    #[arg(long, env = "ARTIFACTS_JWT_EXPECTED_ISS")]
+    pub jwt_expected_iss: Option<String>,
+
     /// Path to the SQLite file that stores minted tokens. Defaults to
     /// `<data-dir>/tokens.db` so the token table lives next to the
     /// repos it authorizes.
@@ -201,6 +216,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         public_base_url,
         admin_token,
         jwt_secret,
+        jwt_expected_aud,
+        jwt_expected_iss,
         token_db,
         max_repos_per_user,
         max_commit_blob_bytes,
@@ -269,7 +286,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }),
     };
     if jwt_secret.is_some() {
-        tracing::info!("jwt auth enabled (HS256)");
+        // K2: surface the audience/issuer strict-mode at startup so an
+        // operator can confirm at-a-glance that the trust boundary
+        // they intend is the one in effect. Logging the values (not
+        // secrets) is safe; absence of either is also safe to log.
+        tracing::info!(
+            aud = jwt_expected_aud.as_deref().unwrap_or("<any>"),
+            iss = jwt_expected_iss.as_deref().unwrap_or("<any>"),
+            "jwt auth enabled (HS256)"
+        );
     } else {
         tracing::info!("jwt auth disabled — only admin token accepted");
     }
@@ -278,6 +303,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         public_base_url,
         admin_token,
         jwt_secret,
+        jwt_expected_aud,
+        jwt_expected_iss,
         max_repos_per_user,
         max_commit_blob_bytes,
         max_repo_bytes,

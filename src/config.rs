@@ -21,6 +21,19 @@ pub struct Config {
     /// the auth hot path beyond the brief swap window.
     jwt_secret: RwLock<Option<String>>,
 
+    /// Expected JWT `aud` (audience) claim. When set, jwt::verify
+    /// requires the token to carry an `aud` matching this value;
+    /// when `None`, no `aud` check happens. Set via
+    /// `--jwt-expected-aud` / `ARTIFACTS_JWT_EXPECTED_AUD`. Immutable
+    /// after startup — the claim shape is a deployment property, not
+    /// a key, so no rotation endpoint is exposed.
+    jwt_expected_aud: Option<String>,
+
+    /// Expected JWT `iss` (issuer) claim. Same shape as
+    /// `jwt_expected_aud`. Set via `--jwt-expected-iss` /
+    /// `ARTIFACTS_JWT_EXPECTED_ISS`.
+    jwt_expected_iss: Option<String>,
+
     /// Maximum number of repos a single non-admin user may own. Applies
     /// to both `create_repo` and `fork_repo`. Admin bypasses. Set via
     /// `--max-repos-per-user`.
@@ -57,6 +70,8 @@ impl Config {
         public_base_url: String,
         admin_token: String,
         jwt_secret: Option<String>,
+        jwt_expected_aud: Option<String>,
+        jwt_expected_iss: Option<String>,
         max_repos_per_user: u64,
         max_commit_blob_bytes: usize,
         max_repo_bytes: u64,
@@ -67,11 +82,26 @@ impl Config {
             public_base_url,
             admin_token: RwLock::new(admin_token),
             jwt_secret: RwLock::new(jwt_secret),
+            jwt_expected_aud,
+            jwt_expected_iss,
             max_repos_per_user,
             max_commit_blob_bytes,
             max_repo_bytes,
             readiness_write_check,
         }
+    }
+
+    /// Snapshot the expected JWT `aud` claim, if configured. Returns
+    /// `None` when `--jwt-expected-aud` is unset — jwt::verify then
+    /// skips audience validation. Cheap clone (small string).
+    pub fn jwt_expected_aud(&self) -> Option<&str> {
+        self.jwt_expected_aud.as_deref()
+    }
+
+    /// Snapshot the expected JWT `iss` claim, if configured. Same
+    /// shape as `jwt_expected_aud`.
+    pub fn jwt_expected_iss(&self) -> Option<&str> {
+        self.jwt_expected_iss.as_deref()
     }
 
     /// Snapshot the current JWT secret. Allocates — call once per
@@ -133,6 +163,8 @@ mod tests {
             PathBuf::from("/tmp/x"),
             "http://x".to_string(),
             token.to_string(),
+            None,
+            None,
             None,
             16,
             1024,

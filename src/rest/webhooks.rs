@@ -48,6 +48,8 @@ pub async fn create_webhook(
         &headers,
         &state.cfg.admin_token(),
         state.cfg.jwt_secret().as_deref(),
+        state.cfg.jwt_expected_aud(),
+        state.cfg.jwt_expected_iss(),
     )?;
     state.authn.rate_limit.check(&principal, Class::Token)?;
     if !state.data.storage.exists(&id) {
@@ -74,6 +76,8 @@ pub async fn list_webhooks(
         &headers,
         &state.cfg.admin_token(),
         state.cfg.jwt_secret().as_deref(),
+        state.cfg.jwt_expected_aud(),
+        state.cfg.jwt_expected_iss(),
     )?;
     if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));
@@ -92,6 +96,8 @@ pub async fn delete_webhook(
         &headers,
         &state.cfg.admin_token(),
         state.cfg.jwt_secret().as_deref(),
+        state.cfg.jwt_expected_aud(),
+        state.cfg.jwt_expected_iss(),
     )?;
     if !state.data.storage.exists(&id) {
         return Err(Error::RepoNotFound(id));

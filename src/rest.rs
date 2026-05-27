@@ -211,6 +211,8 @@ pub(crate) fn require_admin(state: &RestState, headers: &HeaderMap) -> Result<()
         headers,
         &state.cfg.admin_token(),
         state.cfg.jwt_secret().as_deref(),
+        state.cfg.jwt_expected_aud(),
+        state.cfg.jwt_expected_iss(),
     )?;
     if !matches!(principal, crate::auth::Principal::Admin) {
         return Err(Error::Forbidden(
