@@ -165,14 +165,21 @@ impl RateLimiter {
 /// staleness threshold `stale_after`. The task ends when the `Arc`
 /// reaches refcount 1 (not load-bearing here — the limiter lives for
 /// the whole server lifetime).
-pub fn spawn_cleanup(limiter: Arc<RateLimiter>, tick: Duration, stale_after: Duration) {
+pub fn spawn_cleanup(
+    limiter: Arc<RateLimiter>,
+    tick: Duration,
+    stale_after: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         loop {
-            ticker.tick().await;
-            limiter.evict_stale(stale_after);
+            tokio::select! {
+                _ = ticker.tick() => limiter.evict_stale(stale_after),
+                _ = cancel.cancelled() => return,
+            }
         }
-    });
+    })
 }
 
 #[cfg(test)]

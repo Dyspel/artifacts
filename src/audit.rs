@@ -433,26 +433,31 @@ pub fn spawn_prune_task(
     store: Arc<dyn AuditStore>,
     tick: std::time::Duration,
     retention: std::time::Duration,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if retention.is_zero() {
         tracing::info!("audit retention disabled — prune task not spawned");
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // Skip the immediate fire so prune doesn't run during boot.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            let cutoff = now_unix_secs().saturating_sub(retention.as_secs() as i64);
-            match store.prune_older_than(cutoff).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(pruned = n, "audit prune"),
-                Err(e) => tracing::error!(error = %e, "audit prune failed"),
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let cutoff = now_unix_secs().saturating_sub(retention.as_secs() as i64);
+                    match store.prune_older_than(cutoff).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(pruned = n, "audit prune"),
+                        Err(e) => tracing::error!(error = %e, "audit prune failed"),
+                    }
+                    refresh_events_stored_gauge(&*store).await;
+                }
+                _ = cancel.cancelled() => return,
             }
-            refresh_events_stored_gauge(&*store).await;
         }
-    });
+    }))
 }
 
 /// One-shot — read the audit event count and publish to the
@@ -476,7 +481,11 @@ pub async fn refresh_events_stored_gauge(store: &dyn AuditStore) {
 /// Same shape as the token / webhook / repo gauges — 60s tick keeps
 /// the value fresh enough for capacity dashboards while a SQLite
 /// `SELECT COUNT(*)` against an indexed table stays cheap.
-pub fn spawn_events_stored_gauge_refresher(store: Arc<dyn AuditStore>, tick: std::time::Duration) {
+pub fn spawn_events_stored_gauge_refresher(
+    store: Arc<dyn AuditStore>,
+    tick: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // The caller populates the gauge synchronously at startup, so
@@ -484,10 +493,12 @@ pub fn spawn_events_stored_gauge_refresher(store: Arc<dyn AuditStore>, tick: std
         // refreshes.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            refresh_events_stored_gauge(&*store).await;
+            tokio::select! {
+                _ = ticker.tick() => refresh_events_stored_gauge(&*store).await,
+                _ = cancel.cancelled() => return,
+            }
         }
-    });
+    })
 }
 
 /// Emit an audit event: both as a live `tracing::info!(target: "audit",

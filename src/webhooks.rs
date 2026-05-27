@@ -883,15 +883,21 @@ pub fn refresh_active_webhook_gauge(registry: &dyn WebhookRegistry) {
 /// shape as `tokens::spawn_active_gauge_refresher`; both run in
 /// parallel so the metrics surface tracks real activity within a
 /// minute.
-pub fn spawn_active_gauge_refresher(registry: Arc<dyn WebhookRegistry>, tick: std::time::Duration) {
+pub fn spawn_active_gauge_refresher(
+    registry: Arc<dyn WebhookRegistry>,
+    tick: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            refresh_active_webhook_gauge(&*registry);
+            tokio::select! {
+                _ = ticker.tick() => refresh_active_webhook_gauge(&*registry),
+                _ = cancel.cancelled() => return,
+            }
         }
-    });
+    })
 }
 
 /// Long-lived task that subscribes to the event bus and enqueues each
@@ -899,19 +905,26 @@ pub fn spawn_active_gauge_refresher(registry: Arc<dyn WebhookRegistry>, tick: st
 /// implement `enqueue_delivery` (MemRegistry), falls back to the
 /// legacy in-process direct-dispatch path so test deployments that
 /// don't open the SQLite store still see webhook firings.
-pub fn spawn_dispatcher(registry: Arc<dyn WebhookRegistry>, bus: crate::events::EventBus) {
+pub fn spawn_dispatcher(
+    registry: Arc<dyn WebhookRegistry>,
+    bus: crate::events::EventBus,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(ev) => dispatch_event(&*registry, &ev).await,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "webhook dispatcher lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(ev) => dispatch_event(&*registry, &ev).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(dropped = n, "webhook dispatcher lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                _ = cancel.cancelled() => return,
             }
         }
-    });
+    })
 }
 
 /// K3 backoff policy for the durable-delivery worker. Doubling base
@@ -942,28 +955,40 @@ fn worker_backoff_secs(attempt: u32) -> i64 {
 /// (which would couple the worker to the enqueue site); a tick of
 /// 1-5s gives near-immediate first-attempt latency without
 /// significant idle work.
-pub fn spawn_delivery_worker(registry: Arc<dyn WebhookRegistry>, tick: std::time::Duration) {
+pub fn spawn_delivery_worker(
+    registry: Arc<dyn WebhookRegistry>,
+    tick: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         loop {
-            ticker.tick().await;
-            let rows = match registry.claim_pending_deliveries(WORKER_BATCH_LIMIT) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "webhook worker: claim_pending failed");
-                    continue;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let rows = match registry.claim_pending_deliveries(WORKER_BATCH_LIMIT) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "webhook worker: claim_pending failed");
+                            continue;
+                        }
+                    };
+                    for row in rows {
+                        let registry = registry.clone();
+                        // ureq is sync — the per-delivery HTTP call goes onto
+                        // the blocking pool so a slow target doesn't tie up
+                        // tokio workers. The registry handle is `Arc`, cheap
+                        // to clone into the closure. We don't track the
+                        // per-delivery handle in the K4 drain set: each call
+                        // has its own 5s timeout and finalizes the row on
+                        // its own; tracking would block shutdown for as long
+                        // as the slowest target takes to respond.
+                        tokio::task::spawn_blocking(move || dispatch_row(&*registry, row));
+                    }
                 }
-            };
-            for row in rows {
-                let registry = registry.clone();
-                // ureq is sync — the per-delivery HTTP call goes onto
-                // the blocking pool so a slow target doesn't tie up
-                // tokio workers. The registry handle is `Arc`, cheap
-                // to clone into the closure.
-                tokio::task::spawn_blocking(move || dispatch_row(&*registry, row));
+                _ = cancel.cancelled() => return,
             }
         }
-    });
+    })
 }
 
 fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
@@ -1690,7 +1715,11 @@ mod tests {
         // wait the production 2s.
         let registry: Arc<dyn WebhookRegistry> =
             Arc::new(SqliteWebhookRegistry::open(&path, test_master_key()).unwrap());
-        spawn_delivery_worker(registry.clone(), std::time::Duration::from_millis(50));
+        spawn_delivery_worker(
+            registry.clone(),
+            std::time::Duration::from_millis(50),
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         // Phase 3 — observe. The listener thread is blocking on
         // accept(); the worker's first tick (within ~50ms of spawn)
@@ -1815,6 +1844,58 @@ mod tests {
         assert!(
             again.is_empty(),
             "row scheduled for the future must not be re-claimed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_handle_resolves_cleanly_on_cancel() {
+        // K4: pin the graceful-shutdown property. Spawn the delivery
+        // worker on a short tick so it's actively polling. Fire
+        // cancel + await the handle with a bounded timeout. The
+        // handle must resolve in well under that bound — if the
+        // tokio::select! arm on the cancel token isn't wired
+        // correctly the test hangs and the timeout fires.
+        let (_d, sqlite_r) = open_sqlite_registry();
+        let registry: Arc<dyn WebhookRegistry> = Arc::new(sqlite_r);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_delivery_worker(
+            registry,
+            std::time::Duration::from_millis(50),
+            cancel.clone(),
+        );
+        // Let the worker actually start its loop and hit the select!
+        // arm at least once before we cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        // 1 second is generous — the worker should drop out of the
+        // select! on the next poll.
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "delivery worker did not resolve within 1s of cancel"
+        );
+        resolved
+            .unwrap()
+            .expect("worker JoinHandle returned an error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatcher_handle_resolves_cleanly_on_cancel() {
+        // Same shape as the worker test but exercises the
+        // spawn_dispatcher select! — that one selects on a
+        // broadcast::Recv vs cancel.cancelled(), structurally
+        // different from the ticker-vs-cancel pattern.
+        let registry: Arc<dyn WebhookRegistry> = Arc::new(MemRegistry::new());
+        let bus = crate::events::EventBus::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_dispatcher(registry, bus, cancel.clone());
+        // Give the dispatcher a beat to subscribe and block on recv.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.cancel();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "dispatcher did not resolve within 1s of cancel"
         );
     }
 

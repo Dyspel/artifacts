@@ -299,7 +299,8 @@ pub(crate) fn refresh_pool_gauges(pool: &crate::db_migrate::DbPool, store: &'sta
 pub fn spawn_pool_gauge_refresher(
     pools: Vec<(&'static str, crate::db_migrate::DbPool)>,
     tick: std::time::Duration,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     // Publish once immediately so the first scrape doesn't see 0.
     for (name, p) in &pools {
         refresh_pool_gauges(p, name);
@@ -308,12 +309,16 @@ pub fn spawn_pool_gauge_refresher(
         let mut ticker = tokio::time::interval(tick);
         ticker.tick().await; // skip the immediate one
         loop {
-            ticker.tick().await;
-            for (name, p) in &pools {
-                refresh_pool_gauges(p, name);
+            tokio::select! {
+                _ = ticker.tick() => {
+                    for (name, p) in &pools {
+                        refresh_pool_gauges(p, name);
+                    }
+                }
+                _ = cancel.cancelled() => return,
             }
         }
-    });
+    })
 }
 
 /// Render the Prometheus exposition. Returns `text/plain; version=0.0.4`

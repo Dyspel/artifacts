@@ -470,7 +470,11 @@ pub async fn refresh_repos_gauge(store: &dyn OwnershipStore) {
 /// `tick` cadence — same shape as `tokens::spawn_active_gauge_refresher`
 /// and `webhooks::spawn_active_gauge_refresher`, all three running in
 /// parallel so each metric stays fresh independently.
-pub fn spawn_repos_gauge_refresher(store: Arc<dyn OwnershipStore>, tick: Duration) {
+pub fn spawn_repos_gauge_refresher(
+    store: Arc<dyn OwnershipStore>,
+    tick: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // Skip the immediate-fire tick — the caller already populates
@@ -478,10 +482,12 @@ pub fn spawn_repos_gauge_refresher(store: Arc<dyn OwnershipStore>, tick: Duratio
         // only.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            refresh_repos_gauge(&*store).await;
+            tokio::select! {
+                _ = ticker.tick() => refresh_repos_gauge(&*store).await,
+                _ = cancel.cancelled() => return,
+            }
         }
-    });
+    })
 }
 
 /// Enforcement helper: caller's `principal` must be permitted to act on

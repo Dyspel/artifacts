@@ -337,6 +337,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // `artifacts_sqlite_pool_in_use{store}` without having to
     // re-thread the concrete types through the rest of the function.
     let mut sqlite_pools: Vec<(&'static str, crate::db_migrate::DbPool)> = Vec::new();
+    // K4: every long-lived spawn helper receives a child token from
+    // this root. On drain we `bg_cancel.cancel()` to broadcast the
+    // shutdown signal, then await every handle in `bg_handles` with
+    // a single overall timeout. Per-event spawn_blocking calls
+    // (webhook delivery, smart-HTTP subprocess plumbing) are NOT in
+    // this set — they own their own short timeouts and shouldn't
+    // block drain.
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let sqlite_tokens = Arc::new(SqliteTokenStore::open(&token_db_path)?);
     sqlite_pools.push(("tokens", sqlite_tokens.pool().clone()));
     // Periodic prune of revoked + expired rows. Without this the
@@ -344,14 +353,23 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // operation = 3.6M rows of dead weight. Runs hourly, with a 24h
     // grace window after expiry so admins can still audit
     // recently-expired tokens before they're gone.
-    tokens::spawn_prune_task(sqlite_tokens.clone(), PRUNE_INTERVAL, TOKEN_PRUNE_GRACE);
+    bg_handles.push(tokens::spawn_prune_task(
+        sqlite_tokens.clone(),
+        PRUNE_INTERVAL,
+        TOKEN_PRUNE_GRACE,
+        bg_cancel.child_token(),
+    ));
     // Populate the active-token gauge before any handler can observe
     // it as zero, then spawn a 60-second refresher so the gauge
     // tracks real mint/revoke activity within a minute rather than
     // waiting for the hourly prune.
     tokens::refresh_active_token_gauge(&*sqlite_tokens).await;
     let tokens: Arc<dyn TokenStore> = sqlite_tokens;
-    tokens::spawn_active_gauge_refresher(tokens.clone(), GAUGE_REFRESH_INTERVAL);
+    bg_handles.push(tokens::spawn_active_gauge_refresher(
+        tokens.clone(),
+        GAUGE_REFRESH_INTERVAL,
+        bg_cancel.child_token(),
+    ));
     // Reuses the same SQLite file for a separate `repos` table.
     // Separate table and separate connection keeps the concerns
     // cleanly split; WAL-mode lets them coexist without lock
@@ -364,7 +382,11 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // create/delete activity. Same cadence and rationale as the
     // active-token / active-webhook gauges spawned above.
     ownership::refresh_repos_gauge(&*ownership).await;
-    ownership::spawn_repos_gauge_refresher(ownership.clone(), GAUGE_REFRESH_INTERVAL);
+    bg_handles.push(ownership::spawn_repos_gauge_refresher(
+        ownership.clone(),
+        GAUGE_REFRESH_INTERVAL,
+        bg_cancel.child_token(),
+    ));
     // Audit log lives in its own DB so it can be archived / rotated
     // independently of the token store. Same WAL-mode SQLite shape;
     // the writer is best-effort (a SQLite hiccup logs but doesn't
@@ -377,18 +399,25 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Hourly retention sweep — same cadence as the token-prune task.
     // `0` days from the CLI flag disables pruning, which
     // `spawn_prune_task` honors by not spawning at all.
-    audit::spawn_prune_task(
+    if let Some(h) = audit::spawn_prune_task(
         audit.clone(),
         PRUNE_INTERVAL,
         Duration::from_secs(audit_retention_days * 86400),
-    );
+        bg_cancel.child_token(),
+    ) {
+        bg_handles.push(h);
+    }
     // Stored-events gauge — populate before the listener starts so
     // the first scrape isn't 0, then a 60s refresher keeps it fresh
     // between hourly prune sweeps (the prune task itself also
     // refreshes after each delete batch). Mirrors the token /
     // webhook / repo gauges spawned above.
     audit::refresh_events_stored_gauge(&*audit).await;
-    audit::spawn_events_stored_gauge_refresher(audit.clone(), GAUGE_REFRESH_INTERVAL);
+    bg_handles.push(audit::spawn_events_stored_gauge_refresher(
+        audit.clone(),
+        GAUGE_REFRESH_INTERVAL,
+        bg_cancel.child_token(),
+    ));
     // Emit a startup audit event so a compliance reviewer can see
     // "when did this server boot, with what security-relevant
     // configuration." Captures the flags that affect the threat
@@ -420,22 +449,24 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Prune stale per-subject buckets every 5 min; buckets not
     // touched for an hour get dropped. Keeps the map from growing
     // unbounded if a lot of short-lived JWT subjects come and go.
-    rate_limit::spawn_cleanup(
+    bg_handles.push(rate_limit::spawn_cleanup(
         rate_limit.clone(),
         Duration::from_secs(300),
         Duration::from_secs(3600),
-    );
+        bg_cancel.child_token(),
+    ));
 
     // Per-IP rate limiter for the two unauth health endpoints. Same
     // shape as `RateLimiter` but keyed on peer IP instead of subject;
     // lives behind a middleware layer attached to `/v1/health*` so
     // authenticated traffic is unaffected.
     let ip_rate_limit = Arc::new(ip_rate_limit::IpRateLimiter::with_defaults());
-    ip_rate_limit::spawn_cleanup(
+    bg_handles.push(ip_rate_limit::spawn_cleanup(
         ip_rate_limit.clone(),
         Duration::from_secs(300),
         Duration::from_secs(3600),
-    );
+        bg_cancel.child_token(),
+    ));
 
     let event_bus = events::EventBus::new();
     // Webhook subscription store: SQLite-backed if
@@ -470,22 +501,38 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // so the broadcast subscriber registers before events start
     // flying. Otherwise the first commit/fork on boot wouldn't reach
     // any subscribers.
-    webhooks::spawn_dispatcher(webhook_registry.clone(), event_bus.clone());
+    bg_handles.push(webhooks::spawn_dispatcher(
+        webhook_registry.clone(),
+        event_bus.clone(),
+        bg_cancel.child_token(),
+    ));
     // K3: durable-outbox delivery worker. Polls the
     // webhook_deliveries table every 2 seconds and drives un-
     // finalized rows toward a terminal outcome. For the in-memory
     // MemRegistry the worker is a no-op (claim_pending returns
     // empty) — direct dispatch via spawn_dispatcher's fallback is
     // what fires in that case.
-    webhooks::spawn_delivery_worker(webhook_registry.clone(), Duration::from_secs(2));
+    bg_handles.push(webhooks::spawn_delivery_worker(
+        webhook_registry.clone(),
+        Duration::from_secs(2),
+        bg_cancel.child_token(),
+    ));
     webhooks::refresh_active_webhook_gauge(&*webhook_registry);
-    webhooks::spawn_active_gauge_refresher(webhook_registry.clone(), GAUGE_REFRESH_INTERVAL);
+    bg_handles.push(webhooks::spawn_active_gauge_refresher(
+        webhook_registry.clone(),
+        GAUGE_REFRESH_INTERVAL,
+        bg_cancel.child_token(),
+    ));
 
     // One task that refreshes every store's pool gauges. Populated by
     // each `SqliteXxxStore::open` call above; an empty `sqlite_pools`
     // (e.g. webhook_registry is the in-memory variant) just becomes
     // a no-op tick.
-    crate::metrics::spawn_pool_gauge_refresher(sqlite_pools, GAUGE_REFRESH_INTERVAL);
+    bg_handles.push(crate::metrics::spawn_pool_gauge_refresher(
+        sqlite_pools,
+        GAUGE_REFRESH_INTERVAL,
+        bg_cancel.child_token(),
+    ));
 
     // Shared drain flag. Flipped from `false` → `true` by the
     // shutdown listener task on first SIGTERM/SIGINT, before
@@ -684,6 +731,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
+        // K4: drain long-lived background tasks before the
+        // server.shutdown audit event so the audit log's last line
+        // truly is post-drain. emit_server_shutdown lives after.
+        drain_background_tasks(
+            &bg_cancel,
+            std::mem::take(&mut bg_handles),
+            shutdown_timeout,
+        )
+        .await;
         emit_server_shutdown(
             &*audit_for_shutdown,
             server_started_at,
@@ -719,6 +775,14 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 ),
             }
         }
+        // K4: drain background tasks here too — same shape as the
+        // TLS branch above.
+        drain_background_tasks(
+            &bg_cancel,
+            std::mem::take(&mut bg_handles),
+            shutdown_timeout,
+        )
+        .await;
         emit_server_shutdown(
             &*audit_for_shutdown,
             server_started_at,
@@ -728,6 +792,40 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .await;
     }
     Ok(())
+}
+
+/// K4: cancel every long-lived background task and await its join.
+/// `overall_timeout` bounds the whole drain — if any single task is
+/// stuck (waiting on SQLite under a lock-poison, say), the drain
+/// returns with the rest abandoned rather than blocking shutdown
+/// forever. The `shutdown_timeout_secs` flag drives this; the
+/// audit-event emission happens AFTER this returns so a compliance
+/// reviewer sees "drained N tasks" / "drain timed out" before the
+/// server.shutdown row.
+async fn drain_background_tasks(
+    cancel: &tokio_util::sync::CancellationToken,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    overall_timeout: Duration,
+) {
+    cancel.cancel();
+    let count = handles.len();
+    if count == 0 {
+        return;
+    }
+    let joined = futures::future::join_all(handles);
+    if overall_timeout.is_zero() {
+        let _ = joined.await;
+        tracing::info!(count, "drained background tasks");
+        return;
+    }
+    match tokio::time::timeout(overall_timeout, joined).await {
+        Ok(_) => tracing::info!(count, "drained background tasks"),
+        Err(_) => tracing::warn!(
+            count,
+            timeout_secs = overall_timeout.as_secs(),
+            "background-task drain timed out — exiting with tasks still running"
+        ),
+    }
 }
 
 /// Refuse to start in the configuration most likely to leak

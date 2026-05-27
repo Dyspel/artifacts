@@ -23,6 +23,10 @@ tokio = { version = "1", features = ["full"] }
 # `sync` brings BroadcastStream — adapter from tokio::sync::broadcast
 # to a Stream usable by axum's Sse response.
 tokio-stream = { version = "0.1", features = ["sync"] }
+# K4 graceful-shutdown drain uses tokio_util::sync::CancellationToken
+# as the broadcast cancel signal across every long-lived spawn site.
+# `rt` feature unlocks the sync + task helpers we need.
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "limit", "timeout"] }
 tracing = "0.1"

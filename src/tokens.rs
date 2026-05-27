@@ -271,21 +271,30 @@ impl SqliteTokenStore {
 /// need a separate metrics-publishing task. The startup-time
 /// `refresh_active_token_gauge` populates the initial value so the
 /// gauge isn't reported as 0 until the first tick fires.
-pub fn spawn_prune_task(store: Arc<SqliteTokenStore>, tick: Duration, expiry_grace: Duration) {
+pub fn spawn_prune_task(
+    store: Arc<SqliteTokenStore>,
+    tick: Duration,
+    expiry_grace: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // Skip the first tick so we don't fire immediately on startup.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            match store.prune(expiry_grace).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(pruned = n, "token prune"),
-                Err(e) => tracing::error!(error = %e, "token prune failed"),
+            tokio::select! {
+                _ = ticker.tick() => {
+                    match store.prune(expiry_grace).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(pruned = n, "token prune"),
+                        Err(e) => tracing::error!(error = %e, "token prune failed"),
+                    }
+                    refresh_active_token_gauge(&*store).await;
+                }
+                _ = cancel.cancelled() => return,
             }
-            refresh_active_token_gauge(&*store).await;
         }
-    });
+    })
 }
 
 /// One-shot — read the active count and publish to the gauge. Called
@@ -306,7 +315,11 @@ pub async fn refresh_active_token_gauge(store: &dyn TokenStore) {
 /// does). The hourly prune task also refreshes after each sweep,
 /// but waiting an hour to see a token-mint reflected in metrics is
 /// too coarse for capacity-planning + anomaly detection use cases.
-pub fn spawn_active_gauge_refresher(store: Arc<dyn TokenStore>, tick: Duration) {
+pub fn spawn_active_gauge_refresher(
+    store: Arc<dyn TokenStore>,
+    tick: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tick);
         // Fire the first interval immediately — we already populate
@@ -314,10 +327,12 @@ pub fn spawn_active_gauge_refresher(store: Arc<dyn TokenStore>, tick: Duration) 
         // here would leave a one-tick lag.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            refresh_active_token_gauge(&*store).await;
+            tokio::select! {
+                _ = ticker.tick() => refresh_active_token_gauge(&*store).await,
+                _ = cancel.cancelled() => return,
+            }
         }
-    });
+    })
 }
 
 #[async_trait]
