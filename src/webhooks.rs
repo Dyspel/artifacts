@@ -7,26 +7,40 @@
 //! `X-Artifacts-Signature: sha256=<hex>` so subscribers can verify
 //! authenticity without trusting the network path.
 //!
-//! ## What this is *not*
+//! ## Durability (K3)
 //!
-//! - Durable. Subscriptions live in memory; restarting the process
-//!   loses them. The store is behind the `WebhookRegistry` trait so a
-//!   future SQLite impl drops in without touching the rest of the
-//!   plumbing — same shape as `TokenStore` / `OwnershipStore`.
-//! - Reliable. Each delivery is best-effort: one HTTP attempt, no
-//!   retries, no dead-letter queue. Subscribers that need
-//!   exactly-once should poll `/v1/events` SSE instead. M6-deliver
-//!   adds retries with exponential backoff.
-//! - Observable beyond stderr. Per-delivery status lives in the
-//!   `tracing` log only; a future commit can plumb counts through
-//!   the Prometheus exporter.
+//! `SqliteWebhookRegistry` is the production path; delivery is
+//! durable via the `webhook_deliveries` outbox table (migration v3).
+//! On each event the dispatcher INSERTs one row per matching
+//! subscription, capturing url + sealed secret + payload. A separate
+//! `spawn_delivery_worker` task polls pending rows on a 2-second
+//! tick, drives each through HTTP with exponential backoff
+//! (1 min × 2^n up to 1 hour, max 8 attempts), and stamps the row
+//! as `success` / `client_error` / `exhausted`. Restart picks up
+//! every un-finalized row — no events lost across crashes.
+//!
+//! `MemRegistry` (in-memory, test-only) doesn't implement the
+//! outbox methods; the dispatcher detects `enqueue_delivery`
+//! returning 0 and falls back to a simpler single-attempt
+//! direct-dispatch path (`legacy_direct_dispatch`). That path is
+//! best-effort and drops on crash — acceptable for test deployments
+//! that opt out of SQLite altogether.
+//!
+//! ## What this is still *not*
+//!
+//! - Observable beyond stderr + Prometheus counters. There's no
+//!   per-row inspection endpoint yet — admin tooling that needs
+//!   "show me failed deliveries" reads the `webhook_deliveries`
+//!   table directly (until a `/v1/admin/webhooks/deliveries`
+//!   endpoint lands).
+//! - Pruned. Finalized rows accumulate forever today; a retention
+//!   sweep (mirroring `audit::spawn_prune_task`) is a follow-up.
 //!
 //! ## Threading
 //!
-//! Delivery runs on a dedicated `tokio::spawn_blocking` per-event so
-//! that a slow webhook target can't tie up axum's request workers.
-//! `ureq` is sync, which suits this use case — the spawn_blocking
-//! call sleeps the blocking-pool thread, never the tokio reactor.
+//! Per-delivery HTTP runs on `tokio::spawn_blocking` (ureq is sync)
+//! so a slow target doesn't stall axum workers. The worker loop
+//! itself is async + polling.
 
 use crate::events::Event;
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine};
@@ -55,14 +69,89 @@ pub struct Subscription {
     pub events: Vec<String>,
 }
 
-/// The registry contract. In-memory `MemRegistry` is the only impl
-/// today; SQLite-backed comes when subscriptions need to survive a
-/// restart.
+/// One row of the durable delivery outbox (K3). Returned by
+/// `claim_pending_deliveries` after the registry has unsealed the
+/// secret. The delivery worker treats this as the source of truth
+/// for an in-flight delivery — `url` + `secret` are denormalized
+/// from the subscription at enqueue time so a subscription edit /
+/// delete during retry doesn't break the delivery.
+#[derive(Debug, Clone)]
+pub struct PendingDelivery {
+    pub id: i64,
+    pub hook_id: String,
+    pub url: String,
+    /// Plaintext HMAC secret (or `None` if the subscription had no
+    /// secret at enqueue time). Already unsealed by the registry —
+    /// the worker never sees ciphertext.
+    pub secret: Option<String>,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub attempts: u32,
+}
+
+/// The registry contract. Today: `MemRegistry` (in-memory, K3 outbox
+/// methods are no-ops — direct dispatch only) and `SqliteWebhookRegistry`
+/// (durable, K3 outbox methods are implemented). The trait shape
+/// matches: callers always go through enqueue + worker for SQLite, fall
+/// back to direct-dispatch when enqueue reports 0 rows.
 pub trait WebhookRegistry: Send + Sync {
     fn add(&self, sub: Subscription) -> String;
     fn list(&self, repo_id: &str) -> Vec<Subscription>;
     fn remove(&self, repo_id: &str, hook_id: &str) -> bool;
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription>;
+
+    /// K3: durable enqueue. INSERT one `webhook_deliveries` row per
+    /// matching subscription, capturing url + sealed secret at enqueue
+    /// time. Returns the count of rows inserted. `Ok(0)` means either
+    /// no matching subscriptions OR the registry doesn't support
+    /// durable delivery (default impl) — callers should fall back to
+    /// direct dispatch in that case.
+    fn enqueue_delivery(
+        &self,
+        _repo_id: &str,
+        _kind: &str,
+        _payload: &[u8],
+    ) -> crate::error::Result<u64> {
+        Ok(0)
+    }
+
+    /// K3: pop up to `limit` un-finalized delivery rows whose
+    /// `next_attempt_at <= now`. The registry unseals the secret
+    /// before returning. Increments the row's `attempts` counter and
+    /// pushes `next_attempt_at` forward by a default backoff window
+    /// so a slow worker can't double-deliver the same row — the
+    /// worker will call `mark_delivery_finalized` or
+    /// `mark_delivery_retry` to record the actual outcome.
+    /// Default impl returns an empty Vec (MemRegistry shape).
+    fn claim_pending_deliveries(&self, _limit: u32) -> crate::error::Result<Vec<PendingDelivery>> {
+        Ok(Vec::new())
+    }
+
+    /// K3: schedule a row for another attempt. Updates `attempts`,
+    /// `last_status`, and `next_attempt_at`. The worker computes the
+    /// new `next_attempt_at` from its own backoff policy.
+    fn mark_delivery_retry(
+        &self,
+        _id: i64,
+        _attempts: u32,
+        _next_attempt_at: i64,
+        _last_status: &str,
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    /// K3: stamp a row as finalized — no further attempts. `outcome`
+    /// is one of {"success", "client_error", "exhausted"}; the
+    /// `last_status` is the last HTTP status code as a string (or a
+    /// transport-error tag) for audit.
+    fn mark_delivery_finalized(
+        &self,
+        _id: i64,
+        _outcome: &str,
+        _last_status: Option<&str>,
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
 
     /// Replace the in-process master key, re-encrypting every existing
     /// secret under it. Returns the count of rows re-encrypted (0
@@ -120,7 +209,7 @@ pub struct SqliteWebhookRegistry {
     master_key: std::sync::RwLock<Arc<crate::secrets::MasterKey>>,
 }
 
-const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
+const MIGRATIONS: [crate::db_migrate::Migration; 3] = [
     crate::db_migrate::Migration {
         version: 1,
         name: "init",
@@ -145,6 +234,69 @@ const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
         version: 2,
         name: "add_secret_nonce_column",
         up: |c| crate::db_migrate::add_column_if_missing(c, "webhooks", "secret_nonce", "BLOB"),
+    },
+    crate::db_migrate::Migration {
+        // K3: durable webhook-delivery outbox. Before this migration,
+        // delivery was best-effort spawn_blocking with a 3-attempt
+        // in-memory retry loop — a process crash mid-delivery dropped
+        // the event silently. With the outbox, every event is INSERT'd
+        // into webhook_deliveries (one row per matching subscription)
+        // before dispatch; the delivery worker polls + drives each row
+        // to a finalized_outcome. Restart picks up un-finalized rows.
+        //
+        // Schema:
+        //   id                 — INTEGER PK; monotonic insertion order
+        //   hook_id            — TEXT; the webhooks.id this delivery
+        //                        targets (kept for forensic tracing;
+        //                        url + secret are denormalized so a
+        //                        post-enqueue edit doesn't break the
+        //                        in-flight delivery)
+        //   url                — TEXT NOT NULL; captured at enqueue
+        //   secret / secret_nonce — BLOB,BLOB ; sealed under the same
+        //                        master key as webhooks.secret. NULL
+        //                        means the subscription had no HMAC
+        //                        secret (delivery goes unsigned).
+        //   kind               — TEXT; event kind for X-Artifacts-Event
+        //                        header + metric label
+        //   payload            — BLOB NOT NULL; the JSON event body
+        //   attempts           — INTEGER NOT NULL DEFAULT 0
+        //   last_status        — TEXT; last HTTP status code as string
+        //                        or transport error tag ("network",
+        //                        "timeout"). Audit-only.
+        //   next_attempt_at    — INTEGER NOT NULL; unix-secs; the
+        //                        worker claims rows with
+        //                        next_attempt_at <= now AND
+        //                        finalized_at IS NULL.
+        //   created_at         — INTEGER NOT NULL
+        //   finalized_at       — INTEGER; set when the row reaches a
+        //                        terminal outcome. After that the row
+        //                        is kept for audit until pruned.
+        //   finalized_outcome  — TEXT ∈ {success, client_error,
+        //                        exhausted}; NULL until finalized.
+        version: 3,
+        name: "add_webhook_deliveries",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     hook_id           TEXT NOT NULL,
+                     url               TEXT NOT NULL,
+                     secret            BLOB,
+                     secret_nonce      BLOB,
+                     kind              TEXT NOT NULL,
+                     payload           BLOB NOT NULL,
+                     attempts          INTEGER NOT NULL DEFAULT 0,
+                     last_status       TEXT,
+                     next_attempt_at   INTEGER NOT NULL,
+                     created_at        INTEGER NOT NULL,
+                     finalized_at      INTEGER,
+                     finalized_outcome TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
+                     ON webhook_deliveries(next_attempt_at)
+                     WHERE finalized_at IS NULL;",
+            )
+        },
     },
 ];
 
@@ -290,6 +442,228 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         Ok(n.max(0) as u64)
     }
 
+    fn enqueue_delivery(
+        &self,
+        repo_id: &str,
+        kind: &str,
+        payload: &[u8],
+    ) -> crate::error::Result<u64> {
+        use rusqlite::params;
+        // Tuple-only alias to keep clippy::type_complexity quiet —
+        // these rows escape the prepare_cached statement borrow into
+        // the per-row loop below, so a public struct would be more
+        // ceremony than the shape warrants.
+        type EnqueueRow = (String, String, Option<String>, Option<Vec<u8>>, String);
+        let now = now_unix_secs();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // SELECT the matching subscriptions inline so we hold one
+        // transaction across the enqueue. Events filter is checked in
+        // Rust to match the rest of matching()'s shape (avoids the
+        // JSON1 dep).
+        let rows: Vec<EnqueueRow> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, url, secret, secret_nonce, events_json
+                 FROM webhooks
+                 WHERE repo_id = ?1 AND revoked_at IS NULL",
+            )?;
+            let v: Vec<_> = stmt
+                .query_map(params![repo_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            v
+        };
+        let mut inserted: u64 = 0;
+        for (hook_id, url, sec_b64, nonce, events_json) in rows {
+            let events: Vec<String> = serde_json::from_str(&events_json).unwrap_or_default();
+            if !events.is_empty() && !events.iter().any(|e| e == kind) {
+                continue;
+            }
+            // Re-encode the sealed secret as a BLOB-shaped column in
+            // webhook_deliveries. Subscription rows store the
+            // ciphertext as base64-in-TEXT (legacy schema); the new
+            // outbox table stores it as raw BLOB to skip the
+            // base64-roundtrip on every claim.
+            let secret_blob: Option<Vec<u8>> = match sec_b64 {
+                Some(b64) => match BASE64_STD.decode(b64.as_bytes()) {
+                    Ok(ct) => Some(ct),
+                    Err(e) => {
+                        tracing::warn!(
+                            hook_id = %hook_id, error = %e,
+                            "enqueue: failed to decode subscription ciphertext; \
+                             dropping secret for this delivery"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            tx.execute(
+                "INSERT INTO webhook_deliveries
+                   (hook_id, url, secret, secret_nonce, kind, payload,
+                    attempts, next_attempt_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)",
+                params![hook_id, url, secret_blob, nonce, kind, payload, now],
+            )?;
+            inserted += 1;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    fn claim_pending_deliveries(&self, limit: u32) -> crate::error::Result<Vec<PendingDelivery>> {
+        use rusqlite::params;
+        let now = now_unix_secs();
+        // Use a generous in-flight reschedule so a worker crash mid-
+        // delivery doesn't double-deliver instantly. 60 seconds is well
+        // beyond the per-attempt HTTP timeout (5s) so a healthy
+        // worker always wins the race against the rescheduler.
+        const INFLIGHT_RESCHEDULE_SECS: i64 = 60;
+        let next_attempt_at = now + INFLIGHT_RESCHEDULE_SECS;
+
+        // Tuple-only alias keeps clippy::type_complexity quiet without
+        // committing to a public DTO struct for a row that exists only
+        // inside this method.
+        type ClaimRow = (
+            i64,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            String,
+            Vec<u8>,
+            i64,
+        );
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // SELECT eligible rows, then UPDATE each to push next_attempt_at
+        // forward + bump attempts. The two-statement shape (inside a
+        // transaction) is what SQLite gives us in place of FOR UPDATE.
+        let rows: Vec<ClaimRow> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, hook_id, url, secret, secret_nonce, kind,
+                        payload, attempts
+                 FROM webhook_deliveries
+                 WHERE finalized_at IS NULL
+                   AND next_attempt_at <= ?1
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )?;
+            let v: Vec<_> = stmt
+                .query_map(params![now, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Vec<u8>>(6)?,
+                        r.get::<_, i64>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            v
+        };
+        let key = self.current_key();
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, hook_id, url, secret_ct, nonce_blob, kind, payload, attempts) in rows {
+            // In-flight reschedule + attempts bump. The worker calls
+            // mark_delivery_retry / mark_delivery_finalized to
+            // overwrite next_attempt_at with the policy-driven value
+            // once it knows the outcome.
+            tx.execute(
+                "UPDATE webhook_deliveries
+                 SET next_attempt_at = ?1, attempts = attempts + 1
+                 WHERE id = ?2",
+                params![next_attempt_at, id],
+            )?;
+            // Unseal under the current master key. The subscription
+            // path treats a unseal failure as "drop the secret, keep
+            // the delivery"; mirror that here so a key rotation race
+            // doesn't crash the worker.
+            let secret = match (secret_ct, nonce_blob) {
+                (Some(ct), Some(nonce_vec)) => match <[u8; 12]>::try_from(nonce_vec.as_slice()) {
+                    Ok(nonce) => match crate::secrets::unseal(&key, &ct, &nonce) {
+                        Ok(pt) => String::from_utf8(pt).ok(),
+                        Err(e) => {
+                            tracing::warn!(
+                                delivery_id = id, hook_id = %hook_id, error = %e,
+                                "claim_pending: secret unseal failed; sending unsigned"
+                            );
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        tracing::warn!(
+                            delivery_id = id, hook_id = %hook_id,
+                            "claim_pending: nonce wrong length; sending unsigned"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+            out.push(PendingDelivery {
+                id,
+                hook_id,
+                url,
+                secret,
+                kind,
+                payload,
+                // attempts is the pre-increment value visible to the
+                // worker (the worker decides backoff based on which
+                // attempt this IS, not which one came before).
+                attempts: (attempts + 1) as u32,
+            });
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    fn mark_delivery_retry(
+        &self,
+        id: i64,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_status: &str,
+    ) -> crate::error::Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE webhook_deliveries
+             SET attempts = ?1, next_attempt_at = ?2, last_status = ?3
+             WHERE id = ?4",
+            rusqlite::params![attempts as i64, next_attempt_at, last_status, id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_delivery_finalized(
+        &self,
+        id: i64,
+        outcome: &str,
+        last_status: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let conn = self.lock();
+        let now = now_unix_secs();
+        conn.execute(
+            "UPDATE webhook_deliveries
+             SET finalized_at = ?1, finalized_outcome = ?2, last_status = ?3
+             WHERE id = ?4",
+            rusqlite::params![now, outcome, last_status, id],
+        )?;
+        Ok(())
+    }
+
     /// Re-encrypt every secret-bearing row under `new`, then atomically
     /// install `new` as the current master key. Holds the connection
     /// mutex for the full operation, so concurrent `add` and `list`
@@ -353,6 +727,15 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         *self.master_key.write().unwrap_or_else(|p| p.into_inner()) = new;
         Ok(count)
     }
+}
+
+/// Unix-seconds clock. Shared by every site in this module that
+/// stamps a row.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn row_to_sub(
@@ -511,10 +894,11 @@ pub fn spawn_active_gauge_refresher(registry: Arc<dyn WebhookRegistry>, tick: st
     });
 }
 
-/// Long-lived task that subscribes to the event bus and dispatches
-/// each event to every matching subscription. Owns its own broadcast
-/// receiver; the registry handle is shared with the REST endpoints
-/// so add/list/remove see the same set the dispatcher walks.
+/// Long-lived task that subscribes to the event bus and enqueues each
+/// event into the durable outbox (K3). For registries that don't
+/// implement `enqueue_delivery` (MemRegistry), falls back to the
+/// legacy in-process direct-dispatch path so test deployments that
+/// don't open the SQLite store still see webhook firings.
 pub fn spawn_dispatcher(registry: Arc<dyn WebhookRegistry>, bus: crate::events::EventBus) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
@@ -530,12 +914,161 @@ pub fn spawn_dispatcher(registry: Arc<dyn WebhookRegistry>, bus: crate::events::
     });
 }
 
+/// K3 backoff policy for the durable-delivery worker. Doubling base
+/// of 1 minute up to a 1-hour ceiling, with a hard MAX_ATTEMPTS=8
+/// after which a row is finalized "exhausted". This is more generous
+/// than the legacy in-process retry (3 attempts over ~3.5s) — the
+/// outbox is what makes the long tail safe.
+const WORKER_MAX_ATTEMPTS: u32 = 8;
+const WORKER_BACKOFF_BASE_SECS: i64 = 60;
+const WORKER_BACKOFF_MAX_SECS: i64 = 3600;
+const WORKER_HTTP_TIMEOUT_SECS: u64 = 5;
+const WORKER_BATCH_LIMIT: u32 = 32;
+
+fn worker_backoff_secs(attempt: u32) -> i64 {
+    // attempt 1 → base; attempt 2 → 2*base; … capped at MAX.
+    let shift = attempt.saturating_sub(1).min(20);
+    let secs = WORKER_BACKOFF_BASE_SECS.saturating_mul(1i64 << shift);
+    secs.min(WORKER_BACKOFF_MAX_SECS)
+}
+
+/// Long-lived task that drives the durable outbox. Polls
+/// `claim_pending_deliveries` on a tick, delivers each row via the
+/// shared HTTP-deliver routine, and stamps the result back into the
+/// row. Restart-safe: rows un-finalized at shutdown remain claimable
+/// after the next process starts.
+///
+/// `tick`: cadence between polls. Polling avoids a NOTIFY signal path
+/// (which would couple the worker to the enqueue site); a tick of
+/// 1-5s gives near-immediate first-attempt latency without
+/// significant idle work.
+pub fn spawn_delivery_worker(registry: Arc<dyn WebhookRegistry>, tick: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        loop {
+            ticker.tick().await;
+            let rows = match registry.claim_pending_deliveries(WORKER_BATCH_LIMIT) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "webhook worker: claim_pending failed");
+                    continue;
+                }
+            };
+            for row in rows {
+                let registry = registry.clone();
+                // ureq is sync — the per-delivery HTTP call goes onto
+                // the blocking pool so a slow target doesn't tie up
+                // tokio workers. The registry handle is `Arc`, cheap
+                // to clone into the closure.
+                tokio::task::spawn_blocking(move || dispatch_row(&*registry, row));
+            }
+        }
+    });
+}
+
+fn dispatch_row(registry: &dyn WebhookRegistry, row: PendingDelivery) {
+    let signature = sign_body(row.secret.as_deref(), &row.payload);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(WORKER_HTTP_TIMEOUT_SECS))
+        .build();
+    let mut req = agent
+        .post(&row.url)
+        .set("Content-Type", "application/json")
+        .set("X-Artifacts-Hook-Id", &row.hook_id)
+        .set("X-Artifacts-Event", &row.kind)
+        .set("X-Artifacts-Attempt", &row.attempts.to_string())
+        .set("X-Artifacts-Delivery-Id", &row.id.to_string());
+    if let Some(sig) = signature.as_deref() {
+        req = req.set("X-Artifacts-Signature", sig);
+    }
+    match req.send_bytes(&row.payload) {
+        Ok(resp) => {
+            let status = resp.status();
+            if (200..400).contains(&status) {
+                let _ =
+                    registry.mark_delivery_finalized(row.id, "success", Some(&status.to_string()));
+                metrics::counter!(
+                    "artifacts_webhook_deliveries_total",
+                    "kind" => row.kind.clone(),
+                    "outcome" => "success",
+                )
+                .increment(1);
+                return;
+            }
+            if (500..600).contains(&status) {
+                // Retryable.
+                if row.attempts >= WORKER_MAX_ATTEMPTS {
+                    finalize_exhausted(registry, &row, Some(&status.to_string()));
+                } else {
+                    let next = now_unix_secs() + worker_backoff_secs(row.attempts);
+                    let _ = registry.mark_delivery_retry(
+                        row.id,
+                        row.attempts,
+                        next,
+                        &status.to_string(),
+                    );
+                    tracing::warn!(
+                        delivery_id = row.id, hook = %row.hook_id, url = %row.url,
+                        status, attempt = row.attempts, next_secs = next - now_unix_secs(),
+                        "webhook 5xx; will retry"
+                    );
+                }
+            } else {
+                // 4xx — terminal client error.
+                let _ = registry.mark_delivery_finalized(
+                    row.id,
+                    "client_error",
+                    Some(&status.to_string()),
+                );
+                tracing::warn!(
+                    delivery_id = row.id, hook = %row.hook_id, url = %row.url,
+                    status, attempt = row.attempts, "webhook 4xx; not retrying"
+                );
+                metrics::counter!(
+                    "artifacts_webhook_deliveries_total",
+                    "kind" => row.kind.clone(),
+                    "outcome" => "client_error",
+                )
+                .increment(1);
+            }
+        }
+        Err(e) => {
+            // Network / transport / timeout — all retryable.
+            if row.attempts >= WORKER_MAX_ATTEMPTS {
+                finalize_exhausted(registry, &row, Some("network"));
+            } else {
+                let next = now_unix_secs() + worker_backoff_secs(row.attempts);
+                let _ = registry.mark_delivery_retry(row.id, row.attempts, next, "network");
+                tracing::warn!(
+                    delivery_id = row.id, hook = %row.hook_id, url = %row.url,
+                    attempt = row.attempts, error = %e,
+                    "webhook delivery failed; will retry"
+                );
+            }
+        }
+    }
+}
+
+fn finalize_exhausted(
+    registry: &dyn WebhookRegistry,
+    row: &PendingDelivery,
+    last_status: Option<&str>,
+) {
+    let _ = registry.mark_delivery_finalized(row.id, "exhausted", last_status);
+    metrics::counter!(
+        "artifacts_webhook_deliveries_total",
+        "kind" => row.kind.clone(),
+        "outcome" => "exhausted",
+    )
+    .increment(1);
+    tracing::warn!(
+        delivery_id = row.id, hook = %row.hook_id, url = %row.url,
+        "webhook delivery exhausted after {} attempts", row.attempts
+    );
+}
+
 async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
     let (repo_id, kind) = repo_and_kind(ev);
-    let subs = registry.matching(repo_id, kind);
-    if subs.is_empty() {
-        return;
-    }
     let body = match serde_json::to_vec(ev) {
         Ok(b) => b,
         Err(e) => {
@@ -543,96 +1076,85 @@ async fn dispatch_event(registry: &dyn WebhookRegistry, ev: &Event) {
             return;
         }
     };
+    // Try the durable outbox first. Ok(n) with n > 0 means rows are
+    // queued; the delivery worker picks them up on its next tick.
+    // Ok(0) means either no matching subs OR a registry that doesn't
+    // implement enqueue (MemRegistry default) — fall back to legacy
+    // direct dispatch so the in-memory test path still fires hooks.
+    match registry.enqueue_delivery(repo_id, kind, &body) {
+        Ok(n) if n > 0 => {}
+        Ok(_) => legacy_direct_dispatch(registry, ev, body),
+        Err(e) => {
+            tracing::error!(error = %e, "webhook enqueue failed; falling back to direct dispatch");
+            legacy_direct_dispatch(registry, ev, body);
+        }
+    }
+}
+
+/// Pre-K3 single-attempt direct dispatch — kept so MemRegistry-backed
+/// deployments (tests, dev) still see webhook firings without a
+/// SQLite outbox. Production deployments go through the durable
+/// outbox + worker pair instead.
+fn legacy_direct_dispatch(registry: &dyn WebhookRegistry, ev: &Event, body: Vec<u8>) {
+    let (repo_id, kind) = repo_and_kind(ev);
+    let subs = registry.matching(repo_id, kind);
+    if subs.is_empty() {
+        return;
+    }
+    let kind_owned = kind.to_string();
     for sub in subs {
         let body = body.clone();
-        // ureq is sync — push it onto the blocking pool so a slow
-        // webhook target can't stall the tokio runtime. We retry
-        // up to MAX_ATTEMPTS times with exponential backoff so a
-        // brief receiver outage doesn't drop events; permanent
-        // failures still log and give up.
+        let kind = kind_owned.clone();
         tokio::task::spawn_blocking(move || {
-            const MAX_ATTEMPTS: u32 = 3;
-            // 0.5s, 1s, 2s — total worst-case wall time ~3.5s
-            // on top of per-attempt timeout. Picked low because a
-            // running event bus shouldn't queue events behind a
-            // single dead subscription for a minute+.
-            const BACKOFF_BASE_MS: u64 = 500;
-
             let signature = sign_body(sub.secret.as_deref(), &body);
-            let kind = kind_str(&body);
-            for attempt in 1..=MAX_ATTEMPTS {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build();
-                let mut req = agent
-                    .post(&sub.url)
-                    .set("Content-Type", "application/json")
-                    .set("X-Artifacts-Hook-Id", &sub.id)
-                    .set("X-Artifacts-Event", &kind)
-                    .set("X-Artifacts-Attempt", &attempt.to_string());
-                if let Some(sig) = signature.as_deref() {
-                    req = req.set("X-Artifacts-Signature", sig);
-                }
-                let outcome = match req.send_bytes(&body) {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if (200..400).contains(&status) {
-                            metrics::counter!(
-                                "artifacts_webhook_deliveries_total",
-                                "kind" => kind.clone(),
-                                "outcome" => "success",
-                            )
-                            .increment(1);
-                            return;
-                        }
-                        // Treat 5xx as retryable, 4xx as terminal —
-                        // the receiver is telling us the request is
-                        // wrong, retrying won't help. Mirrors what
-                        // most webhook frameworks do.
-                        if (500..600).contains(&status) {
-                            tracing::warn!(
-                                hook = %sub.id, url = %sub.url, status, attempt,
-                                "webhook 5xx; will retry"
-                            );
-                            "retry"
-                        } else {
-                            tracing::warn!(
-                                hook = %sub.id, url = %sub.url, status, attempt,
-                                "webhook 4xx; not retrying"
-                            );
-                            metrics::counter!(
-                                "artifacts_webhook_deliveries_total",
-                                "kind" => kind.clone(),
-                                "outcome" => "client_error",
-                            )
-                            .increment(1);
-                            return;
-                        }
-                    }
-                    Err(e) => {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(WORKER_HTTP_TIMEOUT_SECS))
+                .build();
+            let mut req = agent
+                .post(&sub.url)
+                .set("Content-Type", "application/json")
+                .set("X-Artifacts-Hook-Id", &sub.id)
+                .set("X-Artifacts-Event", &kind)
+                .set("X-Artifacts-Attempt", "1");
+            if let Some(sig) = signature.as_deref() {
+                req = req.set("X-Artifacts-Signature", sig);
+            }
+            match req.send_bytes(&body) {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let outcome = if (200..400).contains(&status) {
+                        "success"
+                    } else if (500..600).contains(&status) {
+                        "exhausted"
+                    } else {
+                        "client_error"
+                    };
+                    metrics::counter!(
+                        "artifacts_webhook_deliveries_total",
+                        "kind" => kind.clone(),
+                        "outcome" => outcome,
+                    )
+                    .increment(1);
+                    if outcome != "success" {
                         tracing::warn!(
-                            hook = %sub.id, url = %sub.url, attempt, error = %e,
-                            "webhook delivery failed; will retry"
+                            hook = %sub.id, url = %sub.url, status,
+                            "legacy direct-dispatch: non-2xx (single attempt)"
                         );
-                        "retry"
                     }
-                };
-
-                if attempt < MAX_ATTEMPTS && outcome == "retry" {
-                    let delay_ms = BACKOFF_BASE_MS * (1u64 << (attempt - 1));
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hook = %sub.id, url = %sub.url, error = %e,
+                        "legacy direct-dispatch: transport error (single attempt)"
+                    );
+                    metrics::counter!(
+                        "artifacts_webhook_deliveries_total",
+                        "kind" => kind.clone(),
+                        "outcome" => "exhausted",
+                    )
+                    .increment(1);
                 }
             }
-            metrics::counter!(
-                "artifacts_webhook_deliveries_total",
-                "kind" => kind.clone(),
-                "outcome" => "exhausted",
-            )
-            .increment(1);
-            tracing::warn!(
-                hook = %sub.id, url = %sub.url,
-                "webhook delivery gave up after {} attempts", MAX_ATTEMPTS,
-            );
         });
     }
 }
@@ -663,20 +1185,6 @@ fn repo_and_kind(ev: &Event) -> (&str, &str) {
         Event::Fork { parent_repo_id, .. } => (parent_repo_id, "fork"),
         Event::Status { repo_id, .. } => (repo_id, "status"),
     }
-}
-
-/// Read the `kind` value out of the already-serialized event body.
-/// Used to set the `X-Artifacts-Event` header without re-borrowing
-/// the typed Event after we've moved the body into a blocking task.
-fn kind_str(body: &[u8]) -> String {
-    let s = std::str::from_utf8(body).unwrap_or("");
-    if let Some(start) = s.find("\"kind\":\"") {
-        let after = &s[start + 8..];
-        if let Some(end) = after.find('"') {
-            return after[..end].to_string();
-        }
-    }
-    "unknown".to_string()
 }
 
 #[cfg(test)]
@@ -786,17 +1294,6 @@ mod tests {
     #[test]
     fn sign_body_returns_none_without_secret() {
         assert!(sign_body(None, b"x").is_none());
-    }
-
-    #[test]
-    fn kind_str_extracts_the_kind_key() {
-        let body = br#"{"kind":"commit","repoId":"r1"}"#;
-        assert_eq!(kind_str(body), "commit");
-    }
-
-    #[test]
-    fn kind_str_returns_unknown_on_garbage() {
-        assert_eq!(kind_str(b"not json"), "unknown");
     }
 
     fn test_master_key() -> Arc<crate::secrets::MasterKey> {
@@ -1114,5 +1611,232 @@ mod tests {
         let plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
         assert!(plaintexts.contains(&"legacy-plaintext"));
         assert!(plaintexts.contains(&"encrypted-row"));
+    }
+
+    // K3 — durable webhook outbox.
+    //
+    // The acceptance scenario the goal calls for: a row sitting
+    // un-finalized when the process restarts must be picked up by the
+    // delivery worker and driven to a terminal outcome. We simulate
+    // the restart by raw-INSERT-ing a pending row into the SQLite
+    // file, dropping the registry handle, reopening on the same path,
+    // and asserting the worker delivers it.
+
+    /// Tiny one-shot HTTP listener. Accepts one TCP connection,
+    /// reads the request bytes (up to 4 KiB; webhooks are small),
+    /// replies 200 OK, and ships the captured bytes through a
+    /// channel. Lives in a single thread so the test's tokio runtime
+    /// stays clean. Returns (url, receiver).
+    fn spawn_one_shot_listener() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe socket");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = tx.send(req);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/hook"), rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn outbox_redelivers_after_simulated_restart() {
+        let (server_url, recv) = spawn_one_shot_listener();
+
+        // Phase 1 — pre-restart. Open the registry against a fresh
+        // SQLite path, then raw-INSERT a pending row pointing at the
+        // listener. Dropping the registry simulates a process crash
+        // mid-delivery: the row is durably on disk, no worker is
+        // running, nobody finalized it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.db");
+        {
+            let _r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO webhook_deliveries
+                   (hook_id, url, secret, secret_nonce, kind, payload,
+                    attempts, next_attempt_at, created_at)
+                 VALUES ('h-pre-restart', ?1, NULL, NULL, 'commit', ?2,
+                         0, ?3, ?3)",
+                rusqlite::params![server_url, br#"{"kind":"commit"}"#.to_vec(), 0i64],
+            )
+            .unwrap();
+            // Confirm the row is in the file before we drop the registry.
+            let pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM webhook_deliveries
+                     WHERE finalized_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending, 1, "expected one un-finalized row pre-restart");
+        }
+
+        // Phase 2 — post-restart. Reopen on the same file with a
+        // FRESH master key (the row's secret is NULL so the new key
+        // never has to unseal anything; this also pins that the
+        // worker doesn't depend on the old in-memory key state) and
+        // spawn the worker on a fast tick so the test doesn't have to
+        // wait the production 2s.
+        let registry: Arc<dyn WebhookRegistry> =
+            Arc::new(SqliteWebhookRegistry::open(&path, test_master_key()).unwrap());
+        spawn_delivery_worker(registry.clone(), std::time::Duration::from_millis(50));
+
+        // Phase 3 — observe. The listener thread is blocking on
+        // accept(); the worker's first tick (within ~50ms of spawn)
+        // should pick the row up and POST to it. A 5-second window
+        // is generous on CI.
+        let req = tokio::task::spawn_blocking(move || {
+            recv.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .expect("listener never received a request");
+        assert!(req.starts_with("POST "), "expected POST, got:\n{req}");
+        assert!(
+            req.contains("X-Artifacts-Hook-Id: h-pre-restart"),
+            "expected hook-id header to flow through: \n{req}"
+        );
+        assert!(
+            req.contains("X-Artifacts-Event: commit"),
+            "expected event-kind header to flow through:\n{req}"
+        );
+
+        // Phase 4 — confirm the row was finalized. The worker stamps
+        // finalized_at + finalized_outcome on success; we poll the DB
+        // for up to 2 seconds so the assertion isn't a flaky race.
+        let path_clone = path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&path_clone).unwrap();
+            for _ in 0..40 {
+                let row: rusqlite::Result<(i64, String)> = conn.query_row(
+                    "SELECT finalized_at, finalized_outcome
+                     FROM webhook_deliveries
+                     WHERE id = 1",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        ))
+                    },
+                );
+                if let Ok((finalized_at, outcome)) = row {
+                    if finalized_at > 0 {
+                        return outcome;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome, "success",
+            "row was not finalized as success after the worker delivered it"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_creates_one_row_per_matching_subscription() {
+        // Setup: a subscription with two matching kinds.
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere.invalid".into(),
+            secret: None,
+            events: vec!["commit".into(), "fork".into()],
+        });
+        // Plus a subscription that doesn't match this kind.
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere2.invalid".into(),
+            secret: None,
+            events: vec!["fork".into()],
+        });
+        // Plus a subscription on a different repo.
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r2".into(),
+            url: "http://nowhere3.invalid".into(),
+            secret: None,
+            events: vec![],
+        });
+
+        let n = r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
+        assert_eq!(
+            n, 1,
+            "only the kind-matching r1 subscription should enqueue"
+        );
+
+        // empty-events subscription matches every kind.
+        let n2 = r.enqueue_delivery("r2", "commit", br#"{}"#).unwrap();
+        assert_eq!(n2, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_retry_pushes_next_attempt_forward() {
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere.invalid".into(),
+            secret: None,
+            events: vec![],
+        });
+        let n = r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
+        assert_eq!(n, 1);
+
+        // Claim moves the row's next_attempt_at forward by 60s. The
+        // worker would then mark it retry with a real backoff; we
+        // emulate that and assert the row stays un-finalized.
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        let id = claimed[0].id;
+        let future = now_unix_secs() + 3600;
+        r.mark_delivery_retry(id, 2, future, "503").unwrap();
+
+        // Re-claim now returns nothing (row's next_attempt_at is 1h
+        // in the future).
+        let again = r.claim_pending_deliveries(10).unwrap();
+        assert!(
+            again.is_empty(),
+            "row scheduled for the future must not be re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_finalized_makes_row_un_claimable() {
+        let (_d, r) = open_sqlite_registry();
+        r.add(Subscription {
+            id: String::new(),
+            repo_id: "r1".into(),
+            url: "http://nowhere.invalid".into(),
+            secret: None,
+            events: vec![],
+        });
+        r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
+        let claimed = r.claim_pending_deliveries(10).unwrap();
+        let id = claimed[0].id;
+        r.mark_delivery_finalized(id, "success", Some("200"))
+            .unwrap();
+        let again = r.claim_pending_deliveries(10).unwrap();
+        assert!(
+            again.is_empty(),
+            "finalized rows must not be claimable again"
+        );
     }
 }

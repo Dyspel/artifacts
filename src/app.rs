@@ -471,6 +471,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // flying. Otherwise the first commit/fork on boot wouldn't reach
     // any subscribers.
     webhooks::spawn_dispatcher(webhook_registry.clone(), event_bus.clone());
+    // K3: durable-outbox delivery worker. Polls the
+    // webhook_deliveries table every 2 seconds and drives un-
+    // finalized rows toward a terminal outcome. For the in-memory
+    // MemRegistry the worker is a no-op (claim_pending returns
+    // empty) — direct dispatch via spawn_dispatcher's fallback is
+    // what fires in that case.
+    webhooks::spawn_delivery_worker(webhook_registry.clone(), Duration::from_secs(2));
     webhooks::refresh_active_webhook_gauge(&*webhook_registry);
     webhooks::spawn_active_gauge_refresher(webhook_registry.clone(), GAUGE_REFRESH_INTERVAL);
 
