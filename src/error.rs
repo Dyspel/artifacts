@@ -275,7 +275,21 @@ impl IntoResponse for Error {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
         };
-        let body = Json(json!({ "error": { "code": code, "message": self.to_string() } }));
+        // 5xx responses MUST NOT echo the underlying Display chain to
+        // the wire. The chain leaks file paths (Io), anyhow `.context()`
+        // strings (Other), and gix internals (GixError) — enough to
+        // help an attacker probe filesystem layout or feature flags.
+        // The full Display already went to `tracing::error!` above, so
+        // operators see the detail in logs while the wire surface stays
+        // opaque. 4xx responses keep their Display text because the
+        // content is already user-input-shaped (echoed repo ids, pack
+        // parse messages bounded by the parser's vocabulary, etc.).
+        let message = if status.is_server_error() {
+            "internal".to_string()
+        } else {
+            self.to_string()
+        };
+        let body = Json(json!({ "error": { "code": code, "message": message } }));
         let mut resp = (status, body).into_response();
         if matches!(self, Error::UnauthorizedBasic) {
             resp.headers_mut().insert(
@@ -399,10 +413,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_returns_500_with_internal_code() {
-        let resp = Error::Other(anyhow::anyhow!("boom")).into_response();
+    async fn other_returns_500_with_internal_code_and_redacted_message() {
+        // The underlying anyhow chain ("boom" + any added context)
+        // must NOT reach the wire — operators see it in tracing::error
+        // logs, callers see only "internal".
+        let resp = Error::Other(anyhow::anyhow!("boom: secret /etc/shadow")).into_response();
         let v = body_json(resp).await;
         assert_eq!(v["status"], 500);
         assert_eq!(v["body"]["error"]["code"], "internal");
+        assert_eq!(v["body"]["error"]["message"], "internal");
+        // Belt-and-suspenders: the leaky bits must not be in the body
+        // anywhere, including any future fields we might add.
+        let serialized = serde_json::to_string(&v["body"]).unwrap();
+        assert!(
+            !serialized.contains("boom") && !serialized.contains("shadow"),
+            "5xx body must not contain underlying error detail: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn io_returns_500_with_internal_code_and_redacted_message() {
+        // An Io error typically wraps a path; that path must not
+        // reach the wire on a 5xx.
+        let inner = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found: /var/secret/passwords.db",
+        );
+        let resp = Error::Io(inner).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 500);
+        assert_eq!(v["body"]["error"]["code"], "internal");
+        assert_eq!(v["body"]["error"]["message"], "internal");
+        let serialized = serde_json::to_string(&v["body"]).unwrap();
+        assert!(
+            !serialized.contains("/var/secret") && !serialized.contains("passwords.db"),
+            "Io 5xx body must not contain the leaked path: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gix_returns_500_with_internal_code_and_redacted_message() {
+        // GixError wraps a String that call sites build from gix
+        // internals (pack offsets, ODB paths, oid lookups). The wire
+        // must say only "internal".
+        let resp =
+            Error::GixError("find_object(deadbeef): odb at /data/repos/r1.git missing".to_string())
+                .into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 500);
+        assert_eq!(v["body"]["error"]["code"], "internal");
+        assert_eq!(v["body"]["error"]["message"], "internal");
+        let serialized = serde_json::to_string(&v["body"]).unwrap();
+        assert!(
+            !serialized.contains("/data/repos") && !serialized.contains("deadbeef"),
+            "GixError 5xx body must not contain gix internals: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_parse_returns_400_and_keeps_user_facing_message() {
+        // 4xx variants are NOT redacted — their Display is already
+        // user-input-shaped and aids debugging at the callsite. Pin
+        // that PackParse keeps its message so the redaction logic
+        // doesn't over-broaden by status family.
+        let resp = Error::PackParse("expected PACK magic, got DEAD".to_string()).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 400);
+        assert_eq!(v["body"]["error"]["code"], "pack_parse");
+        assert!(
+            v["body"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("expected PACK magic"),
+            "4xx message must surface the user-input-shaped detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_request_keeps_user_facing_message() {
+        // Same property as pack_parse — BadRequest is the other
+        // common 4xx that lets callers know what they sent wrong.
+        let resp = Error::BadRequest("missing field: branch".to_string()).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 400);
+        assert_eq!(v["body"]["error"]["code"], "bad_request");
+        assert_eq!(
+            v["body"]["error"]["message"].as_str().unwrap(),
+            "bad request: missing field: branch"
+        );
     }
 }
