@@ -18,7 +18,7 @@
 use crate::{
     alternates_cache, audit, commits,
     config::Config,
-    events, ip_rate_limit, merge, metrics, object_store,
+    events, gc, ip_rate_limit, merge, metrics, object_store,
     ownership::{self, OwnershipStore, SqliteOwnershipStore},
     rate_limit::{self, RateLimiter},
     reads,
@@ -197,6 +197,23 @@ pub struct ServeArgs {
     #[arg(long, env = "ARTIFACTS_REQUEST_TIMEOUT_SECS", default_value_t = 300)]
     pub request_timeout_secs: u64,
 
+    /// L3: cadence for the periodic GC sweep, in seconds. The
+    /// sweep walks every repo on disk and runs the existing
+    /// alternates-aware preview+run cycle against each. `0`
+    /// disables (matches the prune-task shape across the codebase).
+    /// Default 86400 (daily) is a conservative starting point;
+    /// deployments with high create/delete churn can tighten.
+    #[arg(long, env = "ARTIFACTS_GC_INTERVAL_SECS", default_value_t = 86400)]
+    pub gc_interval_secs: u64,
+
+    /// L3: anti-race guard for the periodic GC sweep. An
+    /// unreachable loose object younger than this is skipped — it
+    /// might belong to a push that's mid-stream (objects on disk,
+    /// ref not yet committed). Default 7200 (2h) matches the
+    /// admin-endpoint default.
+    #[arg(long, env = "ARTIFACTS_GC_MIN_OBJECT_AGE_SECS", default_value_t = 7200)]
+    pub gc_min_object_age_secs: u64,
+
     /// REST surface (`/v1/*`) per-request body cap, in bytes. Bodies
     /// larger than this get 413 before the JSON deserializer
     /// allocates anything. Default 1 MiB is well above realistic
@@ -261,6 +278,8 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         shutdown_drain_delay_secs,
         audit_retention_days,
         request_timeout_secs,
+        gc_interval_secs,
+        gc_min_object_age_secs,
         rest_body_limit_bytes,
         git_body_limit_bytes,
         allow_insecure,
@@ -568,6 +587,37 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         bg_cancel.child_token(),
     ));
 
+    // Shared AlternatesCache: the REST state carries it (for the
+    // gc-preview/run endpoints) and the L3 periodic sweep below
+    // reuses the same instance so both paths benefit from the
+    // same hot cache. Pre-K4 this was inlined into RestState.
+    let alternates_cache = Arc::new(alternates_cache::AlternatesCache::new());
+
+    // L3: scheduled GC sweep. Walks every repo on disk on the
+    // configured tick and runs the existing alternates-aware
+    // preview+run cycle. `--gc-interval-secs=0` opts out — useful
+    // for deployments that prefer to drive GC from a sibling cron
+    // / k8s job, or that don't want background disk activity at
+    // all. Picks up the K4 CancellationToken pattern so server
+    // shutdown drains the in-flight sweep.
+    if gc_interval_secs > 0 {
+        bg_handles.push(gc::spawn_periodic_sweep(
+            cfg.repos_dir(),
+            alternates_cache.clone(),
+            objects.clone(),
+            Duration::from_secs(gc_interval_secs),
+            gc_min_object_age_secs,
+            bg_cancel.child_token(),
+        ));
+        tracing::info!(
+            gc_interval_secs,
+            gc_min_object_age_secs,
+            "gc: periodic sweep enabled"
+        );
+    } else {
+        tracing::info!("gc: periodic sweep disabled (--gc-interval-secs=0)");
+    }
+
     // Shared drain flag. Flipped from `false` → `true` by the
     // shutdown listener task on first SIGTERM/SIGINT, before
     // axum-server begins refusing connections. The readiness probe
@@ -593,7 +643,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             ownership,
             refs: refs.clone(),
             objects: objects.clone(),
-            alternates_cache: Arc::new(alternates_cache::AlternatesCache::new()),
+            alternates_cache: alternates_cache.clone(),
         },
         authn: crate::rest::AuthnState {
             tokens: tokens.clone(),

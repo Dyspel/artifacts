@@ -51,7 +51,8 @@ use crate::alternates_cache::AlternatesCache;
 use crate::error::{Error, Result};
 use crate::object_store::ObjectStore;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Read-only summary of what a GC pass would do. Returned by the
 /// preview endpoint as JSON; field names are camelCase via serde
@@ -329,6 +330,122 @@ fn rev_list_objects(repos_dir: &Path, repo_id: &str) -> Result<Vec<String>> {
 // `ObjectStore::list_loose` and `ObjectStore::delete_loose`
 // respectively — gc is now backend-neutral.
 
+/// L3: one pass of the periodic GC sweep. Enumerates every repo on
+/// disk under `repos_dir` (every `<id>.git` subdirectory) and runs
+/// the existing alternates-aware `run()` against each, honoring
+/// `min_age_secs` as the anti-race guard. Logs an aggregate at the
+/// end so an operator sees a single "swept N repos, reclaimed M
+/// bytes" line per tick rather than per-repo noise.
+///
+/// Synchronous on purpose — the periodic spawn wraps this in
+/// `tokio::task::spawn_blocking` so the gix + subprocess work
+/// doesn't tie up tokio workers. Tests call this directly without
+/// the scheduling layer.
+fn run_sweep(
+    repos_dir: &Path,
+    cache: &AlternatesCache,
+    objects: &dyn ObjectStore,
+    min_age_secs: u64,
+) {
+    let entries = match std::fs::read_dir(repos_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                error = %e, dir = %repos_dir.display(),
+                "gc sweep: read_dir failed"
+            );
+            return;
+        }
+    };
+    let mut total_deleted = 0u64;
+    let mut total_bytes = 0u64;
+    let mut repo_count = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(repo_id) = name_str.strip_suffix(".git") else {
+            continue;
+        };
+        // Some disk layouts include hidden state directories that
+        // happen to end in `.git`; skip anything that isn't a
+        // directory.
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        repo_count += 1;
+        match run(repos_dir, repo_id, cache, min_age_secs, objects) {
+            Ok(r) => {
+                total_deleted += r.deleted;
+                total_bytes += r.deleted_bytes;
+            }
+            Err(e) => {
+                // Per-repo errors are soft — a broken repo in one
+                // corner shouldn't abort the whole sweep.
+                tracing::warn!(
+                    repo = %repo_id, error = %e,
+                    "gc sweep: per-repo run failed; skipping"
+                );
+            }
+        }
+    }
+    if total_deleted > 0 || total_bytes > 0 {
+        tracing::info!(
+            repos = repo_count,
+            deleted = total_deleted,
+            deleted_bytes = total_bytes,
+            "gc sweep complete"
+        );
+    } else {
+        tracing::debug!(repos = repo_count, "gc sweep complete (nothing to delete)");
+    }
+}
+
+/// L3: spawn a long-lived task that runs `run_sweep` on every tick.
+/// Picks up the K4 CancellationToken shape so server shutdown
+/// drains it cleanly. `tick == Duration::ZERO` is the disable
+/// signal — the app.rs wiring honors that by not calling this
+/// function at all (matching `audit::spawn_prune_task`'s shape;
+/// keeping the precondition there means the caller doesn't have
+/// to think about it twice if a `0` flag value ever flows in).
+pub fn spawn_periodic_sweep(
+    repos_dir: PathBuf,
+    cache: Arc<AlternatesCache>,
+    objects: Arc<dyn ObjectStore>,
+    tick: std::time::Duration,
+    min_age_secs: u64,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // Skip immediate fire — same shape as audit::spawn_prune_task.
+        // First sweep happens one tick after boot.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let repos_dir = repos_dir.clone();
+                    let cache = cache.clone();
+                    let objects = objects.clone();
+                    // spawn_blocking — gc shells out to git rev-list
+                    // and walks the filesystem; sync work that
+                    // doesn't belong on the tokio runtime.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        run_sweep(&repos_dir, &cache, &*objects, min_age_secs);
+                    })
+                    .await;
+                }
+                _ = cancel.cancelled() => return,
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +655,149 @@ mod tests {
         let result2 = run(&repos_dir, &repo_id, &cache, 0, &objects).unwrap();
         assert_eq!(result2.deleted, 0);
         assert_eq!(result2.skipped_too_young, 0);
+    }
+
+    /// L3: the periodic-sweep entry point walks every repo on disk.
+    /// Seed two repos, drop a dangling blob in each, run one
+    /// `run_sweep` cycle, and assert both danglers gone + the live
+    /// commits untouched. Tests the sync entry point directly so
+    /// the assertion isn't tangled with tokio scheduling.
+    #[test]
+    fn run_sweep_visits_every_repo_under_repos_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        let storage = FsStorage::new(&repos).unwrap();
+
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut repos_setup: Vec<(String, String, String)> = Vec::new();
+        for _ in 0..2 {
+            let repo_id = new_repo_id();
+            storage.create(&repo_id).unwrap();
+            let git_dir = repos.join(format!("{repo_id}.git"));
+            // Seed a reachable commit so run() doesn't error on a
+            // ref-less repo.
+            let mut blob_p = Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            blob_p.stdin.as_mut().unwrap().write_all(b"hi").unwrap();
+            let live_blob = String::from_utf8(blob_p.wait_with_output().unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            let mut tree_p = Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .arg("mktree")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(
+                tree_p.stdin.as_mut().unwrap(),
+                "100644 blob {live_blob}\tfile.txt"
+            )
+            .unwrap();
+            let tree = String::from_utf8(tree_p.wait_with_output().unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            let commit = Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .args(["commit-tree", &tree, "-m", "init"])
+                .output()
+                .unwrap();
+            let commit = String::from_utf8(commit.stdout).unwrap().trim().to_string();
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .args(["update-ref", "refs/heads/main", &commit])
+                .output()
+                .unwrap();
+            // Drop an unreferenced (dangling) blob.
+            let mut dp = Command::new("git")
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .args(["hash-object", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            dp.stdin.as_mut().unwrap().write_all(b"orphan-l3").unwrap();
+            let dangler = String::from_utf8(dp.wait_with_output().unwrap().stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+            repos_setup.push((repo_id, live_blob, dangler));
+        }
+
+        // Sanity: each repo has its dangler before the sweep.
+        for (repo_id, _live, dangler) in &repos_setup {
+            let git_dir = repos.join(format!("{repo_id}.git"));
+            assert!(
+                loose_path(&git_dir, dangler).exists(),
+                "expected dangler on disk pre-sweep"
+            );
+        }
+
+        // One sync sweep cycle, min_age=0 so the mtime guard never fires.
+        let cache = AlternatesCache::new();
+        let objects = fs_objects(&repos);
+        run_sweep(&repos, &cache, &objects, 0);
+
+        for (repo_id, live, dangler) in &repos_setup {
+            let git_dir = repos.join(format!("{repo_id}.git"));
+            assert!(
+                !loose_path(&git_dir, dangler).exists(),
+                "expected dangler removed from {repo_id} after sweep"
+            );
+            // Live blob untouched — it's reachable from refs/heads/main.
+            assert!(
+                loose_path(&git_dir, live).exists(),
+                "expected live blob preserved in {repo_id}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn periodic_sweep_handle_resolves_on_cancel() {
+        // K4-style cancel test for the L3 spawn helper. The actual
+        // sweep work would need a populated repos_dir to do anything
+        // interesting; here we just confirm the cancel path is wired
+        // and the JoinHandle resolves within a bounded window.
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        let cache = Arc::new(AlternatesCache::new());
+        let objects: Arc<dyn ObjectStore> =
+            Arc::new(crate::object_store::FsObjectStore::new(&repos));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_periodic_sweep(
+            repos.clone(),
+            cache,
+            objects,
+            std::time::Duration::from_millis(50),
+            0,
+            cancel.clone(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            resolved.is_ok(),
+            "periodic sweep did not resolve within 1s of cancel"
+        );
     }
 
     #[test]
