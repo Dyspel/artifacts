@@ -62,7 +62,7 @@ pub async fn create_webhook(
         url: body.url,
         secret: body.secret,
         events: body.events,
-    });
+    })?;
     Ok(Json(WebhookCreated { id: hook_id }))
 }
 
@@ -83,7 +83,7 @@ pub async fn list_webhooks(
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
-    Ok(Json(state.observ.webhooks.list(&id)))
+    Ok(Json(state.observ.webhooks.list(&id)?))
 }
 
 /// DELETE /v1/repos/:id/webhooks/:hook_id
@@ -103,6 +103,6 @@ pub async fn delete_webhook(
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
-    let removed = state.observ.webhooks.remove(&id, &hook_id);
+    let removed = state.observ.webhooks.remove(&id, &hook_id)?;
     Ok(Json(serde_json::json!({ "removed": removed })))
 }

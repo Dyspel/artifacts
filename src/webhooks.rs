@@ -95,9 +95,16 @@ pub struct PendingDelivery {
 /// matches: callers always go through enqueue + worker for SQLite, fall
 /// back to direct-dispatch when enqueue reports 0 rows.
 pub trait WebhookRegistry: Send + Sync {
-    fn add(&self, sub: Subscription) -> String;
-    fn list(&self, repo_id: &str) -> Vec<Subscription>;
-    fn remove(&self, repo_id: &str, hook_id: &str) -> bool;
+    /// Create a subscription, returning its id. `Err` on a storage
+    /// failure (e.g. SQLite pool exhaustion) so the REST handler can
+    /// surface a 500 instead of panicking the request task.
+    fn add(&self, sub: Subscription) -> crate::error::Result<String>;
+    fn list(&self, repo_id: &str) -> crate::error::Result<Vec<Subscription>>;
+    fn remove(&self, repo_id: &str, hook_id: &str) -> crate::error::Result<bool>;
+    /// Subscriptions matching `(repo_id, kind)`. Infallible by design:
+    /// this is driven by the background dispatcher, which can only log
+    /// a failure anyway, so a storage error degrades to "no matches"
+    /// (logged) rather than propagating into the fire-and-forget path.
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription>;
 
     /// K3: durable enqueue. INSERT one `webhook_deliveries` row per
@@ -324,12 +331,16 @@ impl SqliteWebhookRegistry {
         })
     }
 
-    /// Claim a pooled connection. Panics on pool exhaustion to keep
-    /// the trait's infallible-`add` shape — pool exhaustion would
-    /// stall every webhook write anyway, surfacing as a `Mutex`-poison
-    /// panic in the previous implementation.
-    fn lock(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
-        crate::metrics::get_pooled(&self.conn, "webhooks").expect("sqlite pool exhausted")
+    /// Claim a pooled connection. Returns `Err` on pool exhaustion
+    /// (propagated as `Error::Other` by `get_pooled`) so callers on a
+    /// request path surface a clean 500 instead of panicking the task —
+    /// matching how every other store (tokens, ownership, audit) treats
+    /// the same condition. The earlier impl `.expect`ed here, which
+    /// turned a recoverable, load-induced stall into a panic.
+    fn lock(
+        &self,
+    ) -> crate::error::Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
+        crate::metrics::get_pooled(&self.conn, "webhooks")
     }
 
     /// Expose the pool so periodic tasks can publish pool gauges.
@@ -354,7 +365,7 @@ impl SqliteWebhookRegistry {
 }
 
 impl WebhookRegistry for SqliteWebhookRegistry {
-    fn add(&self, mut sub: Subscription) -> String {
+    fn add(&self, mut sub: Subscription) -> crate::error::Result<String> {
         if sub.id.is_empty() {
             sub.id = Uuid::new_v4().to_string();
         }
@@ -382,7 +393,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             None => (None, None),
         };
 
-        let _ = self.lock().execute(
+        self.lock()?.execute(
             "INSERT INTO webhooks (id, repo_id, url, secret, secret_nonce, events_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
@@ -394,58 +405,56 @@ impl WebhookRegistry for SqliteWebhookRegistry {
                 events,
                 now
             ],
-        );
-        sub.id
+        )?;
+        Ok(sub.id)
     }
 
-    fn list(&self, repo_id: &str) -> Vec<Subscription> {
-        let conn = self.lock();
-        let mut stmt = match conn.prepare_cached(
+    fn list(&self, repo_id: &str) -> crate::error::Result<Vec<Subscription>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT id, repo_id, url, secret, secret_nonce, events_json
              FROM webhooks
              WHERE repo_id = ?1 AND revoked_at IS NULL",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        )?;
         let key = self.current_key();
-        let rows = stmt.query_map(rusqlite::params![repo_id], move |row| row_to_sub(row, &key));
-        let rows = match rows {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        rows.flatten().collect()
+        let rows = stmt.query_map(rusqlite::params![repo_id], move |row| row_to_sub(row, &key))?;
+        Ok(rows.flatten().collect())
     }
 
-    fn remove(&self, repo_id: &str, hook_id: &str) -> bool {
+    fn remove(&self, repo_id: &str, hook_id: &str) -> crate::error::Result<bool> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let conn = self.lock();
-        let n = conn
-            .execute(
-                "UPDATE webhooks SET revoked_at = ?1
-                 WHERE id = ?2 AND repo_id = ?3 AND revoked_at IS NULL",
-                rusqlite::params![now, hook_id, repo_id],
-            )
-            .unwrap_or(0);
-        n > 0
+        let n = self.lock()?.execute(
+            "UPDATE webhooks SET revoked_at = ?1
+             WHERE id = ?2 AND repo_id = ?3 AND revoked_at IS NULL",
+            rusqlite::params![now, hook_id, repo_id],
+        )?;
+        Ok(n > 0)
     }
 
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription> {
         // Filter in Rust rather than embed the JSON LIKE in SQL so
         // we don't depend on JSON1 being compiled in. Subscription
         // counts per repo are small (dozens at most), so this is
-        // fine.
-        self.list(repo_id)
-            .into_iter()
-            .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
-            .collect()
+        // fine. Infallible by trait contract: a storage error degrades
+        // to "no matches" with a log rather than propagating into the
+        // background dispatcher.
+        match self.list(repo_id) {
+            Ok(subs) => subs
+                .into_iter()
+                .filter(|s| s.events.is_empty() || s.events.iter().any(|e| e == kind))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, repo_id, "webhook matching: list failed; treating as no matches");
+                Vec::new()
+            }
+        }
     }
 
     fn count_active(&self) -> crate::error::Result<u64> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM webhooks WHERE revoked_at IS NULL",
             [],
@@ -467,7 +476,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         // ceremony than the shape warrants.
         type EnqueueRow = (String, String, Option<String>, Option<Vec<u8>>, String);
         let now = now_unix_secs();
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         // SELECT the matching subscriptions inline so we hold one
         // transaction across the enqueue. Events filter is checked in
@@ -554,7 +563,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
             Vec<u8>,
             i64,
         );
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         // SELECT eligible rows, then UPDATE each to push next_attempt_at
         // forward + bump attempts. The two-statement shape (inside a
@@ -649,7 +658,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         next_attempt_at: i64,
         last_status: &str,
     ) -> crate::error::Result<()> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         conn.execute(
             "UPDATE webhook_deliveries
              SET attempts = ?1, next_attempt_at = ?2, last_status = ?3
@@ -665,7 +674,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
         outcome: &str,
         last_status: Option<&str>,
     ) -> crate::error::Result<()> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         let now = now_unix_secs();
         conn.execute(
             "UPDATE webhook_deliveries
@@ -677,7 +686,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
     }
 
     fn prune_finalized(&self, cutoff_ts: i64) -> crate::error::Result<u64> {
-        let conn = self.lock();
+        let conn = self.lock()?;
         // Two guards:
         //   - finalized_at IS NOT NULL: skip in-flight (pending) rows.
         //   - finalized_at < cutoff_ts: keep recently-finalized rows
@@ -708,7 +717,7 @@ impl WebhookRegistry for SqliteWebhookRegistry {
     /// encrypted rows exist; the swap still happens).
     fn rotate_master_key(&self, new: Arc<crate::secrets::MasterKey>) -> crate::error::Result<u64> {
         use rusqlite::params;
-        let mut conn = self.lock();
+        let mut conn = self.lock()?;
         let old = self.current_key();
         let tx = conn.transaction()?;
         let mut count: u64 = 0;
@@ -863,28 +872,29 @@ impl MemRegistry {
 }
 
 impl WebhookRegistry for MemRegistry {
-    fn add(&self, mut sub: Subscription) -> String {
+    fn add(&self, mut sub: Subscription) -> crate::error::Result<String> {
         if sub.id.is_empty() {
             sub.id = Uuid::new_v4().to_string();
         }
         let id = sub.id.clone();
         self.lock().push(sub);
-        id
+        Ok(id)
     }
 
-    fn list(&self, repo_id: &str) -> Vec<Subscription> {
-        self.lock()
+    fn list(&self, repo_id: &str) -> crate::error::Result<Vec<Subscription>> {
+        Ok(self
+            .lock()
             .iter()
             .filter(|s| s.repo_id == repo_id)
             .cloned()
-            .collect()
+            .collect())
     }
 
-    fn remove(&self, repo_id: &str, hook_id: &str) -> bool {
+    fn remove(&self, repo_id: &str, hook_id: &str) -> crate::error::Result<bool> {
         let mut g = self.lock();
         let before = g.len();
         g.retain(|s| !(s.repo_id == repo_id && s.id == hook_id));
-        before != g.len()
+        Ok(before != g.len())
     }
 
     fn matching(&self, repo_id: &str, kind: &str) -> Vec<Subscription> {
@@ -928,6 +938,30 @@ pub fn spawn_active_gauge_refresher(
     })
 }
 
+/// Handle a broadcast-lag signal on the dispatcher.
+///
+/// The K3 outbox is durable only *after* an event is enqueued, and
+/// enqueue is driven by this in-process `tokio::broadcast` channel —
+/// so a `Lagged(n)` means `n` events overflowed the ring and were
+/// dropped BEFORE ever reaching the outbox. They are genuinely lost,
+/// not merely delayed. The earlier code logged this at `warn` and moved
+/// on, which buried a real durability gap. Surface it loudly: an
+/// `error` log plus an `artifacts_webhook_events_dropped_total` counter
+/// so it shows up on a dashboard/alert.
+///
+/// The durable fix is to enqueue at *publish* time (in the commit/push
+/// path, in the same breath as the event is produced) rather than off a
+/// lossy broadcast subscription; that's a larger change tracked
+/// separately. Until then this is the honest visibility for the loss.
+fn record_dispatcher_lag(dropped: u64) {
+    tracing::error!(
+        dropped,
+        "webhook dispatcher lagged; events dropped before reaching the durable outbox \
+         (durable fix: enqueue-at-publish)"
+    );
+    metrics::counter!("artifacts_webhook_events_dropped_total").increment(dropped);
+}
+
 /// Long-lived task that subscribes to the event bus and enqueues each
 /// event into the durable outbox (K3). For registries that don't
 /// implement `enqueue_delivery` (MemRegistry), falls back to the
@@ -945,7 +979,7 @@ pub fn spawn_dispatcher(
                 msg = rx.recv() => match msg {
                     Ok(ev) => dispatch_event(&*registry, &ev).await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(dropped = n, "webhook dispatcher lagged");
+                        record_dispatcher_lag(n);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -1284,15 +1318,17 @@ mod tests {
     #[test]
     fn add_then_list_round_trip() {
         let r = MemRegistry::new();
-        let id = r.add(Subscription {
-            id: String::new(),
-            repo_id: "r1".into(),
-            url: "http://example".into(),
-            secret: None,
-            events: vec![],
-        });
+        let id = r
+            .add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "http://example".into(),
+                secret: None,
+                events: vec![],
+            })
+            .unwrap();
         assert!(!id.is_empty());
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
     }
@@ -1306,42 +1342,48 @@ mod tests {
             url: "u1".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         r.add(Subscription {
             id: String::new(),
             repo_id: "r2".into(),
             url: "u2".into(),
             secret: None,
             events: vec![],
-        });
-        assert_eq!(r.list("r1").len(), 1);
-        assert_eq!(r.list("r2").len(), 1);
-        assert_eq!(r.list("r3").len(), 0);
+        })
+        .unwrap();
+        assert_eq!(r.list("r1").unwrap().len(), 1);
+        assert_eq!(r.list("r2").unwrap().len(), 1);
+        assert_eq!(r.list("r3").unwrap().len(), 0);
     }
 
     #[test]
     fn remove_targets_specific_hook_only() {
         let r = MemRegistry::new();
-        let id1 = r.add(Subscription {
-            id: String::new(),
-            repo_id: "r1".into(),
-            url: "u1".into(),
-            secret: None,
-            events: vec![],
-        });
-        let id2 = r.add(Subscription {
-            id: String::new(),
-            repo_id: "r1".into(),
-            url: "u2".into(),
-            secret: None,
-            events: vec![],
-        });
-        assert!(r.remove("r1", &id1));
-        let rem = r.list("r1");
+        let id1 = r
+            .add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "u1".into(),
+                secret: None,
+                events: vec![],
+            })
+            .unwrap();
+        let id2 = r
+            .add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "u2".into(),
+                secret: None,
+                events: vec![],
+            })
+            .unwrap();
+        assert!(r.remove("r1", &id1).unwrap());
+        let rem = r.list("r1").unwrap();
         assert_eq!(rem.len(), 1);
         assert_eq!(rem[0].id, id2);
         // removing again is a no-op.
-        assert!(!r.remove("r1", &id1));
+        assert!(!r.remove("r1", &id1).unwrap());
     }
 
     #[test]
@@ -1353,14 +1395,16 @@ mod tests {
             url: "u-all".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         r.add(Subscription {
             id: String::new(),
             repo_id: "r1".into(),
             url: "u-commit".into(),
             secret: None,
             events: vec!["commit".into()],
-        });
+        })
+        .unwrap();
         let m_commit = r.matching("r1", "commit");
         assert_eq!(m_commit.len(), 2);
         let m_fork = r.matching("r1", "fork");
@@ -1400,14 +1444,16 @@ mod tests {
     #[test]
     fn sqlite_add_then_list_round_trip() {
         let (_d, r) = open_sqlite_registry();
-        let id = r.add(Subscription {
-            id: String::new(),
-            repo_id: "r1".into(),
-            url: "http://example".into(),
-            secret: Some("s".into()),
-            events: vec!["commit".into()],
-        });
-        let listed = r.list("r1");
+        let id = r
+            .add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "http://example".into(),
+                secret: Some("s".into()),
+                events: vec!["commit".into()],
+            })
+            .unwrap();
+        let listed = r.list("r1").unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].secret.as_deref(), Some("s"));
@@ -1417,17 +1463,19 @@ mod tests {
     #[test]
     fn sqlite_remove_marks_revoked_and_drops_from_list() {
         let (_d, r) = open_sqlite_registry();
-        let id = r.add(Subscription {
-            id: String::new(),
-            repo_id: "r1".into(),
-            url: "u".into(),
-            secret: None,
-            events: vec![],
-        });
-        assert!(r.remove("r1", &id));
-        assert!(r.list("r1").is_empty());
+        let id = r
+            .add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "u".into(),
+                secret: None,
+                events: vec![],
+            })
+            .unwrap();
+        assert!(r.remove("r1", &id).unwrap());
+        assert!(r.list("r1").unwrap().is_empty());
         // Idempotent: a second remove finds no live row.
-        assert!(!r.remove("r1", &id));
+        assert!(!r.remove("r1", &id).unwrap());
     }
 
     #[test]
@@ -1446,10 +1494,11 @@ mod tests {
                 secret: Some("k".into()),
                 events: vec![],
             })
+            .unwrap()
         };
         // Drop, reopen on the same path. Must see the row.
         let r = SqliteWebhookRegistry::open(&path, key).unwrap();
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(listed[0].secret.as_deref(), Some("k"));
@@ -1464,14 +1513,16 @@ mod tests {
             url: "u-all".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         r.add(Subscription {
             id: String::new(),
             repo_id: "r1".into(),
             url: "u-commit".into(),
             secret: None,
             events: vec!["commit".into()],
-        });
+        })
+        .unwrap();
         let m_commit = r.matching("r1", "commit");
         assert_eq!(m_commit.len(), 2);
         let m_fork = r.matching("r1", "fork");
@@ -1494,7 +1545,8 @@ mod tests {
             url: "u".into(),
             secret: Some("plaintext-marker-XYZ".into()),
             events: vec![],
-        });
+        })
+        .unwrap();
         // Raw read against the same DB file. Must NOT see "plaintext-marker-XYZ".
         let conn = rusqlite::Connection::open(&path).unwrap();
         let (stored_secret, nonce): (Option<String>, Option<Vec<u8>>) = conn
@@ -1530,11 +1582,12 @@ mod tests {
                 url: "u".into(),
                 secret: Some("k".into()),
                 events: vec![],
-            });
+            })
+            .unwrap();
         }
         let k2 = test_master_key(); // fresh, unrelated
         let r = SqliteWebhookRegistry::open(&path, k2).unwrap();
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         assert_eq!(listed.len(), 1, "subscription should still be visible");
         assert_eq!(
             listed[0].secret, None,
@@ -1564,7 +1617,7 @@ mod tests {
         // Reopen via the registry with a (different) key — legacy rows
         // ignore the key entirely.
         let r = SqliteWebhookRegistry::open(&path, test_master_key()).unwrap();
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].secret.as_deref(), Some("legacy-plaintext-secret"));
     }
@@ -1586,14 +1639,16 @@ mod tests {
             url: "u".into(),
             secret: Some("alpha".into()),
             events: vec![],
-        });
+        })
+        .unwrap();
         r.add(Subscription {
             id: String::new(),
             repo_id: "r1".into(),
             url: "u".into(),
             secret: Some("beta".into()),
             events: vec![],
-        });
+        })
+        .unwrap();
 
         // Snapshot the raw secret column before rotation.
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1613,7 +1668,7 @@ mod tests {
         // After rotation, list() returns plaintexts decrypted under the
         // newly-installed key — same plaintexts, since we re-encrypted
         // the same secrets under the new key.
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         let mut plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
         plaintexts.sort();
         assert_eq!(plaintexts, vec!["alpha", "beta"]);
@@ -1648,13 +1703,14 @@ mod tests {
             url: "u".into(),
             secret: Some("post-rotate".into()),
             events: vec![],
-        });
+        })
+        .unwrap();
         // Rebuild a registry against the OLD key — the row added after
         // rotation must come back unsigned (key mismatch handled the
         // same way as in `sqlite_wrong_key_yields_unsigned_subscription`).
         drop(r);
         let r_old = SqliteWebhookRegistry::open(&path, k1).unwrap();
-        let listed = r_old.list("r1");
+        let listed = r_old.list("r1").unwrap();
         assert_eq!(listed.len(), 1);
         assert!(
             listed[0].secret.is_none(),
@@ -1690,14 +1746,15 @@ mod tests {
             url: "u".into(),
             secret: Some("encrypted-row".into()),
             events: vec![],
-        });
+        })
+        .unwrap();
         let rotated = r.rotate_master_key(test_master_key()).unwrap();
         assert_eq!(
             rotated, 1,
             "legacy row should be skipped, only the encrypted row touched"
         );
         // Legacy row still readable as plaintext.
-        let listed = r.list("r1");
+        let listed = r.list("r1").unwrap();
         let plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
         assert!(plaintexts.contains(&"legacy-plaintext"));
         assert!(plaintexts.contains(&"encrypted-row"));
@@ -1852,7 +1909,8 @@ mod tests {
             url: "http://nowhere.invalid".into(),
             secret: None,
             events: vec!["commit".into(), "fork".into()],
-        });
+        })
+        .unwrap();
         // Plus a subscription that doesn't match this kind.
         r.add(Subscription {
             id: String::new(),
@@ -1860,7 +1918,8 @@ mod tests {
             url: "http://nowhere2.invalid".into(),
             secret: None,
             events: vec!["fork".into()],
-        });
+        })
+        .unwrap();
         // Plus a subscription on a different repo.
         r.add(Subscription {
             id: String::new(),
@@ -1868,7 +1927,8 @@ mod tests {
             url: "http://nowhere3.invalid".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
 
         let n = r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
         assert_eq!(
@@ -1890,7 +1950,8 @@ mod tests {
             url: "http://nowhere.invalid".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         let n = r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
         assert_eq!(n, 1);
 
@@ -1975,7 +2036,8 @@ mod tests {
             url: "http://nowhere.invalid".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         // Enqueue three rows; finalize two of them at very old
         // timestamps via raw SQL so the cutoff arithmetic is
         // unambiguous.
@@ -1985,7 +2047,7 @@ mod tests {
 
         // Two of them: stamp finalized_at = 100 (epoch+100s, very old).
         {
-            let conn = r.lock();
+            let conn = r.lock().unwrap();
             conn.execute(
                 "UPDATE webhook_deliveries
                  SET finalized_at = 100, finalized_outcome = 'success'
@@ -2002,7 +2064,7 @@ mod tests {
         assert_eq!(pruned, 2, "two finalized rows should be pruned");
 
         let surviving: u64 = {
-            let conn = r.lock();
+            let conn = r.lock().unwrap();
             conn.query_row("SELECT COUNT(*) FROM webhook_deliveries", [], |row| {
                 row.get::<_, i64>(0)
             })
@@ -2028,12 +2090,13 @@ mod tests {
             url: "http://nowhere.invalid".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
         // Finalize at a "recent" timestamp.
         let recent = now_unix_secs();
         {
-            let conn = r.lock();
+            let conn = r.lock().unwrap();
             conn.execute(
                 "UPDATE webhook_deliveries
                  SET finalized_at = ?1, finalized_outcome = 'success'
@@ -2077,7 +2140,8 @@ mod tests {
             url: "http://nowhere.invalid".into(),
             secret: None,
             events: vec![],
-        });
+        })
+        .unwrap();
         r.enqueue_delivery("r1", "commit", br#"{}"#).unwrap();
         let claimed = r.claim_pending_deliveries(10).unwrap();
         let id = claimed[0].id;
@@ -2088,5 +2152,85 @@ mod tests {
             again.is_empty(),
             "finalized rows must not be claimable again"
         );
+    }
+
+    // --- M4: pool-exhaustion returns Err (not panic) -------------------
+
+    /// Build a SqliteWebhookRegistry over a pool capped at one
+    /// connection with a short acquire timeout, so a second checkout
+    /// fails fast. Returns the registry plus the held connection — keep
+    /// the latter alive to keep the pool exhausted.
+    fn exhausted_registry() -> (
+        SqliteWebhookRegistry,
+        r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    ) {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(50))
+            .build(manager)
+            .unwrap();
+        let held = pool.get().unwrap(); // the only connection; pool now empty
+        let reg = SqliteWebhookRegistry {
+            conn: pool,
+            master_key: std::sync::RwLock::new(test_master_key()),
+        };
+        (reg, held)
+    }
+
+    #[test]
+    fn pool_exhaustion_returns_err_not_panic() {
+        // The earlier impl `.expect`ed on a failed pool checkout, which
+        // panicked the handler task. add/list/remove must instead
+        // surface a clean Err so the REST layer maps it to a 500.
+        let (reg, _held) = exhausted_registry();
+        assert!(
+            reg.add(Subscription {
+                id: String::new(),
+                repo_id: "r1".into(),
+                url: "http://nowhere.invalid".into(),
+                secret: None,
+                events: vec![],
+            })
+            .is_err(),
+            "add must return Err on pool exhaustion"
+        );
+        assert!(
+            reg.list("r1").is_err(),
+            "list must return Err on pool exhaustion"
+        );
+        assert!(
+            reg.remove("r1", "missing").is_err(),
+            "remove must return Err on pool exhaustion"
+        );
+        // matching is infallible by contract: it degrades to an empty
+        // set (logged) rather than erroring or panicking.
+        assert!(reg.matching("r1", "commit").is_empty());
+    }
+
+    // --- M4: dispatcher lag is counted, not silently dropped -----------
+
+    #[test]
+    fn dispatcher_lag_increments_drop_counter() {
+        use metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        with_local_recorder(&recorder, || {
+            record_dispatcher_lag(7);
+        });
+
+        let found = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, _, _, _)| k.key().name() == "artifacts_webhook_events_dropped_total");
+        match found {
+            Some((_, _, _, DebugValue::Counter(v))) => {
+                assert_eq!(v, 7, "drop counter must record the dropped-event count")
+            }
+            other => panic!("drop counter was not recorded: {other:?}"),
+        }
     }
 }

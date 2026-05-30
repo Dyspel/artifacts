@@ -49,6 +49,10 @@
 //!   `outcome` ∈ {`success` (2xx-3xx), `client_error` (4xx, not
 //!   retried), `exhausted` (gave up after MAX_ATTEMPTS retries on
 //!   5xx / transport error)}.
+//! - `artifacts_webhook_events_dropped_total` — counter incremented by
+//!   the dispatcher when the in-process event bus lags and drops `n`
+//!   events before they reach the durable outbox (a genuine delivery
+//!   loss; see `webhooks::record_dispatcher_lag`).
 //! - `artifacts_sqlite_lock_wait_seconds{store}` — histogram
 //!   recording how long each handler waits on `r2d2::Pool::get()`
 //!   before issuing its SQL. Each store carries its own r2d2 pool

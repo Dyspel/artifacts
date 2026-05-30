@@ -130,6 +130,11 @@ proptest = "1"
 # server (`std::process::Child::kill` is SIGKILL on Unix; the
 # graceful-shutdown scenario specifically needs SIGTERM).
 libc = "0.2"
+# In-process snapshotting recorder so tests can assert metric values
+# (e.g. the M4 webhook-event-drop counter). Pinned to the 0.17 line
+# already in the tree transitively via metrics-exporter-prometheus, so
+# this introduces no new version into the graph.
+metrics-util = "0.17"
 
 [profile.release]
 lto = "thin"
