@@ -425,11 +425,21 @@ async fn pack_handler(
 ///      --stdin` so the new objects land in the repo's odb. (M1b-3-gix
 ///      will swap this for `gix-pack` indexing — same architectural
 ///      seam as M1b-2c.)
-///   2. CAS each ref-update through `RefStore`. We do them serially —
+///   2. **Connectivity gate (M1).** Before touching any ref, verify the
+///      full object closure of every new tip exists in the odb (a
+///      `git rev-list --objects <tips> --not --all` walk). A pack that
+///      unpacked partially, was truncated, or is thin against a base we
+///      lack leaves objects dangling; advancing a ref to a tip whose
+///      tree/blob/parent is missing is silent repo corruption (every
+///      later clone breaks with "missing object"). If the walk fails we
+///      reject the WHOLE push — `ng <ref> missing necessary objects` on
+///      every update — exactly as `git receive-pack`'s own
+///      `check_connected` does. No ref advances.
+///   3. CAS each ref-update through `RefStore`. We do them serially —
 ///      the underlying `git update-ref` already serializes, and a
 ///      bulk update-ref isn't worth the parser complexity until
 ///      `atomic` lands.
-///   3. Build a `unpack <status>\n[ok|ng] <ref> ...` report and frame
+///   4. Build a `unpack <status>\n[ok|ng] <ref> ...` report and frame
 ///      it as the protocol expects (with sideband-1 wrap if the
 ///      client advertised it).
 async fn native_receive_pack_response(
@@ -511,13 +521,57 @@ async fn native_receive_pack_response(
     };
     pkt::write_data(&mut report, unpack_line.as_bytes());
 
+    // Connectivity gate (M1). The new tips of every non-delete update
+    // must have their full object closure present before we move any
+    // ref. We run this once, before the CAS loop, so every check sees
+    // the pre-push ref set (`--not --all`). A single missing object
+    // fails the whole push — never advance a ref into a hole.
+    let connectivity: std::result::Result<(), String> = if unpack_outcome.is_ok() {
+        let new_tips: Vec<String> = req
+            .updates
+            .iter()
+            .filter(|u| !u.is_delete())
+            .map(|u| u.new.clone())
+            .collect();
+        if new_tips.is_empty() {
+            Ok(())
+        } else {
+            match crate::git_cmd::rev_list_check_connected(repo_path, &new_tips).await {
+                Ok((0, _)) => Ok(()),
+                Ok((code, stderr)) => Err(format!(
+                    "rev-list exited {code}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                )),
+                Err(e) => Err(format!("connectivity check could not run: {e}")),
+            }
+        }
+    } else {
+        Ok(())
+    };
+
     if unpack_outcome.is_ok() {
-        for u in &req.updates {
-            let line = match apply_ref_update(refs, repo_id, u).await {
-                Ok(()) => format!("ok {}\n", u.name),
-                Err(reason) => format!("ng {} {}\n", u.name, reason),
-            };
-            pkt::write_data(&mut report, line.as_bytes());
+        if let Err(detail) = &connectivity {
+            // The full closure of at least one new tip is missing. Reject
+            // every ref-update with the terse protocol reason; the detail
+            // (which may carry git's stderr) goes to the server log only,
+            // not back over the wire.
+            tracing::warn!(
+                repo_id,
+                detail,
+                "receive-pack connectivity check failed; rejecting push without advancing any ref",
+            );
+            for u in &req.updates {
+                let line = format!("ng {} missing necessary objects\n", u.name);
+                pkt::write_data(&mut report, line.as_bytes());
+            }
+        } else {
+            for u in &req.updates {
+                let line = match apply_ref_update(refs, repo_id, u).await {
+                    Ok(()) => format!("ok {}\n", u.name),
+                    Err(reason) => format!("ng {} {}\n", u.name, reason),
+                };
+                pkt::write_data(&mut report, line.as_bytes());
+            }
         }
     } else {
         for u in &req.updates {
@@ -787,5 +841,165 @@ mod tests {
         assert!(service_from_query("service=").is_err());
         assert!(service_from_query("service=git-unknown").is_err());
         assert!(service_from_query("nothing=here").is_err());
+    }
+
+    // --- M1: connectivity gate -----------------------------------------
+    //
+    // These exercise the rule that a ref never advances to a tip whose
+    // object closure is incomplete. We construct the broken state with
+    // `git mktree --missing` (writes a tree referencing a blob OID that
+    // doesn't exist) + `git commit-tree` (writes a commit pointing at
+    // that tree). Both land as loose objects in the odb, so the tip OID
+    // resolves but `rev-list --objects` over its closure hits the
+    // missing blob and fails — the exact shape of a truncated/thin push.
+
+    /// Run a `git` plumbing command in a bare repo, returning trimmed
+    /// stdout. Panics on non-zero exit — fixture setup must succeed.
+    #[cfg(test)]
+    fn git_in(git_dir: &std::path::Path, args: &[&str], stdin: Option<&[u8]>) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("git");
+        cmd.arg("--git-dir").arg(git_dir).args(args);
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn git");
+        if let Some(data) = stdin {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(data)
+                .expect("write stdin");
+        }
+        let out = child.wait_with_output().expect("wait git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Write a commit whose tree references a blob that does not exist
+    /// in the odb. The returned OID resolves, but its closure is broken.
+    #[cfg(test)]
+    fn make_commit_with_missing_blob(git_dir: &std::path::Path) -> String {
+        let missing = "0".repeat(39) + "1";
+        let entry = format!("100644 blob {missing}\tmissing.txt\n");
+        let tree = git_in(git_dir, &["mktree", "--missing"], Some(entry.as_bytes()));
+        git_in(
+            git_dir,
+            &["commit-tree", &tree, "-m", "refs a missing blob"],
+            None,
+        )
+    }
+
+    /// Write a fully-connected commit (real blob -> tree -> commit).
+    #[cfg(test)]
+    fn make_valid_commit(git_dir: &std::path::Path) -> String {
+        let blob = git_in(git_dir, &["hash-object", "-w", "--stdin"], Some(b"hello\n"));
+        let entry = format!("100644 blob {blob}\tok.txt\n");
+        let tree = git_in(git_dir, &["mktree"], Some(entry.as_bytes()));
+        git_in(git_dir, &["commit-tree", &tree, "-m", "ok"], None)
+    }
+
+    #[tokio::test]
+    async fn rev_list_check_flags_missing_closure_and_passes_valid() {
+        let repo = crate::test_support::TestRepo::new();
+        let broken = make_commit_with_missing_blob(&repo.git_dir);
+        let valid = make_valid_commit(&repo.git_dir);
+
+        let (code, _stderr) =
+            crate::git_cmd::rev_list_check_connected(&repo.git_dir, &[broken.clone()])
+                .await
+                .expect("spawn rev-list");
+        assert_ne!(code, 0, "missing-blob closure must fail connectivity");
+
+        let (code_ok, _) =
+            crate::git_cmd::rev_list_check_connected(&repo.git_dir, &[valid.clone()])
+                .await
+                .expect("spawn rev-list");
+        assert_eq!(code_ok, 0, "fully-connected closure must pass");
+    }
+
+    fn mk_receive_request(name: &str, new_oid: &str) -> ReceivePackRequest {
+        ReceivePackRequest {
+            updates: vec![RefUpdate {
+                old: RefUpdate::ZERO.to_string(),
+                new: new_oid.to_string(),
+                name: name.to_string(),
+            }],
+            has_report_status: true,
+            has_sideband_64k: false,
+            has_unsupported: false,
+            pack: Vec::new(),
+        }
+    }
+
+    async fn body_string(resp: Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn push_with_missing_objects_does_not_advance_ref() {
+        let repo = crate::test_support::TestRepo::new();
+        let broken = make_commit_with_missing_blob(&repo.git_dir);
+        let refs = crate::refs::FsRefStore::new(repo.repos_dir.clone());
+        let objects = crate::object_store::FsObjectStore::new(repo.repos_dir.clone());
+
+        let req = mk_receive_request("refs/heads/broken", &broken);
+        let resp = native_receive_pack_response(&repo.git_dir, &repo.repo_id, &refs, &objects, req)
+            .await
+            .expect("response built");
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("ng refs/heads/broken missing necessary objects"),
+            "expected connectivity rejection, got: {body:?}"
+        );
+
+        // The ref must NOT have advanced.
+        let repo_id = crate::ids::RepoId::try_from(repo.repo_id.as_str()).unwrap();
+        let ref_name = crate::ids::RefName::try_from("refs/heads/broken").unwrap();
+        let resolved = crate::refs::RefStore::read(&refs, &repo_id, &ref_name)
+            .await
+            .unwrap();
+        assert_eq!(resolved, None, "broken push must leave the ref unborn");
+    }
+
+    #[tokio::test]
+    async fn push_with_complete_objects_advances_ref() {
+        let repo = crate::test_support::TestRepo::new();
+        let valid = make_valid_commit(&repo.git_dir);
+        let refs = crate::refs::FsRefStore::new(repo.repos_dir.clone());
+        let objects = crate::object_store::FsObjectStore::new(repo.repos_dir.clone());
+
+        let req = mk_receive_request("refs/heads/ok", &valid);
+        let resp = native_receive_pack_response(&repo.git_dir, &repo.repo_id, &refs, &objects, req)
+            .await
+            .expect("response built");
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("ok refs/heads/ok"),
+            "expected accept, got: {body:?}"
+        );
+
+        let repo_id = crate::ids::RepoId::try_from(repo.repo_id.as_str()).unwrap();
+        let ref_name = crate::ids::RefName::try_from("refs/heads/ok").unwrap();
+        let resolved = crate::refs::RefStore::read(&refs, &repo_id, &ref_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.map(|o| o.to_string()),
+            Some(valid),
+            "valid push must advance the ref to the pushed tip"
+        );
     }
 }

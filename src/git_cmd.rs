@@ -197,3 +197,43 @@ pub(crate) fn rev_list_objects_all(git_dir: &Path) -> std::process::Command {
         .args(["rev-list", "--objects", "--all"]);
     cmd
 }
+
+/// `git --git-dir <dir> rev-list --objects <tips…> --not --all` — the
+/// connectivity check `git receive-pack` runs before advancing a ref.
+///
+/// Walks the full object closure of each new tip and exits non-zero
+/// (128, "fatal: missing … object") if any object in that closure —
+/// commit, tree, or blob — is absent from the odb. `--not --all`
+/// prunes history already reachable from the repo's existing refs, so
+/// the walk pays only for the newly-pushed objects (this is exactly
+/// what git's own `check_connected` does before a ref update).
+///
+/// Each tip is a 40-hex OID (validated upstream as an `Oid` newtype),
+/// so it can never be misread as a flag. Returns `(exit_code, stderr)`;
+/// the caller treats a non-zero code as "this push references objects
+/// we don't have — reject every ref-update rather than leave a ref
+/// pointing into an incomplete closure".
+pub(crate) async fn rev_list_check_connected(
+    git_dir: &Path,
+    tips: &[String],
+) -> Result<(i32, Vec<u8>)> {
+    let mut cmd = async_cmd();
+    cmd.arg("--git-dir")
+        .arg(git_dir)
+        .arg("rev-list")
+        .arg("--objects");
+    for tip in tips {
+        cmd.arg(tip);
+    }
+    cmd.arg("--not").arg("--all");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).await?;
+    }
+    let status = child.wait().await?;
+    Ok((status.code().unwrap_or(-1), stderr))
+}
