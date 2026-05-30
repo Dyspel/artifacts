@@ -69,6 +69,36 @@ const OBJ_TAG: u8 = 4;
 const OBJ_OFS_DELTA: u8 = 6;
 const OBJ_REF_DELTA: u8 = 7;
 
+/// Hard ceiling on the size of a single decompressed pack entry — an
+/// object payload, a delta instruction stream, or a delta-reconstructed
+/// target. A pushed pack body is itself capped upstream, but a small
+/// compressed entry can inflate enormously, and the entry/delta headers
+/// carry attacker-controlled length fields. Without this cap two paths
+/// drive unbounded allocation: `decompress_zlib`'s grow-until-StreamEnd
+/// loop (a decompression bomb) and `apply_delta`'s
+/// `Vec::with_capacity(target_size)` (a single huge alloc from a tiny
+/// delta). 1 GiB matches the receive-pack body cap; no single object in
+/// a real interactive push approaches it.
+///
+/// On why there is no separate "max compression ratio" constant: a
+/// single zlib stream's expansion is intrinsically bounded by deflate
+/// (~1028:1 empirically, even for all-zeros input), which sits right on
+/// top of any ratio threshold one might pick — so a ratio gate would
+/// reject legitimate maximally-compressible blobs (e.g. a committed
+/// file of zeros) while adding nothing the absolute + per-entry
+/// declared-size output caps don't already guarantee. The declared-size
+/// bound (a well-formed entry inflates to *exactly* its header size) is
+/// the tight, false-positive-free expansion limit; this constant is the
+/// absolute backstop above it.
+pub(crate) const MAX_ENTRY_BYTES: usize = 1 << 30; // 1 GiB
+
+/// Cap on how much we preallocate up front for a single entry/target.
+/// We never trust an attacker-declared size for the initial allocation;
+/// the buffer grows as real output arrives, bounded by the declared
+/// size and `MAX_ENTRY_BYTES`. Keeps a hostile "declared 1 GiB" header
+/// from forcing a 1 GiB allocation before a single output byte exists.
+const INITIAL_ALLOC_CAP: usize = 64 * 1024;
+
 /// One parsed pack entry. `data` is the zlib-decompressed body —
 /// for a direct entry that's the object payload; for a delta entry
 /// that's the delta instruction stream.
@@ -133,10 +163,20 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
 
     for i in 0..n_objects {
         let entry_offset = cursor;
-        let (kind_byte, _size, header_len) = parse_entry_header(&pack[cursor..]).map_err(|e| {
-            Error::PackParse(format!("entry {i} at offset {cursor}: header parse: {e}"))
-        })?;
+        let (kind_byte, declared_size, header_len) =
+            parse_entry_header(&pack[cursor..]).map_err(|e| {
+                Error::PackParse(format!("entry {i} at offset {cursor}: header parse: {e}"))
+            })?;
         cursor += header_len;
+
+        // Reject an absurd declared size before we decompress or
+        // allocate anything for it. A well-formed entry's deflated body
+        // inflates to exactly this many bytes; cap it at MAX_ENTRY_BYTES.
+        if declared_size > MAX_ENTRY_BYTES as u64 {
+            return Err(Error::PackParse(format!(
+                "entry {i}: declared size {declared_size} exceeds {MAX_ENTRY_BYTES}-byte cap"
+            )));
+        }
 
         let kind = match kind_byte {
             OBJ_COMMIT => ParsedKind::Direct(ObjectKind::Commit),
@@ -171,11 +211,15 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
             }
         };
 
-        let (decompressed, compressed_len) = decompress_zlib(&pack[cursor..]).map_err(|e| {
-            Error::PackParse(format!(
-                "entry {i} at offset {entry_offset}: zlib decompress: {e}"
-            ))
-        })?;
+        // The deflated body must inflate to exactly `declared_size`
+        // bytes; pass it as the hard output ceiling so a malformed or
+        // hostile stream can't grow the buffer without bound.
+        let (decompressed, compressed_len) =
+            decompress_zlib(&pack[cursor..], declared_size as usize).map_err(|e| {
+                Error::PackParse(format!(
+                    "entry {i} at offset {entry_offset}: zlib decompress: {e}"
+                ))
+            })?;
         cursor += compressed_len;
 
         entries.push(ParsedEntry {
@@ -257,11 +301,20 @@ fn parse_ofs_delta_offset(bytes: &[u8]) -> Result<(u64, usize)> {
 /// the inflated payload and the number of input bytes consumed —
 /// the caller advances its pack cursor by that amount so subsequent
 /// entries land at the right offset.
-fn decompress_zlib(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+///
+/// `max_out` is the hard ceiling on accepted output (the entry's
+/// declared uncompressed size). A well-formed stream inflates to
+/// exactly `max_out` bytes; we error the moment the running total
+/// exceeds it, so a corrupt or hostile stream can neither grow the
+/// buffer without bound (a decompression bomb) nor force a huge
+/// up-front allocation — the initial capacity is clamped, and the
+/// buffer only grows as real output arrives.
+fn decompress_zlib(bytes: &[u8], max_out: usize) -> Result<(Vec<u8>, usize)> {
     use flate2::{Decompress, FlushDecompress, Status};
     let mut decoder = Decompress::new(true);
-    // Reasonable starting capacity; the loop grows as needed.
-    let mut out = Vec::with_capacity(bytes.len().min(4096));
+    // Never preallocate the (attacker-declared) full size; grow as
+    // output actually materializes.
+    let mut out = Vec::with_capacity(max_out.clamp(64, INITIAL_ALLOC_CAP));
     loop {
         let in_before = decoder.total_in() as usize;
         let out_before = decoder.total_out() as usize;
@@ -273,6 +326,14 @@ fn decompress_zlib(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
         let status = decoder
             .decompress(buf, &mut out[out_before..], FlushDecompress::None)
             .map_err(|e| Error::PackParse(format!("zlib: {e}")))?;
+        // Enforce the output ceiling right after each step (including
+        // the step that hits StreamEnd) so an over-long stream is
+        // caught before we return it.
+        if decoder.total_out() as usize > max_out {
+            return Err(Error::PackParse(format!(
+                "decompressed entry exceeds {max_out}-byte declared size"
+            )));
+        }
         match status {
             Status::Ok | Status::BufError => {
                 // BufError means out buffer is full; loop again with
@@ -436,7 +497,16 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
 
     let target_size_usize = usize::try_from(target_size)
         .map_err(|_| Error::PackParse("delta target size too large for usize".to_string()))?;
-    let mut out = Vec::with_capacity(target_size_usize);
+    // The target size is an attacker-controlled varint. Reject an
+    // absurd value before allocating, and never preallocate the full
+    // declared size — the buffer grows as COPY/INSERT ops append, and
+    // the post-loop `out.len() == target_size` check validates it.
+    if target_size_usize > MAX_ENTRY_BYTES {
+        return Err(Error::PackParse(format!(
+            "delta target size {target_size_usize} exceeds {MAX_ENTRY_BYTES}-byte cap"
+        )));
+    }
+    let mut out = Vec::with_capacity(target_size_usize.min(INITIAL_ALLOC_CAP));
 
     while idx < delta.len() {
         let op = delta[idx];
@@ -1095,6 +1165,102 @@ mod tests {
         assert_eq!(out, target_payload);
     }
 
+    // --- M2: bounded allocations ---------------------------------------
+
+    /// Encode a pack entry header (type + size varint) exactly as
+    /// `build_minimal_pack` does, exposed so a test can declare an
+    /// arbitrary (possibly absurd) size.
+    fn encode_entry_header(type_byte: u8, mut size: u64) -> Vec<u8> {
+        let mut header = Vec::new();
+        let low = (size & 0b1111) as u8;
+        size >>= 4;
+        let first = (if size > 0 { 0x80 } else { 0 }) | (type_byte << 4) | low;
+        header.push(first);
+        while size > 0 {
+            let byte = (size & 0x7f) as u8;
+            size >>= 7;
+            let continuation = if size > 0 { 0x80 } else { 0 };
+            header.push(continuation | byte);
+        }
+        header
+    }
+
+    fn zlib_compress(payload: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn decompress_zlib_roundtrips_within_cap() {
+        let payload = b"a perfectly ordinary pack entry body\n".repeat(64);
+        let compressed = zlib_compress(&payload);
+        // Exact declared size: must round-trip cleanly.
+        let (out, consumed) = decompress_zlib(&compressed, payload.len()).unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(consumed, compressed.len());
+    }
+
+    #[test]
+    fn decompress_zlib_rejects_output_over_declared_size() {
+        // A stream that inflates to more than max_out is rejected before
+        // the buffer can grow without bound — this is the decompression-
+        // bomb guard. (max_out is the entry's declared size in the real
+        // path; here we under-declare to trip it deterministically.)
+        let payload = vec![0u8; 4096]; // compresses tiny, inflates to 4 KiB
+        let compressed = zlib_compress(&payload);
+        assert!(
+            compressed.len() < 100,
+            "all-zeros should compress to well under 100 bytes"
+        );
+        let err = decompress_zlib(&compressed, 16).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("declared size"),
+            "expected output-cap rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_pack_rejects_oversized_declared_size() {
+        // One entry whose header declares an uncompressed size past the
+        // MAX_ENTRY_BYTES cap. parse_pack must reject it before it ever
+        // tries to decompress or allocate for the body.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        pack.extend_from_slice(&encode_entry_header(OBJ_BLOB, MAX_ENTRY_BYTES as u64 + 1));
+        // No body/trailer needed — the size check fires first.
+        let err = parse_pack(&pack).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("cap"),
+            "expected declared-size rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_delta_rejects_oversized_target_size() {
+        // A delta whose target_size varint claims more than MAX_ENTRY_BYTES
+        // must error before `Vec::with_capacity` — otherwise that single
+        // line is a multi-hundred-MB+ allocation from a few delta bytes.
+        let base = b"x".to_vec();
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&delta_varint(base.len() as u64));
+        delta.extend_from_slice(&delta_varint(MAX_ENTRY_BYTES as u64 + 1));
+        // No ops follow; the cap check returns before the op loop.
+        let err = apply_delta(&base, &delta).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("cap"),
+            "expected target-size rejection, got: {msg}"
+        );
+    }
+
     #[test]
     fn apply_delta_pure_copy() {
         let base = b"copy me copy you".to_vec();
@@ -1228,8 +1394,12 @@ mod tests {
         pack.extend_from_slice(&enc.finish().unwrap());
 
         // Entry 2: REF_DELTA pointing at entry 1.
-        let target_size = (base_payload.len() + tail.len()) as u64;
-        let mut dsz = target_size;
+        // The entry-header size field is the inflated length of the body
+        // that follows. For a delta entry that's the delta-instruction
+        // stream — NOT the reconstructed object size (the target size
+        // lives in a varint inside the stream). Real git packs encode it
+        // this way; M2's decompress cap enforces the equality.
+        let mut dsz = delta.len() as u64;
         let mut dheader = vec![
             (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_REF_DELTA << 4) | ((dsz & 0xf) as u8),
         ];
@@ -1301,10 +1471,10 @@ mod tests {
         p.extend_from_slice(b"PACK");
         p.extend_from_slice(&2u32.to_be_bytes());
         p.extend_from_slice(&1u32.to_be_bytes());
-        // REF_DELTA header, target_size=0 (after applying).
-        p.push(OBJ_REF_DELTA << 4);
+        // REF_DELTA header; size = inflated delta-body length (2 bytes).
+        p.push((OBJ_REF_DELTA << 4) | 2);
         p.extend_from_slice(&[0xab; 20]); // phantom base
-                                          // Empty delta body that claims source_size=0, target_size=0.
+                                          // 2-byte delta body claiming source_size=0, target_size=0.
         {
             use flate2::write::ZlibEncoder;
             use flate2::Compression;
@@ -1417,8 +1587,12 @@ mod tests {
 
         // Entry 2: OFS_DELTA pointing back at entry 1.
         let delta_offset = pack.len();
-        let target_size = (base_payload.len() + tail.len()) as u64;
-        let mut dsz = target_size;
+        // The entry-header size field is the inflated length of the body
+        // that follows. For a delta entry that's the delta-instruction
+        // stream — NOT the reconstructed object size (the target size
+        // lives in a varint inside the stream). Real git packs encode it
+        // this way; M2's decompress cap enforces the equality.
+        let mut dsz = delta.len() as u64;
         let mut dheader = vec![
             (if dsz >> 4 > 0 { 0x80 } else { 0 }) | (OBJ_OFS_DELTA << 4) | ((dsz & 0xf) as u8),
         ];
@@ -1487,7 +1661,7 @@ mod tests {
         pack.extend_from_slice(b"PACK");
         pack.extend_from_slice(&2u32.to_be_bytes());
         pack.extend_from_slice(&1u32.to_be_bytes());
-        pack.push(OBJ_OFS_DELTA << 4); // size=0
+        pack.push((OBJ_OFS_DELTA << 4) | 2); // size = inflated delta-body length (2 bytes)
         let offset_field = encode_ofs_offset(99999);
         pack.extend_from_slice(&offset_field);
         {
