@@ -779,7 +779,10 @@ pub(crate) fn store_with_ref_delta_resolution<S: ObjectStore + ?Sized>(
         .filter_map(|(i, e)| match e.kind {
             ParsedKind::RefDelta { .. } => Some(i),
             ParsedKind::OfsDelta { .. } => Some(i),
-            _ => None,
+            // Explicit (not `_`) so a future ParsedKind variant forces a
+            // compile error here rather than being silently treated as
+            // a non-delta entry that needs no resolution.
+            ParsedKind::Direct(_) => None,
         })
         .collect();
 

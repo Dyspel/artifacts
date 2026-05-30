@@ -146,9 +146,16 @@ impl RateLimiter {
 
     /// Drop buckets that haven't been touched in `stale_after`. Keeps
     /// the map from growing unboundedly if subjects come and go.
+    ///
+    /// Uses `Instant::elapsed()` rather than `Instant::now() -
+    /// stale_after`: the subtraction form panics when `stale_after`
+    /// exceeds the process uptime (monotonic-clock underflow), which is
+    /// reachable with a long eviction window early in a server's life.
+    /// `elapsed()` subtracts a past instant from now and cannot
+    /// underflow.
     pub fn evict_stale(&self, stale_after: Duration) {
-        let cutoff = Instant::now() - stale_after;
-        self.buckets.retain(|_, bucket| bucket.last_refill > cutoff);
+        self.buckets
+            .retain(|_, bucket| bucket.last_refill.elapsed() < stale_after);
     }
 
     /// For tests: peek at the current token count of a bucket. Returns
@@ -199,6 +206,21 @@ mod tests {
         for _ in 0..10_000 {
             rl.check(&Principal::Admin, Class::Create).unwrap();
         }
+    }
+
+    #[test]
+    fn evict_stale_with_window_exceeding_uptime_does_not_panic() {
+        // Regression: the old `Instant::now() - stale_after` form panics
+        // (monotonic-clock underflow) when the window exceeds process
+        // uptime. A ~100-year window must be safe, and a freshly-touched
+        // bucket must survive it.
+        let rl = RateLimiter::with_defaults();
+        rl.check(&alice(), Class::Create).unwrap();
+        rl.evict_stale(Duration::from_secs(100 * 365 * 24 * 3600));
+        assert!(
+            rl.peek("alice", Class::Create).is_some(),
+            "a fresh bucket must survive an oversized eviction window"
+        );
     }
 
     #[test]

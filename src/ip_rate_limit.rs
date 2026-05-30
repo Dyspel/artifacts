@@ -84,9 +84,16 @@ impl IpRateLimiter {
     }
 
     /// Drop buckets untouched for `stale_after`. Cleanup-task target.
+    ///
+    /// Uses `Instant::elapsed()` rather than `Instant::now() -
+    /// stale_after`: the latter panics if `stale_after` exceeds the
+    /// process uptime (the subtraction underflows the monotonic clock),
+    /// which is reachable with a long eviction window on a
+    /// freshly-started server. `elapsed()` only ever subtracts a past
+    /// instant from now, so it cannot underflow.
     pub fn evict_stale(&self, stale_after: Duration) {
-        let cutoff = Instant::now() - stale_after;
-        self.buckets.retain(|_, b| b.last_refill > cutoff);
+        self.buckets
+            .retain(|_, b| b.last_refill.elapsed() < stale_after);
     }
 
     #[cfg(test)]
@@ -133,6 +140,22 @@ mod tests {
             rl.check(ip),
             Err(Error::RateLimited { retry_after_secs }) if retry_after_secs >= 1,
         ));
+    }
+
+    #[test]
+    fn evict_stale_with_window_exceeding_uptime_does_not_panic() {
+        // Regression: the old `Instant::now() - stale_after` form panics
+        // (monotonic-clock underflow) when the window exceeds process
+        // uptime. A ~100-year window must be safe, and since no bucket
+        // is that old, a freshly-touched bucket must survive.
+        let rl = IpRateLimiter::with_defaults();
+        let ip = ip4("203.0.113.42");
+        rl.check(ip).unwrap();
+        rl.evict_stale(Duration::from_secs(100 * 365 * 24 * 3600));
+        assert!(
+            rl.peek(ip).is_some(),
+            "a fresh bucket must survive an oversized eviction window"
+        );
     }
 
     #[test]
