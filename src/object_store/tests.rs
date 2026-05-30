@@ -231,6 +231,57 @@ fn fs_write_loose_idempotent_on_repeat() {
     conformance::write_loose_idempotent_on_repeat(&store);
 }
 
+/// M3: the durable write path. `write_loose` stages to a tmp file,
+/// fsyncs the file's contents, renames into place, then fsyncs the
+/// parent directory. This drives that whole path and asserts the
+/// object is readable, the bytes round-trip, and no staging tmp file
+/// is left behind once the rename succeeds.
+#[test]
+fn fs_write_loose_durable_and_leaves_no_tmp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repos = tmp.path().join("repos");
+    let store = FsObjectStore::new(&repos);
+    let repo_id_str = new_repo_id();
+    let repo_id = rid(&repo_id_str);
+    // write_loose stores the bytes verbatim and creates the shard dir
+    // itself; content-addressing isn't re-checked, so any valid oid
+    // exercises the storage path.
+    let oid = to_oid("1234567890abcdef1234567890abcdef12345678");
+    let payload = b"durable-bytes";
+
+    store.write_loose(&repo_id, &oid, payload).unwrap();
+
+    let got = store.read_loose(&repo_id, &oid).unwrap().expect("present");
+    assert_eq!(
+        got, payload,
+        "bytes must round-trip through the durable write"
+    );
+
+    // After a successful rename the staging tmp must be gone.
+    let shard = repos
+        .join(format!("{repo_id_str}.git"))
+        .join("objects")
+        .join("12");
+    let leftovers: Vec<String> = std::fs::read_dir(&shard)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging tmp files left behind: {leftovers:?}"
+    );
+
+    // Idempotent re-write stays a clean success.
+    store.write_loose(&repo_id, &oid, payload).unwrap();
+    let again = store
+        .read_loose(&repo_id, &oid)
+        .unwrap()
+        .expect("still present");
+    assert_eq!(again, payload);
+}
+
 #[test]
 fn fs_list_loose_enumerates_writes() {
     let tmp = tempfile::tempdir().unwrap();

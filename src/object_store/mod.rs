@@ -280,12 +280,21 @@ impl ObjectStore for FsObjectStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Atomic write: stage into a tmp file in the same parent
-        // directory (so rename is filesystem-local), then rename
-        // into place. A torn write to the tmp file leaves the
-        // canonical path untouched. Tmp name uses pid+rand+oid
-        // suffix so concurrent writers of the same object don't
-        // collide on the tmp path.
+        // Atomic + durable write. Stage into a tmp file in the same
+        // parent directory (so rename is filesystem-local), fsync the
+        // tmp file's contents to stable storage, THEN rename into
+        // place, THEN fsync the parent directory so the rename (the
+        // new directory entry) is itself durable.
+        //
+        // Ordering matters: rename only makes the *name* swap atomic;
+        // it says nothing about whether the bytes preceding it reached
+        // disk. Without the data fsync, a crash after the rename — or
+        // after the ref CAS that follows a push — can leave a ref
+        // pointing at a zero-length or absent object (write-ordering
+        // inversion). The directory fsync makes the entry survive a
+        // crash too. Tmp name uses pid+rand+oid so concurrent writers
+        // of the same object don't collide on the tmp path.
+        use std::io::Write as _;
         let parent = path.parent().expect("loose_path has 2-component prefix");
         let tmp_name = format!(
             ".tmp-{}-{}-{}",
@@ -294,9 +303,24 @@ impl ObjectStore for FsObjectStore {
             oid
         );
         let tmp = parent.join(tmp_name);
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(bytes)?;
+            // Flush data + metadata to stable storage before the rename.
+            f.sync_all()?;
+        }
         match std::fs::rename(&tmp, &path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Make the directory entry created by the rename durable.
+                // Best-effort: some filesystems don't support directory
+                // fsync, and the object bytes are already durable above —
+                // the worst case on a crash is the object reverting to
+                // its tmp name, which a re-push re-creates.
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+                Ok(())
+            }
             Err(e) => {
                 // Clean up the tmp on failure so we don't leave
                 // garbage. Best-effort; if cleanup fails too, the

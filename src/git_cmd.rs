@@ -171,11 +171,26 @@ pub(crate) fn pack_objects_revs(git_dir: &Path) -> TokioCommand {
 /// path for the native receive-pack (`ARTIFACTS_NATIVE_INDEX_PACK=1`
 /// swaps in `gix-pack::Bundle::write_to_directory` instead). Caller
 /// pipes the pack bytes to stdin.
+///
+/// `-c core.fsync=loose-object -c core.fsyncMethod=fsync` makes git
+/// fsync each loose object it writes (git 2.36+). This is the
+/// durability guarantee the FS object store gets in `write_loose`: the
+/// pushed objects must be on stable storage before the ref CAS that
+/// follows, or a crash can leave a ref pointing at an object that never
+/// hit disk. git's default (`core.fsync=none`) does not fsync loose
+/// objects, so we opt in explicitly here.
 pub(crate) fn unpack_objects(git_dir: &Path) -> TokioCommand {
     let mut cmd = async_cmd();
     cmd.arg("--git-dir")
         .arg(git_dir)
-        .args(["unpack-objects", "-q"])
+        .args([
+            "-c",
+            "core.fsync=loose-object",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "unpack-objects",
+            "-q",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
