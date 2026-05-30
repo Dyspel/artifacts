@@ -89,20 +89,39 @@ pub enum Error {
     #[error("gix: {0}")]
     GixError(String),
 
+    /// A SQLite operation failed. Unlike the other backend errors this
+    /// keeps the underlying `rusqlite::Error` as its `source()` (via
+    /// `#[from]`) rather than flattening it into a `String`/`anyhow`,
+    /// so callers and tests can inspect the cause and the response layer
+    /// can tell a transient busy/locked database (→ 503 + Retry-After)
+    /// apart from a genuine internal failure (→ 500).
+    #[error("database: {0}")]
+    Db(#[from] rusqlite::Error),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl Error {
+    /// True when a SQLite failure is transient (the database was
+    /// momentarily busy or locked under concurrent writers) and the
+    /// client should retry rather than treat it as a hard error.
+    fn is_retryable_db(&self) -> bool {
+        matches!(
+            self,
+            Error::Db(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<std::string::FromUtf8Error> for Error {
     fn from(e: std::string::FromUtf8Error) -> Self {
-        Error::Other(anyhow::Error::from(e))
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
         Error::Other(anyhow::Error::from(e))
     }
 }
@@ -270,7 +289,24 @@ impl IntoResponse for Error {
                 tracing::warn!(error = %self, "pack parse failure");
                 (StatusCode::BAD_REQUEST, "pack_parse")
             }
-            Error::Io(_) | Error::Other(_) | Error::GixError(_) => {
+            Error::Db(_) if self.is_retryable_db() => {
+                // Transient: the database was busy/locked under concurrent
+                // writers. A 503 + Retry-After tells the client to back
+                // off and retry rather than surfacing a hard 500. The
+                // cause stays in logs, not on the wire.
+                tracing::warn!(error = %self, "database busy/locked; advising retry");
+                let body = Json(json!({
+                    "error": {
+                        "code": "db_busy",
+                        "message": "database temporarily busy, retry shortly",
+                    }
+                }));
+                let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+                resp.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return resp;
+            }
+            Error::Io(_) | Error::Other(_) | Error::GixError(_) | Error::Db(_) => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             }
@@ -336,6 +372,43 @@ mod tests {
         assert_eq!(v["headers"]["retry-after"], "30");
         assert_eq!(v["body"]["error"]["code"], "rate_limited");
         assert_eq!(v["body"]["error"]["retryAfter"], 30);
+    }
+
+    #[tokio::test]
+    async fn db_busy_emits_503_with_retry_after() {
+        // A transient SQLITE_BUSY (result code 5) must surface as a
+        // 503 + Retry-After so the client backs off and retries, not a
+        // hard 500.
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), None);
+        let resp = Error::from(busy).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 503);
+        assert_eq!(v["headers"]["retry-after"], "1");
+        assert_eq!(v["body"]["error"]["code"], "db_busy");
+    }
+
+    #[tokio::test]
+    async fn db_non_transient_emits_redacted_500() {
+        // A non-busy SQLite error is a genuine internal failure: 500
+        // with the body redacted to "internal" (the cause goes to logs).
+        let resp = Error::from(rusqlite::Error::QueryReturnedNoRows).into_response();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], 500);
+        assert_eq!(v["body"]["error"]["code"], "internal");
+        assert_eq!(v["body"]["error"]["message"], "internal");
+    }
+
+    #[test]
+    fn db_error_preserves_rusqlite_source() {
+        // Unlike GixError(String)/PackParse(String), Error::Db keeps the
+        // typed cause reachable via std::error::Error::source().
+        use std::error::Error as _;
+        let err = Error::from(rusqlite::Error::QueryReturnedNoRows);
+        let src = err.source().expect("Db must expose its source");
+        assert!(
+            src.downcast_ref::<rusqlite::Error>().is_some(),
+            "source must downcast back to rusqlite::Error"
+        );
     }
 
     #[tokio::test]
