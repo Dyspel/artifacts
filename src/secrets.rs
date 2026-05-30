@@ -61,6 +61,12 @@ impl Drop for MasterKey {
         // away. We don't pull in the `zeroize` crate just for this —
         // a single 32-byte volatile write is enough.
         for b in self.bytes.iter_mut() {
+            // SAFETY: `b` is a `&mut u8` yielded by `iter_mut`, so the
+            // pointer is non-null, properly aligned, and valid for a
+            // single-byte write for the duration of this call. The
+            // value written (`0`) has no destructor and there is no
+            // aliasing. `write_volatile` is used solely so the compiler
+            // cannot elide the scrub as a dead store.
             unsafe { core::ptr::write_volatile(b, 0) };
         }
     }
