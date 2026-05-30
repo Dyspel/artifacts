@@ -1708,6 +1708,9 @@ fn step_drain_readiness(server: &mut TestServer, _st: &State) {
     assert_status(&pre, 200, "pre-shutdown readiness");
     // SIGTERM. Readiness must flip to 503 + draining:true within the
     // 2 s drain-delay window.
+    // SAFETY: `libc::kill` is an FFI call with no preconditions on the
+    // caller beyond a valid pid; `child.id()` is this process's live
+    // child, and SIGTERM is a valid signal number. No memory is shared.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut flipped = false;

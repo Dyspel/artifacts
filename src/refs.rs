@@ -720,7 +720,9 @@ mod tests {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_ref(), Some(&oid2),);
                 }
-                other => panic!("expected Conflict, got {other:?}"),
+                other @ CasOutcome::Updated => {
+                    panic!("expected Updated-free conflict, got {other:?}")
+                }
             }
         }
 
@@ -791,7 +793,9 @@ mod tests {
                 CasOutcome::Conflict { current } => {
                     assert_eq!(current.as_ref(), Some(&oid_new));
                 }
-                other => panic!("expected Conflict, got {other:?}"),
+                other @ CasOutcome::Updated => {
+                    panic!("expected Updated-free conflict, got {other:?}")
+                }
             }
             // Ref is still present — delete didn't happen.
             assert!(s.read(&repo, &rname).await.unwrap().is_some());
@@ -999,7 +1003,7 @@ mod tests {
             CasOutcome::Conflict { current } => {
                 assert_eq!(current.as_ref(), Some(&s2));
             }
-            other => panic!("wanted conflict, got {other:?}"),
+            other @ CasOutcome::Updated => panic!("wanted conflict, got {other:?}"),
         }
     }
 }

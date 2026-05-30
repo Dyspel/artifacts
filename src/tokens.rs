@@ -560,7 +560,7 @@ fn sha256_hex(s: &str) -> String {
     let digest = Sha256::digest(s.as_bytes());
     const HEX: &[u8] = b"0123456789abcdef";
     let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest.iter() {
+    for b in &digest {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
     }

@@ -315,7 +315,7 @@ mod tests {
         let bytes = axum::body::to_bytes(body, 16 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let mut headers = serde_json::Map::new();
-        for (k, val) in parts.headers.iter() {
+        for (k, val) in &parts.headers {
             headers.insert(k.as_str().to_string(), json!(val.to_str().unwrap_or("")));
         }
         json!({

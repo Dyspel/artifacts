@@ -63,16 +63,9 @@
 //! measurement if pool-exhausted spikes show up in the
 //! `artifacts_sqlite_lock_wait_seconds` histogram".
 
-#![deny(unused)]
-// Unsafe-code discipline. The crate carries exactly one `unsafe` block
-// (a volatile zeroing write in `secrets::MasterKey::drop`). These lints
-// keep it — and any future unsafe code — honest: every `unsafe` block
-// must justify itself with a `// SAFETY:` comment and perform exactly
-// one unsafe operation, and any `unsafe fn` must wrap its own unsafe
-// ops rather than inheriting the function's unsafety implicitly.
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(clippy::undocumented_unsafe_blocks)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
+// Lint policy (unused/unsafe discipline + curated `clippy::pedantic`)
+// lives in the `[lints]` table in Cargo.toml, so it applies uniformly
+// to the library, both binaries, tests, and benches from one place.
 
 pub mod alternates_cache;
 pub mod app;

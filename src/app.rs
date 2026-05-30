@@ -1403,7 +1403,9 @@ mod shutdown_classification_tests {
 
     #[test]
     fn elapsed_past_budget_is_timed_out() {
-        let long_ago = std::time::Instant::now() - Duration::from_secs(60);
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("test host uptime exceeds 60s");
         assert_eq!(
             classify_shutdown_kind(Some(long_ago), Duration::from_secs(30)),
             "timed_out",
@@ -1412,7 +1414,9 @@ mod shutdown_classification_tests {
 
     #[test]
     fn within_epsilon_of_budget_still_graceful() {
-        let near_deadline = std::time::Instant::now() - Duration::from_millis(29_950);
+        let near_deadline = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(29_950))
+            .expect("test host uptime exceeds 30s");
         assert_eq!(
             classify_shutdown_kind(Some(near_deadline), Duration::from_secs(30)),
             "graceful",

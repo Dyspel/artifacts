@@ -1670,7 +1670,7 @@ mod tests {
         // the same secrets under the new key.
         let listed = r.list("r1").unwrap();
         let mut plaintexts: Vec<&str> = listed.iter().filter_map(|s| s.secret.as_deref()).collect();
-        plaintexts.sort();
+        plaintexts.sort_unstable();
         assert_eq!(plaintexts, vec!["alpha", "beta"]);
 
         // Raw secret column changed.
@@ -2228,7 +2228,7 @@ mod tests {
             .find(|(k, _, _, _)| k.key().name() == "artifacts_webhook_events_dropped_total");
         match found {
             Some((_, _, _, DebugValue::Counter(v))) => {
-                assert_eq!(v, 7, "drop counter must record the dropped-event count")
+                assert_eq!(v, 7, "drop counter must record the dropped-event count");
             }
             other => panic!("drop counter was not recorded: {other:?}"),
         }

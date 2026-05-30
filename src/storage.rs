@@ -154,7 +154,7 @@ fn path_is_safe_descendant(root: &Path, joined: &Path) -> std::result::Result<()
     };
     for comp in rel.components() {
         match comp {
-            std::path::Component::Normal(_) => continue,
+            std::path::Component::Normal(_) => {}
             std::path::Component::ParentDir => return Err("ParentDir component"),
             std::path::Component::RootDir => return Err("RootDir component"),
             std::path::Component::Prefix(_) => return Err("Prefix component"),

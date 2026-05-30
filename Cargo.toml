@@ -6,6 +6,81 @@ rust-version = "1.88"
 description = "A versioned filesystem that speaks Git — prototype"
 license = "Apache-2.0"
 
+# Lint policy — single source of truth, applied to the library, both
+# binaries, tests, and benches. Run as `cargo clippy --all-targets --
+# -D warnings`, so every `warn` below is effectively a hard gate.
+[lints.rust]
+unused = "deny"
+# Forward guard: any future `unsafe fn` must wrap its own unsafe ops in
+# an explicit `unsafe {}` block rather than inheriting the fn's unsafety.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Adopt the pedantic group wholesale (priority -1 so the targeted
+# `allow`s below win), then opt out of the categories that are
+# deliberate or pure noise for a server binary. Everything not allowed
+# here is enforced — including the lints we cleaned up to get to green.
+pedantic = { level = "warn", priority = -1 }
+# Unsafe discipline (restriction group): every `unsafe` block must carry
+# a `// SAFETY:` comment and perform exactly one unsafe operation.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# -- Allowed: documentation style. This is an application, not a
+#    published library API, so we don't require per-item rustdoc
+#    sections on every internal `pub` item. (The core public traits and
+#    entry points still get `# Errors`/`# Panics`/examples by hand.)
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# -- Allowed: numeric casts. Epoch-second timestamps (u64<->i64 for
+#    SQLite's signed INTEGER), byte sizes (u64<->usize), and token-bucket
+#    arithmetic (f64) are deliberate, bounded conversions; `as` is
+#    clearer than a `try_from().expect()` dance at these sites.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+
+# -- Allowed: equivalent-readability style choices. These flag perfectly
+#    clear code; rewriting wholesale is churn without a clarity win.
+redundant_closure_for_method_calls = "allow"
+manual_let_else = "allow"
+single_match_else = "allow"
+map_unwrap_or = "allow"
+match_same_arms = "allow"
+manual_assert = "allow"
+ignored_unit_patterns = "allow"
+items_after_statements = "allow"
+needless_raw_string_hashes = "allow"
+unnecessary_debug_formatting = "allow"
+used_underscore_binding = "allow"
+
+# -- Allowed: would force signature churn for marginal benefit.
+needless_pass_by_value = "allow"
+trivially_copy_pass_by_ref = "allow"
+unnecessary_wraps = "allow"
+
+# -- Allowed: large dispatch/match functions whose length is inherent to
+#    the protocol/route surface they cover; splitting hurts readability.
+too_many_lines = "allow"
+
+# -- Allowed: bindings like `oid`/`old`, `s1`/`s2` are clear in context.
+similar_names = "allow"
+
+# -- Allowed: a few sync helpers/handlers are `async` to sit uniformly in
+#    async call sites and to leave room for awaits without a churny
+#    signature change.
+unused_async = "allow"
+
+# -- Allowed: git treats the `.lock` ref-name suffix and our own
+#    `<id>.git` directory suffix as literally lowercase, so a
+#    case-sensitive `ends_with` is correct, not a bug.
+case_sensitive_file_extension_comparisons = "allow"
+
 [[bin]]
 name = "artifacts"
 path = "src/main.rs"

@@ -60,8 +60,8 @@ impl Drop for MasterKey {
         // dead-store elimination; a plain assignment can be optimized
         // away. We don't pull in the `zeroize` crate just for this —
         // a single 32-byte volatile write is enough.
-        for b in self.bytes.iter_mut() {
-            // SAFETY: `b` is a `&mut u8` yielded by `iter_mut`, so the
+        for b in &mut self.bytes {
+            // SAFETY: `b` is a `&mut u8` yielded by iterating `&mut`, so the
             // pointer is non-null, properly aligned, and valid for a
             // single-byte write for the duration of this call. The
             // value written (`0`) has no destructor and there is no
