@@ -400,10 +400,15 @@ repos (forks carry an `objects/info/alternates` pointer).
 ```sh
 cargo build --release             # benchmarks use the release build
 
-cargo test                        # 372 lib tests + 2 doctests + integration
-cargo test --all-features         # + 26 GUI unit tests
+cargo test                        # 754 lib tests + 2 doctests + integration
+cargo test --all-features         # + GUI unit tests
 cargo test --doc                  # runnable doc examples (e.g. src/ids.rs)
 ./tests/smoke.sh                  # → cargo test --test integration_smoke
+
+# Coverage: ~94% line coverage (cargo-tarpaulin). The server is driven
+# in-process by the e2e_* integration binaries so it's instrumented;
+# see docs/COVERAGE.md for the measurement command, methodology, and a
+# per-line accounting of the deliberately-uncovered residual.
 
 # Lints: enforced as a hard gate in CI.
 cargo fmt --check
