@@ -1,11 +1,12 @@
 # Test coverage
 
-**94.2% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
+**94.4% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
 excluded), across **754 in-crate unit tests + 11 integration test
 binaries + doctests**. Reconciled across both coverage engines (see
-"two engines" below) the true line coverage is **≈95%** — the single
-biggest ptrace shortfall, `error.rs` at 68%, is **97% under the LLVM
-engine** (ptrace doesn't credit the lines inside its multi-line
+"two engines" below) the true line coverage is **≈95%** — `error.rs`'s `IntoResponse` arms were refactored through a single
+`structured_error` builder (a DRY win that also let ptrace credit the
+per-field inserts it couldn't attribute inside the old multi-line
+`json!{}` blocks) (ptrace doesn't credit the lines inside its multi-line
 `json!{}` `IntoResponse` arms, all of which the unit tests execute).
 
 Most modules are 91–100%; `rest/admin`, `ownership`, `config`,
