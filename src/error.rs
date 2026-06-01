@@ -172,8 +172,155 @@ impl From<aes_gcm::Error> for Error {
     }
 }
 
+/// Build the standard error envelope `{"error":{"code","message",..extra}}`,
+/// optionally attaching a `Retry-After` header. Factored out of the
+/// per-variant arms so each structured response is assembled from
+/// single-statement field inserts rather than a multi-line `json!`
+/// block duplicated seven ways — DRY, and one place to evolve the
+/// envelope shape.
+fn structured_error(
+    status: StatusCode,
+    code: &str,
+    message: String,
+    extra: Vec<(&str, serde_json::Value)>,
+    retry_after: Option<String>,
+) -> Response {
+    let mut err = serde_json::Map::new();
+    err.insert("code".to_string(), json!(code));
+    err.insert("message".to_string(), json!(message));
+    for (k, v) in extra {
+        err.insert(k.to_string(), v);
+    }
+    let body = Json(json!({ "error": serde_json::Value::Object(err) }));
+    let mut resp = (status, body).into_response();
+    if let Some(secs) = retry_after {
+        if let Ok(v) = HeaderValue::from_str(&secs) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
+    resp
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        // Structured variants carry extra fields (and sometimes a
+        // Retry-After) beyond the bare code/message; they build their
+        // payload via `structured_error` and return early.
+        match &self {
+            Error::QuotaExceeded { subject, limit } => {
+                // 429 with a dedicated code so clients can tell "you've
+                // hit your quota" apart from "you're being rate-limited."
+                metrics::counter!("artifacts_quota_exceeded_total").increment(1);
+                return structured_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "quota_exceeded",
+                    format!("repo quota exceeded for {subject}"),
+                    vec![("subject", json!(subject)), ("limit", json!(limit))],
+                    None,
+                );
+            },
+            Error::RepoByteQuotaExceeded {
+                repo_id,
+                bytes_used,
+                limit,
+            } => {
+                // 413 — the next push/commit would exceed the per-repo
+                // byte quota. Distinct counter from the per-user count.
+                metrics::counter!("artifacts_repo_byte_quota_exceeded_total").increment(1);
+                return structured_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "repo_byte_quota_exceeded",
+                    format!("repo {repo_id} byte quota exceeded ({bytes_used} >= {limit})"),
+                    vec![
+                        ("repoId", json!(repo_id)),
+                        ("bytesUsed", json!(bytes_used)),
+                        ("limit", json!(limit)),
+                    ],
+                    None,
+                );
+            },
+            Error::RateLimited { retry_after_secs } => {
+                // 429 + Retry-After. Distinct `code` from `quota_exceeded`
+                // so clients retry (transient) vs. surface (persistent).
+                metrics::counter!("artifacts_rate_limited_total").increment(1);
+                return structured_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    format!("rate limited; retry after {retry_after_secs}s"),
+                    vec![("retryAfter", json!(retry_after_secs))],
+                    Some(retry_after_secs.to_string()),
+                );
+            },
+            Error::RefConflict {
+                branch,
+                expected,
+                current,
+            } => {
+                // 409 with current + expected SHAs so callers re-read and
+                // retry without a second round trip.
+                return structured_error(
+                    StatusCode::CONFLICT,
+                    "ref_conflict",
+                    format!("ref conflict on branch {branch}"),
+                    vec![
+                        ("branch", json!(branch)),
+                        ("expected", json!(expected)),
+                        ("current", json!(current)),
+                    ],
+                    None,
+                );
+            },
+            Error::ForkDependency { repo_id, forks } => {
+                // 409 with the dependent fork ids so callers can delete
+                // those first or re-issue with ?force=true.
+                let plural = if forks.len() == 1 { "" } else { "s" };
+                return structured_error(
+                    StatusCode::CONFLICT,
+                    "fork_dependency",
+                    format!("repo {repo_id} has {} dependent fork{plural}", forks.len()),
+                    vec![("repoId", json!(repo_id)), ("forks", json!(forks))],
+                    None,
+                );
+            },
+            Error::MergeConflict {
+                target_branch,
+                source_branch,
+                conflict_paths,
+            } => {
+                // 409 with the paths that failed to merge.
+                let plural = if conflict_paths.len() == 1 { "" } else { "s" };
+                return structured_error(
+                    StatusCode::CONFLICT,
+                    "merge_conflict",
+                    format!(
+                        "merge conflict: {source_branch} → {target_branch} ({} conflicting path{plural})",
+                        conflict_paths.len(),
+                    ),
+                    vec![
+                        ("sourceBranch", json!(source_branch)),
+                        ("targetBranch", json!(target_branch)),
+                        ("conflicts", json!(conflict_paths)),
+                    ],
+                    None,
+                );
+            },
+            Error::Db(_) if self.is_retryable_db() => {
+                // Transient busy/locked: 503 + Retry-After so the client
+                // backs off rather than seeing a hard 500. Cause stays in
+                // logs, not on the wire.
+                tracing::warn!(error = %self, "database busy/locked; advising retry");
+                return structured_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "db_busy",
+                    "database temporarily busy, retry shortly".to_string(),
+                    vec![],
+                    Some("1".to_string()),
+                );
+            },
+            _ => {},
+        }
+
+        // Remaining variants are bare code/message responses.
         let (status, code) = match &self {
             Error::RepoNotFound(_) => (StatusCode::NOT_FOUND, "repo_not_found"),
             Error::RepoExists(_) => (StatusCode::CONFLICT, "repo_exists"),
@@ -183,161 +330,23 @@ impl IntoResponse for Error {
             },
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            Error::QuotaExceeded { subject, limit } => {
-                // 429 with a dedicated code so clients can tell
-                // "you've hit your quota" apart from "you're being
-                // rate-limited." Includes the limit so the client UI
-                // can surface it.
-                metrics::counter!("artifacts_quota_exceeded_total").increment(1);
-                let body = Json(json!({
-                    "error": {
-                        "code": "quota_exceeded",
-                        "message": format!("repo quota exceeded for {subject}"),
-                        "subject": subject,
-                        "limit": limit,
-                    }
-                }));
-                return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-            },
-            Error::RepoByteQuotaExceeded {
-                repo_id,
-                bytes_used,
-                limit,
-            } => {
-                // 413 Payload Too Large — the next push/commit would
-                // exceed the per-repo byte quota. Distinct counter from
-                // the per-user repo-count quota (`quota_exceeded`) so
-                // dashboards can chart them separately.
-                metrics::counter!("artifacts_repo_byte_quota_exceeded_total").increment(1);
-                let body = Json(json!({
-                    "error": {
-                        "code": "repo_byte_quota_exceeded",
-                        "message": format!("repo {repo_id} byte quota exceeded ({bytes_used} >= {limit})"),
-                        "repoId": repo_id,
-                        "bytesUsed": bytes_used,
-                        "limit": limit,
-                    }
-                }));
-                return (StatusCode::PAYLOAD_TOO_LARGE, body).into_response();
-            },
-            Error::RateLimited { retry_after_secs } => {
-                // 429 + Retry-After. Distinct `code` from `quota_exceeded`
-                // so clients retry (rate-limited is transient) vs. surface
-                // an error (quota is persistent).
-                metrics::counter!("artifacts_rate_limited_total").increment(1);
-                let body = Json(json!({
-                    "error": {
-                        "code": "rate_limited",
-                        "message": format!("rate limited; retry after {retry_after_secs}s"),
-                        "retryAfter": retry_after_secs,
-                    }
-                }));
-                let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-                if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                    resp.headers_mut().insert(header::RETRY_AFTER, v);
-                }
-                return resp;
-            },
-            Error::RefConflict {
-                branch,
-                expected,
-                current,
-            } => {
-                // Dedicated 409 with the current + expected SHAs so callers
-                // can re-read and retry without a second round trip.
-                let body = Json(json!({
-                    "error": {
-                        "code": "ref_conflict",
-                        "message": format!("ref conflict on branch {branch}"),
-                        "branch": branch,
-                        "expected": expected,
-                        "current": current,
-                    }
-                }));
-                return (StatusCode::CONFLICT, body).into_response();
-            },
-            Error::ForkDependency { repo_id, forks } => {
-                // 409 with the dependent fork ids so callers can decide
-                // whether to delete those first or re-issue with
-                // ?force=true. Mirrors the shape of MergeConflict /
-                // RefConflict — explicit code + structured payload.
-                let body = Json(json!({
-                    "error": {
-                        "code": "fork_dependency",
-                        "message": format!(
-                            "repo {repo_id} has {} dependent fork{}",
-                            forks.len(),
-                            if forks.len() == 1 { "" } else { "s" },
-                        ),
-                        "repoId": repo_id,
-                        "forks": forks,
-                    }
-                }));
-                return (StatusCode::CONFLICT, body).into_response();
-            },
-            Error::MergeConflict {
-                target_branch,
-                source_branch,
-                conflict_paths,
-            } => {
-                // 409 with the paths that failed to merge so the caller can
-                // surface them directly in a UI or resolve server-side by
-                // re-issuing with explicit content.
-                let body = Json(json!({
-                    "error": {
-                        "code": "merge_conflict",
-                        "message": format!(
-                            "merge conflict: {} → {} ({} conflicting path{})",
-                            source_branch,
-                            target_branch,
-                            conflict_paths.len(),
-                            if conflict_paths.len() == 1 { "" } else { "s" },
-                        ),
-                        "sourceBranch": source_branch,
-                        "targetBranch": target_branch,
-                        "conflicts": conflict_paths,
-                    }
-                }));
-                return (StatusCode::CONFLICT, body).into_response();
-            },
             Error::PackParse(_) => {
-                // 400 — the pack body the client sent didn't parse.
-                // Distinct code so dashboards can chart bad-push rates
-                // separately from genuine 5xxs.
+                // 400 — the pushed pack body didn't parse. Distinct code
+                // so dashboards chart bad-push rates apart from 5xxs.
                 tracing::warn!(error = %self, "pack parse failure");
                 (StatusCode::BAD_REQUEST, "pack_parse")
             },
-            Error::Db(_) if self.is_retryable_db() => {
-                // Transient: the database was busy/locked under concurrent
-                // writers. A 503 + Retry-After tells the client to back
-                // off and retry rather than surfacing a hard 500. The
-                // cause stays in logs, not on the wire.
-                tracing::warn!(error = %self, "database busy/locked; advising retry");
-                let body = Json(json!({
-                    "error": {
-                        "code": "db_busy",
-                        "message": "database temporarily busy, retry shortly",
-                    }
-                }));
-                let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
-                resp.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                return resp;
-            },
-            Error::Io(_) | Error::Other(_) | Error::GixError(_) | Error::Db(_) => {
+            // Io / Other / GixError / non-retryable Db — redacted 5xx.
+            _ => {
                 tracing::error!(error = %self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal")
             },
         };
-        // 5xx responses MUST NOT echo the underlying Display chain to
-        // the wire. The chain leaks file paths (Io), anyhow `.context()`
-        // strings (Other), and gix internals (GixError) — enough to
-        // help an attacker probe filesystem layout or feature flags.
-        // The full Display already went to `tracing::error!` above, so
-        // operators see the detail in logs while the wire surface stays
-        // opaque. 4xx responses keep their Display text because the
-        // content is already user-input-shaped (echoed repo ids, pack
-        // parse messages bounded by the parser's vocabulary, etc.).
+        // 5xx responses MUST NOT echo the underlying Display chain to the
+        // wire — it leaks file paths (Io), anyhow `.context()` strings
+        // (Other), and gix internals (GixError). The full Display already
+        // went to `tracing::error!` above. 4xx keep their Display text
+        // because it's already user-input-shaped.
         let message = if status.is_server_error() {
             "internal".to_string()
         } else {
