@@ -145,12 +145,17 @@ pub async fn admin_gc_preview(
     if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
-    let preview = crate::gc::preview(
-        &state.cfg.repos_dir(),
-        &id,
-        &state.data.alternates_cache,
-        &*state.data.objects,
-    )?;
+    // GC preview walks the alternates network and runs a `git rev-list`
+    // per member — seconds on a large repo. Offload to a blocking
+    // worker so it doesn't stall a tokio runtime thread (the periodic
+    // sweep already does this; the admin endpoint must too).
+    let repos_dir = state.cfg.repos_dir();
+    let cache = state.data.alternates_cache.clone();
+    let objects = state.data.objects.clone();
+    let preview = crate::blocking::run_blocking("admin_gc_preview", move || {
+        crate::gc::preview(&repos_dir, &id, &cache, &*objects)
+    })
+    .await?;
     Ok(Json(preview))
 }
 
@@ -186,13 +191,16 @@ pub async fn admin_gc_run(
     if !state.data.storage.exists(&id_typed) {
         return Err(Error::RepoNotFound(id));
     }
-    let result = crate::gc::run(
-        &state.cfg.repos_dir(),
-        &id,
-        &state.data.alternates_cache,
-        q.min_age_secs.unwrap_or(7200),
-        &*state.data.objects,
-    )?;
+    // A full GC pass (reachability walk + per-object unlink) can run
+    // for seconds-to-minutes; keep it off the runtime threads.
+    let repos_dir = state.cfg.repos_dir();
+    let cache = state.data.alternates_cache.clone();
+    let objects = state.data.objects.clone();
+    let min_age_secs = q.min_age_secs.unwrap_or(7200);
+    let result = crate::blocking::run_blocking("admin_gc_run", move || {
+        crate::gc::run(&repos_dir, &id, &cache, min_age_secs, &*objects)
+    })
+    .await?;
     Ok(Json(result))
 }
 

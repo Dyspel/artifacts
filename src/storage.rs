@@ -43,6 +43,26 @@ pub fn check_repo_byte_quota(repos_dir: &Path, repo_id: &str, limit: u64) -> Res
     Ok(())
 }
 
+/// Async wrapper for [`check_repo_byte_quota`]. The recursive dir-size
+/// walk is `O(files in the repo)` of blocking `stat` syscalls; on a
+/// repo with many loose objects that's enough to stall a tokio worker,
+/// and it runs on the hot push / REST-commit path. Run it on a
+/// blocking worker instead. The no-quota case (`limit == 0`) skips the
+/// spawn entirely so the common configuration pays nothing.
+pub async fn check_repo_byte_quota_async(
+    repos_dir: PathBuf,
+    repo_id: String,
+    limit: u64,
+) -> Result<()> {
+    if limit == 0 {
+        return Ok(());
+    }
+    crate::blocking::run_blocking("check_repo_byte_quota", move || {
+        check_repo_byte_quota(&repos_dir, &repo_id, limit)
+    })
+    .await
+}
+
 /// Repo lifecycle. Implementations are free to back repos with any
 /// storage medium as long as they can honor create / fork / delete /
 /// exists semantics. `FsStorage` is the one impl today.

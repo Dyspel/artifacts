@@ -244,7 +244,14 @@ pub async fn delete_repo(
         let mut deleted = Vec::with_capacity(order.len());
         for dep in &order {
             let dep_typed = crate::ids::RepoId::try_from(dep.as_str())?;
-            state.data.storage.delete(&dep_typed)?;
+            // `delete` is `remove_dir_all` of a bare repo — potentially
+            // large and fully blocking. Keep it off the runtime thread.
+            let storage = state.data.storage.clone();
+            let dep_for_delete = dep_typed.clone();
+            crate::blocking::run_blocking("repo_delete_cascade", move || {
+                storage.delete(&dep_for_delete)
+            })
+            .await?;
             state.data.ownership.delete(&dep_typed).await?;
             state.data.alternates_cache.invalidate(dep);
             deleted.push(dep.clone());
@@ -283,7 +290,10 @@ pub async fn delete_repo(
         }
     }
 
-    state.data.storage.delete(&id_typed)?;
+    // `remove_dir_all` of the bare repo — blocking, possibly large.
+    let storage = state.data.storage.clone();
+    let id_for_delete = id_typed.clone();
+    crate::blocking::run_blocking("repo_delete", move || storage.delete(&id_for_delete)).await?;
     state.data.ownership.delete(&id_typed).await?;
     state.data.alternates_cache.invalidate(&id);
     let mode = if force { "force" } else { "default" };

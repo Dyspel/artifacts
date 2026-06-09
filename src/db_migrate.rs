@@ -171,6 +171,13 @@ pub fn open_pool_with_migrations(
     });
     r2d2::Pool::builder()
         .max_size(DEFAULT_POOL_SIZE)
+        // Bound the checkout wait. r2d2's default is 30s — under a
+        // burst that exhausts the pool, that parks a tokio worker
+        // thread for up to half a minute per request. Cap it at the
+        // same 5s as `busy_timeout`: if a connection can't be had in
+        // 5s the backend is overloaded, and failing fast beats holding
+        // a runtime thread hostage.
+        .connection_timeout(std::time::Duration::from_secs(5))
         .build(manager)
         .map_err(|e| Error::Other(anyhow::anyhow!("build sqlite pool: {e}")))
 }
