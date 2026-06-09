@@ -246,25 +246,38 @@ pub struct ChainVerifyOk {
 #[async_trait]
 impl AuditStore for SqliteAuditStore {
     async fn record(&self, evt: AuditEvent) -> Result<()> {
-        let conn = self.pooled()?;
-        // Read the most-recent chained row's hash under the same
-        // lock so a concurrent recorder can't insert between the
-        // SELECT and the INSERT. The first row of a fresh chain
-        // uses GENESIS_HASH (all-zero 32 bytes); rows that predate
-        // the v2 migration have NULL row_hash and are not part of
-        // the chain — we still chain forward from there using
-        // GENESIS_HASH so the new tail is self-consistent.
-        let prev_hash: Vec<u8> = conn
-            .query_row(
-                "SELECT row_hash FROM audit_events
+        let mut conn = self.pooled()?;
+        // The SELECT-tail-then-INSERT pair MUST be atomic against
+        // other recorders, or two concurrent writers read the same
+        // tail and insert two rows sharing one `prev_hash` — a forked
+        // chain that `verify_chain` reports as tampering. A plain
+        // pooled connection gives each writer its own connection, so
+        // the old "same lock" assumption (true under the single
+        // `Mutex<Connection>`) no longer holds. `BEGIN IMMEDIATE`
+        // takes SQLite's write lock up front, serializing the pair
+        // (other writers block on busy_timeout, then retry as a 503).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The first row of a fresh chain uses GENESIS_HASH (all-zero
+        // 32 bytes); rows that predate the v2 migration have NULL
+        // row_hash and are not part of the chain — we still chain
+        // forward from there using GENESIS_HASH so the new tail is
+        // self-consistent. Only an empty result falls back to
+        // GENESIS; a real DB error propagates (the old `unwrap_or`
+        // silently restarted the chain mid-table on any failure,
+        // which itself breaks verification).
+        let prev_hash: Vec<u8> = match tx.query_row(
+            "SELECT row_hash FROM audit_events
                  WHERE row_hash IS NOT NULL
                  ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .unwrap_or_else(|_| GENESIS_HASH.to_vec());
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(h) => h,
+            Err(rusqlite::Error::QueryReturnedNoRows) => GENESIS_HASH.to_vec(),
+            Err(e) => return Err(e.into()),
+        };
         let row_hash = hash_row(&prev_hash, &evt);
-        conn.execute(
+        tx.execute(
             "INSERT INTO audit_events
                (ts, event, actor, repo_id, fields_json, request_id, prev_hash, row_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -279,6 +292,7 @@ impl AuditStore for SqliteAuditStore {
                 row_hash,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -909,6 +923,37 @@ mod tests {
         }
         let ok = s.verify_chain().await.unwrap();
         assert_eq!(ok.verified, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_records_keep_the_chain_intact() {
+        // Regression for the pooled-connection chain fork: before
+        // `record` wrapped SELECT-tail + INSERT in a BEGIN IMMEDIATE
+        // transaction, two recorders on separate pool connections
+        // could read the same tail and insert rows sharing one
+        // `prev_hash`, which `verify_chain` reports as tampering.
+        // Fire many records concurrently across worker threads and
+        // assert every one chained (no fork, no lost row).
+        let (_d, s) = store();
+        let s = std::sync::Arc::new(s);
+        const N: u64 = 64;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = s.clone();
+            handles.push(tokio::spawn(async move {
+                s.record(evt(&format!("e{i}"), "admin", None))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let ok = s.verify_chain().await.unwrap();
+        assert_eq!(
+            ok.verified, N,
+            "all {N} concurrent inserts must chain without a fork"
+        );
     }
 
     #[tokio::test]
