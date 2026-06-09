@@ -484,6 +484,83 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn reads_commits_merge_routes_enforce_auth_and_ownership() {
+        // The reads class, the REST commit builder, and merge are all
+        // per-handler-authorized (no router-level auth layer), so each
+        // is an independent bypass surface. Walk every one with
+        // (no header → 401) and (a valid JWT for a non-owner → 403).
+        // A dropped `authorize_rest`/`enforce_owner` on any of them
+        // would otherwise ship green. Required query/body are supplied
+        // so extraction succeeds and auth is the deciding factor.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let repo = "auth-probe-repo-001";
+        let rid = crate::ids::RepoId::try_from(repo).unwrap();
+        state.data.storage.create(&rid).unwrap();
+        state
+            .data
+            .ownership
+            .record_owner(&rid, Some(&crate::ids::Subject::try_from("alice").unwrap()))
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/v1/repos/:id", get(crate::reads::get_repo))
+            .route(
+                "/v1/repos/:id/commits",
+                post(crate::commits::create_commit).get(crate::reads::list_commits),
+            )
+            .route("/v1/repos/:id/merge", post(merge_branches))
+            .route("/v1/repos/:id/refs", get(crate::reads::list_refs))
+            .route("/v1/repos/:id/tree", get(crate::reads::get_tree))
+            .route("/v1/repos/:id/blob", get(get_blob))
+            .route("/v1/repos/:id/diff", get(crate::reads::get_diff))
+            .route("/v1/repos/:id/notes", get(crate::reads::get_note))
+            .with_state(state);
+
+        let zeros = "0".repeat(40);
+        let commit_body = r#"{"branch":"main","message":"x","changes":[]}"#;
+        let merge_body = r#"{"sourceBranch":"a","targetBranch":"b"}"#;
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            ("GET", format!("/v1/repos/{repo}"), None),
+            ("GET", format!("/v1/repos/{repo}/commits"), None),
+            ("GET", format!("/v1/repos/{repo}/refs"), None),
+            ("GET", format!("/v1/repos/{repo}/tree"), None),
+            ("GET", format!("/v1/repos/{repo}/blob?path=README.md"), None),
+            ("GET", format!("/v1/repos/{repo}/diff?commit={zeros}"), None),
+            (
+                "GET",
+                format!("/v1/repos/{repo}/notes?commit={zeros}"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/v1/repos/{repo}/commits"),
+                Some(commit_body),
+            ),
+            ("POST", format!("/v1/repos/{repo}/merge"), Some(merge_body)),
+        ];
+
+        let mallory = user_jwt("mallory");
+        for (method, uri, body) in cases {
+            // No credentials → 401.
+            let (status, _) = send(&app, req(method, &uri, None, body)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must reject an unauthenticated caller"
+            );
+            // Valid JWT for a non-owner → 403 (repo is owned by alice).
+            let (status, _) = send(&app, req(method, &uri, Some(&mallory), body)).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must 403 a non-owner principal"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn admin_create_then_list_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let app = app(tmp.path());
