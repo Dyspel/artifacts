@@ -1,8 +1,10 @@
 # Test coverage
 
-**94.4% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
-excluded), across **754 in-crate unit tests + 11 integration test
-binaries + doctests**. Reconciled across both coverage engines (see
+**~94% line coverage** (`cargo-tarpaulin` ptrace engine, `src/main.rs`
+excluded), across **763 in-crate unit tests + 12 integration test
+binaries + doctests** (the count grew with a security/correctness
+hardening pass — arg-injection, shutdown, audit-chain, SSRF, and
+auth-negative-path regression tests). Reconciled across both coverage engines (see
 "two engines" below) the true line coverage is **≈95%**. `error.rs`'s
 `IntoResponse` arms were refactored through a single `structured_error`
 builder — a DRY win that also let ptrace credit the per-field inserts it

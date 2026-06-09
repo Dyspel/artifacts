@@ -400,7 +400,7 @@ repos (forks carry an `objects/info/alternates` pointer).
 ```sh
 cargo build --release             # benchmarks use the release build
 
-cargo test                        # 754 lib tests + 2 doctests + integration
+cargo test                        # 763 lib tests + 2 doctests + integration
 cargo test --all-features         # + GUI unit tests
 cargo test --doc                  # runnable doc examples (e.g. src/ids.rs)
 ./tests/smoke.sh                  # → cargo test --test integration_smoke
