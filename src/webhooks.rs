@@ -71,6 +71,102 @@ pub struct Subscription {
     pub events: Vec<crate::events::EventKind>,
 }
 
+/// SSRF guard for subscription target URLs. A webhook URL is
+/// attacker-supplied (any repo owner can register one) and the server
+/// then issues outbound requests to it, so an unvalidated URL lets a
+/// tenant point the server at internal infrastructure — cloud metadata
+/// (`http://169.254.169.254/…`), loopback admin ports, private-network
+/// services. We require an `http`/`https` scheme and, when the host is
+/// an IP *literal*, refuse loopback / private / link-local / ULA /
+/// multicast / unspecified ranges.
+///
+/// `allow_private` (driven by `--webhook-allow-private-targets`) opts
+/// out of the IP-range block for local/dev deployments that
+/// legitimately deliver to `127.0.0.1`.
+///
+/// Residual: a *hostname* that resolves to a private IP is not blocked
+/// here — fully closing DNS-rebinding needs a resolving HTTP client or
+/// an egress proxy that re-checks the connected peer, which this
+/// single-node prototype doesn't ship. The literal-IP block stops the
+/// direct-address attack, which is the common case.
+pub(crate) fn validate_webhook_url(url: &str, allow_private: bool) -> crate::error::Result<()> {
+    use crate::error::Error;
+    let (scheme, after) = url
+        .split_once("://")
+        .ok_or_else(|| Error::BadRequest("webhook url must be http(s)://…".into()))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::BadRequest(
+            "webhook url scheme must be http or https".into(),
+        ));
+    }
+    // Authority is everything up to the first path/query/fragment.
+    let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any `userinfo@` prefix.
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    // Extract the host, handling bracketed IPv6 and an optional :port.
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(h, _)| h)
+            .ok_or_else(|| Error::BadRequest("malformed IPv6 host in webhook url".into()))?
+    } else {
+        // Strip a trailing :port only when it's all digits, so a bare
+        // IPv4/hostname (no colon) is left intact.
+        hostport.rsplit_once(':').map_or(hostport, |(h, p)| {
+            if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                h
+            } else {
+                hostport
+            }
+        })
+    };
+    if host.is_empty() {
+        return Err(Error::BadRequest("webhook url has no host".into()));
+    }
+    if !allow_private {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_blocked_target_ip(ip) {
+                return Err(Error::BadRequest(
+                    "webhook url targets a loopback/private/link-local address".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for IP literals that an outbound webhook must not target by
+/// default — the SSRF blocklist behind [`validate_webhook_url`].
+fn is_blocked_target_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // Carrier-grade NAT 100.64.0.0/10 (`is_shared` is unstable).
+                || (oct[0] == 100 && (oct[1] & 0xc0) == 0x40)
+        },
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_target_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique-local fc00::/7 + link-local fe80::/10
+                // (the stable predicates for these are unstable).
+                || (seg0 & 0xfe00) == 0xfc00
+                || (seg0 & 0xffc0) == 0xfe80
+        },
+    }
+}
+
 /// One row of the durable delivery outbox (K3). Returned by
 /// `claim_pending_deliveries` after the registry has unsealed the
 /// secret. The delivery worker treats this as the source of truth
@@ -1316,6 +1412,57 @@ mod tests {
     /// lowercase contract (the old `"r1"` shorthand no longer parses).
     fn rid(s: &str) -> crate::ids::RepoId {
         crate::ids::RepoId::try_from(s).unwrap()
+    }
+
+    #[test]
+    fn validate_webhook_url_blocks_ssrf_targets() {
+        // Internal / metadata / loopback / private / link-local /
+        // multicast / unspecified literals, v4 and v6, are refused.
+        for bad in [
+            "http://127.0.0.1/hook",
+            "http://127.0.0.1:8080/hook",
+            "http://169.254.169.254/latest/meta-data", // cloud metadata
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "http://172.16.0.1/x",
+            "http://100.64.0.1/x", // CGNAT
+            "http://0.0.0.0/x",
+            "http://[::1]/x",               // ipv6 loopback
+            "http://[fe80::1]/x",           // ipv6 link-local
+            "http://[fc00::1]/x",           // ipv6 ULA
+            "http://[::ffff:127.0.0.1]/x",  // ipv4-mapped loopback
+            "http://user:pass@127.0.0.1/x", // userinfo doesn't smuggle past
+        ] {
+            assert!(
+                validate_webhook_url(bad, false).is_err(),
+                "{bad:?} must be rejected as SSRF"
+            );
+        }
+        // Non-http(s) schemes are refused regardless of host.
+        for bad in ["ftp://example.com/x", "file:///etc/passwd", "example.com/x"] {
+            assert!(
+                validate_webhook_url(bad, false).is_err(),
+                "{bad:?} must be rejected (scheme/format)"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_webhook_url_allows_public_and_hostnames() {
+        for ok in [
+            "https://hooks.example.com/abc",
+            "http://example.com:8080/x",
+            "https://8.8.8.8/x",         // public IP literal
+            "https://example.invalid/h", // hostname (not an IP) → allowed
+        ] {
+            assert!(
+                validate_webhook_url(ok, false).is_ok(),
+                "{ok:?} should be accepted"
+            );
+        }
+        // The dev opt-out re-allows loopback/private literals.
+        assert!(validate_webhook_url("http://127.0.0.1:9000/h", true).is_ok());
+        assert!(validate_webhook_url("http://10.0.0.1/h", true).is_ok());
     }
 
     #[test]

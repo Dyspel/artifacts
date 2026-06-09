@@ -59,6 +59,10 @@ pub async fn create_webhook(
         return Err(Error::RepoNotFound(id));
     }
     enforce_owner(&*state.data.ownership, &principal, &id).await?;
+    // SSRF guard: a tenant-supplied URL the server will POST to. Reject
+    // non-http(s) schemes and (unless explicitly allowed) private /
+    // loopback / link-local IP literals before persisting it.
+    crate::webhooks::validate_webhook_url(&body.url, state.cfg.webhook_allow_private_targets())?;
     let hook_id = state.observ.webhooks.add(crate::webhooks::Subscription {
         id: String::new(),
         repo_id: id_typed,
@@ -336,6 +340,38 @@ mod tests {
         let (status, body) = send(&app, req("GET", &base, Some(ADMIN), None)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_ssrf_target() {
+        // A loopback IP-literal target must be refused by default
+        // (build_app's Config leaves webhook_allow_private_targets =
+        // false). Admin auth, repo exists — the only thing that fails
+        // is the SSRF guard → 400.
+        let (_t, app) = build_app();
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                &format!("/v1/repos/{REPO}/webhooks"),
+                Some(ADMIN),
+                Some(r#"{"url":"http://169.254.169.254/latest/meta-data","events":["commit"]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "metadata SSRF must be 400");
+
+        let (status, _) = send(
+            &app,
+            req(
+                "POST",
+                &format!("/v1/repos/{REPO}/webhooks"),
+                Some(ADMIN),
+                Some(r#"{"url":"http://127.0.0.1:9000/hook","events":["commit"]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "loopback SSRF must be 400");
     }
 
     #[test]

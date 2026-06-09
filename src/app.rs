@@ -163,6 +163,15 @@ pub struct ServeArgs {
           action = clap::ArgAction::Set)]
     pub readiness_write_check: bool,
 
+    /// Allow webhook delivery to private / loopback / link-local IP
+    /// literals. Default false — the SSRF guard refuses them, since a
+    /// webhook URL is tenant-supplied and the server makes the request.
+    /// Enable for local/dev where webhooks legitimately target
+    /// 127.0.0.1. Hostnames are always allowed (DNS-rebinding is not
+    /// closed here; see `webhooks::validate_webhook_url`).
+    #[arg(long, env = "ARTIFACTS_WEBHOOK_ALLOW_PRIVATE_TARGETS")]
+    pub webhook_allow_private_targets: bool,
+
     /// PEM-encoded TLS certificate. Pair with `--tls-key`.
     #[arg(long, env = "ARTIFACTS_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -284,6 +293,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         max_commit_blob_bytes,
         max_repo_bytes,
         readiness_write_check,
+        webhook_allow_private_targets,
         tls_cert,
         tls_key,
         shutdown_timeout_secs,
@@ -364,18 +374,21 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     } else {
         tracing::info!("jwt auth disabled — only admin token accepted");
     }
-    let cfg = Arc::new(Config::new(
-        data_dir.clone(),
-        public_base_url,
-        admin_token,
-        jwt_secret,
-        jwt_expected_aud,
-        jwt_expected_iss,
-        max_repos_per_user,
-        max_commit_blob_bytes,
-        max_repo_bytes,
-        readiness_write_check,
-    ));
+    let cfg = Arc::new(
+        Config::new(
+            data_dir.clone(),
+            public_base_url,
+            admin_token,
+            jwt_secret,
+            jwt_expected_aud,
+            jwt_expected_iss,
+            max_repos_per_user,
+            max_commit_blob_bytes,
+            max_repo_bytes,
+            readiness_write_check,
+        )
+        .with_webhook_allow_private_targets(webhook_allow_private_targets),
+    );
     tracing::info!(
         max_repos_per_user,
         max_commit_blob_bytes,

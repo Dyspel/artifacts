@@ -70,6 +70,15 @@ pub struct Config {
     /// instead of at the next real mutation. Set via
     /// `ARTIFACTS_READINESS_WRITE_CHECK=0` to opt out.
     pub readiness_write_check: bool,
+
+    /// When `true`, the webhook SSRF guard allows delivery to private /
+    /// loopback / link-local IP literals. Default `false` (refuse them).
+    /// Set via `--webhook-allow-private-targets` /
+    /// `ARTIFACTS_WEBHOOK_ALLOW_PRIVATE_TARGETS` for local/dev
+    /// deployments that legitimately target `127.0.0.1`. Not a
+    /// constructor parameter (keeps `new`'s arity stable) — set via
+    /// [`Config::with_webhook_allow_private_targets`].
+    webhook_allow_private_targets: bool,
 }
 
 impl Config {
@@ -97,7 +106,23 @@ impl Config {
             max_commit_blob_bytes,
             max_repo_bytes,
             readiness_write_check,
+            webhook_allow_private_targets: false,
         }
+    }
+
+    /// Builder-style opt-in to delivering webhooks to private /
+    /// loopback / link-local IP literals (off by default — SSRF guard).
+    /// `app::serve` calls this from the `--webhook-allow-private-targets`
+    /// flag; other constructors keep the safe default.
+    #[must_use]
+    pub fn with_webhook_allow_private_targets(mut self, allow: bool) -> Self {
+        self.webhook_allow_private_targets = allow;
+        self
+    }
+
+    /// Whether the webhook SSRF guard permits private/loopback targets.
+    pub fn webhook_allow_private_targets(&self) -> bool {
+        self.webhook_allow_private_targets
     }
 
     /// Snapshot the expected JWT `aud` claim, if configured. Returns
