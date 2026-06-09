@@ -872,21 +872,48 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             shutdown_timeout_secs,
             "artifacts listening"
         );
+        // `axum::serve` has no built-in drain deadline, so we impose
+        // one — but the clock must start when the shutdown signal
+        // arrives, NOT at boot. `drain_began` is notified the instant
+        // `shutdown_signal` resolves; only then does the timeout race
+        // begin. (Wrapping the whole `serve` future in
+        // `timeout(shutdown_timeout, serve)` was a bug: since `serve`
+        // only resolves on a signal, the timer fired
+        // `shutdown_timeout_secs` after startup and the server exited
+        // on its own with no signal ever sent. The TLS branch above
+        // already gets this right via `handle.graceful_shutdown`.)
+        let drain_began = Arc::new(tokio::sync::Notify::new());
+        let drain_began_signal = drain_began.clone();
+        let draining_for_signal = draining.clone();
+        let drain_started_for_signal = drain_started.clone();
+        // `.into_future()` so the result is a plain `Future` we can
+        // `tokio::pin!` + `select!` on (the `WithGracefulShutdown`
+        // builder is only `IntoFuture`).
+        use std::future::IntoFuture as _;
         let serve = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal(
-            draining.clone(),
-            shutdown_drain_delay,
-            drain_started.clone(),
-        ));
+        .with_graceful_shutdown(async move {
+            shutdown_signal(
+                draining_for_signal,
+                shutdown_drain_delay,
+                drain_started_for_signal,
+            )
+            .await;
+            drain_began_signal.notify_one();
+        })
+        .into_future();
         if shutdown_timeout.is_zero() {
             serve.await?;
         } else {
-            match tokio::time::timeout(shutdown_timeout, serve).await {
-                Ok(r) => r?,
-                Err(_) => tracing::warn!(
+            tokio::pin!(serve);
+            tokio::select! {
+                r = &mut serve => r?,
+                () = async {
+                    drain_began.notified().await;
+                    tokio::time::sleep(shutdown_timeout).await;
+                } => tracing::warn!(
                     timeout_secs = shutdown_timeout_secs,
                     "graceful shutdown timed out — exiting with in-flight requests"
                 ),
