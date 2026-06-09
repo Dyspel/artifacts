@@ -197,12 +197,16 @@ pub async fn list_commits(
     let start = q.r#ref.as_deref().unwrap_or("HEAD");
     validate_ref_or_sha(start)?;
 
+    // `--end-of-options` (git ≥ 2.24) forces everything after it to be
+    // treated as a revision/path, never an option — so a `ref` that
+    // slipped past validation still can't inject a `git log` flag.
     let args = [
         "log",
-        start,
         &format!("--max-count={limit}"),
         &format!("--skip={skip}"),
         &format!("--format={LOG_FORMAT}"),
+        "--end-of-options",
+        start,
     ];
     let (rc, stdout, stderr) = run_git(&git_dir, &args, &[], None).await?;
     if rc != 0 {
@@ -369,8 +373,13 @@ pub async fn get_tree(
 
     // `ls-tree -r -l -z` recurses, emits sizes for blobs, and NUL-delims
     // the records so paths containing spaces or newlines parse correctly.
-    let (rc, stdout, stderr) =
-        run_git(&git_dir, &["ls-tree", "-r", "-l", "-z", start], &[], None).await?;
+    let (rc, stdout, stderr) = run_git(
+        &git_dir,
+        &["ls-tree", "-r", "-l", "-z", "--end-of-options", start],
+        &[],
+        None,
+    )
+    .await?;
     if rc != 0 {
         let err = String::from_utf8_lossy(&stderr);
         if err.contains("not a valid object name") || err.contains("Not a valid object name") {
@@ -942,6 +951,25 @@ mod tests {
             assert!(
                 validate_ref_or_sha(bad).is_err(),
                 "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ref_or_sha_rejects_leading_dash_arg_injection() {
+        // A leading '-' would let `?ref=` smuggle a git option into the
+        // positional revision slot (`git log --output=/path` →
+        // arbitrary file write). Reject every dash-leading form.
+        for bad in [
+            "-",
+            "--output=/tmp/pwned",
+            "--all",
+            "-foo",
+            "--end-of-options",
+        ] {
+            assert!(
+                validate_ref_or_sha(bad).is_err(),
+                "{bad:?} must be rejected (arg injection)"
             );
         }
     }

@@ -159,7 +159,12 @@ impl RefStore for FsRefStore {
         let git_dir = self.repo_path(repo_id);
         let (rc, stdout, _) = crate::git_cmd::run_git(
             &git_dir,
-            &["rev-parse", "--verify", ref_name.as_str()],
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                ref_name.as_str(),
+            ],
             &[],
             None,
         )
@@ -217,6 +222,7 @@ impl RefStore for FsRefStore {
             &git_dir,
             &[
                 "update-ref",
+                "--end-of-options",
                 ref_name.as_str(),
                 new_sha.as_str(),
                 expected_arg,
@@ -251,7 +257,13 @@ impl RefStore for FsRefStore {
         let (rc, _, stderr) = if let Some(exp) = expected {
             crate::git_cmd::run_git(
                 &git_dir,
-                &["update-ref", "-d", ref_name.as_str(), exp.as_str()],
+                &[
+                    "update-ref",
+                    "-d",
+                    "--end-of-options",
+                    ref_name.as_str(),
+                    exp.as_str(),
+                ],
                 &[],
                 None,
             )
@@ -259,7 +271,7 @@ impl RefStore for FsRefStore {
         } else {
             crate::git_cmd::run_git(
                 &git_dir,
-                &["update-ref", "-d", ref_name.as_str()],
+                &["update-ref", "-d", "--end-of-options", ref_name.as_str()],
                 &[],
                 None,
             )

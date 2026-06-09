@@ -262,7 +262,15 @@ fn valid_ref_name(s: &str) -> bool {
         return false;
     }
     for part in s.split('/') {
-        if part.is_empty() || part.starts_with('.') || part.ends_with(".lock") {
+        // A component beginning with '-' would be parsed by git as an
+        // option when the ref name is passed positionally (e.g.
+        // `git update-ref --no-deref ...`). git's own
+        // `check-ref-format` rejects such names; we do too.
+        if part.is_empty()
+            || part.starts_with('.')
+            || part.starts_with('-')
+            || part.ends_with(".lock")
+        {
             return false;
         }
     }
@@ -476,6 +484,12 @@ mod tests {
             "refs/heads/..foo",
             "refs/heads/foo\nbar",
             "refs/heads/foo.lock", // a component ending in .lock is reserved
+            // A component beginning with '-' is parsed by git as an
+            // option when the ref name is passed positionally — reject.
+            "-foo",
+            "--no-deref",
+            "refs/heads/-d",
+            "refs/-x/main",
         ] {
             assert!(
                 RefName::try_from(s).is_err(),

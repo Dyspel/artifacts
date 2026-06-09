@@ -18,6 +18,15 @@ pub(super) fn validate_ref_or_sha(s: &str) -> Result<()> {
     if s.is_empty() || s.len() > 512 {
         return Err(Error::BadRequest("ref/sha empty or too long".into()));
     }
+    // A leading '-' would be parsed by git as an option, not a
+    // revision — e.g. `ref=--output=/path` turns `git log <ref>` into
+    // `git log --output=/path`, an arbitrary-file-write primitive.
+    // No legitimate ref or SHA starts with '-' (git itself rejects
+    // such ref names), so reject it outright. The `--end-of-options`
+    // guard at each call site is the second layer.
+    if s.starts_with('-') {
+        return Err(Error::BadRequest("ref/sha may not start with '-'".into()));
+    }
     for ch in s.chars() {
         if ch.is_whitespace() || matches!(ch, '\0' | ':' | '?' | '*' | '[' | '~' | '^' | '\\') {
             return Err(Error::BadRequest(format!(
