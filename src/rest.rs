@@ -630,6 +630,26 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn sse_stream_rejects_non_admin() {
+        use axum::extract::State;
+        // A valid JWT *user* must NOT get the cross-tenant event bus —
+        // the stream is admin-only. (Regression: the handler used to
+        // authorize then ignore the principal.)
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let mut hdrs = axum::http::HeaderMap::new();
+        hdrs.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", user_jwt("alice")).parse().unwrap(),
+        );
+        let r = crate::events::sse_stream(State(state), hdrs).await;
+        assert!(
+            matches!(r, Err(crate::error::Error::Forbidden(_))),
+            "sse_stream must 403 a non-admin principal"
+        );
+    }
+
+    #[tokio::test]
     async fn sse_stream_emits_a_published_event() {
         use axum::extract::State;
         use axum::response::IntoResponse;

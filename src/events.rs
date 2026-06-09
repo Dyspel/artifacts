@@ -22,7 +22,7 @@
 //! endpoint handler and in the BFF layer above — centralizing the
 //! filter downstream means new filters don't require a schema change.
 
-use crate::{auth::authorize_rest, error::Result, rest::RestState};
+use crate::{error::Result, rest::RestState};
 use axum::{
     extract::State,
     http::HeaderMap,
@@ -183,21 +183,22 @@ fn now_ms() -> i64 {
 
 /// `GET /v1/events` — Server-Sent Events stream of every bus event.
 ///
-/// Admin-only: the BFF subscribes with the admin token, then filters
-/// per-user in Node. A future enhancement may add per-repo or
-/// per-namespace filters at this layer (e.g. `?repoId=abc`) to cut
-/// cross-tenant traffic; not needed today because there's one BFF per
-/// server and it does the filter anyway.
+/// Admin-only, and enforced as such. The bus carries *every* repo's
+/// events (commit messages, repo ids, fork topology), so a non-admin
+/// subscriber would see across tenant boundaries — exactly the leak
+/// `enforce_owner` prevents on every other read endpoint. The BFF
+/// subscribes with the admin token and filters per-user in Node. A
+/// future enhancement may add a per-repo filter here (e.g.
+/// `?repoId=abc`) so owner principals can tail their own repo; until
+/// that exists, the stream is admin-only.
 pub async fn sse_stream(
     State(state): State<RestState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<SseEvent, Infallible>>>> {
-    let _principal = authorize_rest(
-        &headers,
-        &state.cfg.admin_token(),
-        state.cfg.jwt_secret().as_deref(),
-        state.cfg.jwt_expected_aud(),
-        state.cfg.jwt_expected_iss(),
+    crate::rest::require_admin(&state, &headers)?;
+    state.authn.rate_limit.check(
+        &crate::auth::Principal::Admin,
+        crate::rate_limit::Class::Default,
     )?;
     let rx = state.observ.events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|r| match r {
