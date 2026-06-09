@@ -30,7 +30,21 @@ const GIT: &str = "git";
 /// helpers in this module are mostly async because the surrounding
 /// axum handlers are.
 fn async_cmd() -> TokioCommand {
-    TokioCommand::new(GIT)
+    let mut cmd = TokioCommand::new(GIT);
+    // Bind the subprocess lifetime to the request. When a handler
+    // future is dropped — client disconnect, or the per-request
+    // `TimeoutLayer` firing mid-clone — the `Child` is dropped without
+    // `wait()` completing. Without this, `git upload-pack`/`pack-objects`
+    // keeps running to completion server-side, computing and streaming
+    // a full pack into a buffer that's then discarded, so a cheap
+    // "request-then-disconnect" loop becomes a CPU/memory amplification
+    // vector. `kill_on_drop` sends SIGKILL on drop, tearing down the
+    // subprocess (and, by EOF, the detached stdin/stdout pump tasks the
+    // smart-HTTP path spawns). For commands we always `wait()` on
+    // (`run_git`), the child has already exited by drop time, so this
+    // is a no-op there.
+    cmd.kill_on_drop(true);
+    cmd
 }
 
 /// Returns a fresh `std::process::Command` set up to invoke `git`.
@@ -284,6 +298,40 @@ mod tests {
             .success();
         assert!(ok, "git init --bare");
         tmp
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_git_child_is_killed_when_dropped_without_waiting() {
+        use std::time::Duration;
+        let repo = bare_repo();
+        // `upload-pack --stateless-rpc` blocks reading the want-list
+        // from its piped stdin. We take + hold the stdin write half so
+        // the child can't exit via EOF — the ONLY way it terminates is
+        // the SIGKILL `kill_on_drop` sends when the `Child` is dropped.
+        // (Without the fix, the dropped child would keep running and
+        // this test would time out waiting for it to disappear.)
+        let mut child = pack_handler_serve(repo.path(), "upload-pack", None)
+            .spawn()
+            .expect("spawn git upload-pack");
+        let pid = child.id().expect("a running child has a pid") as libc::pid_t;
+        let _stdin = child.stdin.take().expect("stdin was piped");
+        // SAFETY: `kill(pid, 0)` performs no signal delivery; it only
+        // probes whether the pid is signalable (0 = alive/zombie).
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "child should be running");
+
+        drop(child); // kill_on_drop → SIGKILL + tokio orphan-reap.
+
+        let mut gone = false;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // SAFETY: same probe-only `kill(pid, 0)` as above.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true; // ESRCH — killed and reaped.
+                break;
+            }
+        }
+        assert!(gone, "child pid {pid} must be killed + reaped after drop");
     }
 
     #[tokio::test]
