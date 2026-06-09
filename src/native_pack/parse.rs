@@ -158,7 +158,15 @@ pub(crate) fn parse_pack(pack: &[u8]) -> Result<Vec<ParsedEntry>> {
     // Same bound: pack.len() >= 12 ⇒ pack[8..12] is a 4-byte slice.
     let n_objects = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
 
-    let mut entries = Vec::with_capacity(n_objects);
+    // `n_objects` is the attacker-controlled 32-bit count from the
+    // header — unvalidated against the actual body length. Reserving
+    // it directly lets a 12-byte pack claiming 0xFFFF_FFFF objects
+    // request a multi-hundred-GB allocation (abort/OOM) before a single
+    // entry is read. Clamp the *up-front* reservation to a sane cap and
+    // let the Vec grow as real entries materialize; the parse loop
+    // below fails fast on the first entry past the true byte bound, so
+    // a dishonest count can't over-allocate or over-read.
+    let mut entries = Vec::with_capacity(n_objects.min(INITIAL_ALLOC_CAP));
     let mut cursor = 12usize;
 
     for i in 0..n_objects {
@@ -1742,6 +1750,24 @@ mod tests {
         assert!(
             msg.contains("header parse") || msg.contains("empty header"),
             "expected header-parse error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_pack_does_not_overallocate_on_huge_object_count() {
+        // A 12-byte pack claiming 0xFFFF_FFFF objects must NOT try to
+        // reserve ~4.3e9 entries up front (abort/OOM). The reservation
+        // is clamped; the parse loop then fails fast on the first
+        // (absent) entry. Reaching this assertion at all proves we
+        // didn't attempt the giant allocation.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&u32::MAX.to_be_bytes()); // 4.29e9 declared
+        let err = parse_pack(&pack).unwrap_err();
+        assert!(
+            matches!(err, Error::PackParse(_)),
+            "expected a PackParse error, got: {err}"
         );
     }
 
