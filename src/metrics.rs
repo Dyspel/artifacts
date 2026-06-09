@@ -56,7 +56,7 @@
 //! - `artifacts_sqlite_lock_wait_seconds{store}` — histogram
 //!   recording how long each handler waits on `r2d2::Pool::get()`
 //!   before issuing its SQL. Each store carries its own r2d2 pool
-//!   (default 10 connections) and WAL-mode SQLite, so this is the
+//!   (default 8 connections) and WAL-mode SQLite, so this is the
 //!   pool-exhaustion signal: if p99 climbs the pool is sized too
 //!   small for offered concurrency, or a slow query is hogging a
 //!   connection. Pre-A5 every store was an `Arc<TokioMutex

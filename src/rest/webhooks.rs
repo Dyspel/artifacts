@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct CreateWebhookBody {
     pub url: String,
-    /// HMAC-SHA256 secret. Optional — subscribers behind a private
-    /// network might not bother. The server stores it verbatim
-    /// today (no DB to hash against); when subscriptions persist we
-    /// should hash on the way in.
+    /// HMAC-SHA256 signing secret. Optional — subscribers behind a
+    /// trusted network might not bother. Persisted sealed with
+    /// AES-256-GCM by `SqliteWebhookRegistry` (it must stay recoverable
+    /// to sign deliveries, so it's encrypted, not hashed); held in
+    /// memory by `MemRegistry`.
     pub secret: Option<String>,
     /// Empty list means "all event kinds for this repo". Otherwise
     /// only events whose `kind` matches one of these are delivered.

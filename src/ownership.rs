@@ -154,20 +154,33 @@ pub struct SqliteOwnershipStore {
     conn: DbPool,
 }
 
-const MIGRATIONS: [crate::db_migrate::Migration; 1] = [crate::db_migrate::Migration {
-    version: 1,
-    name: "init",
-    up: |c| {
-        c.execute_batch(
-            "CREATE TABLE IF NOT EXISTS repos (
+const MIGRATIONS: [crate::db_migrate::Migration; 2] = [
+    crate::db_migrate::Migration {
+        version: 1,
+        name: "init",
+        up: |c| {
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS repos (
                      id             TEXT PRIMARY KEY,
                      owner_subject  TEXT,
                      created_at     INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_subject);",
-        )
+            )
+        },
     },
-}];
+    crate::db_migrate::Migration {
+        version: 2,
+        name: "index_repos_created_at",
+        // `list_paginated` / `list_all` order by `created_at DESC`
+        // (the admin repo list, polled by the GUI). Without an index
+        // every page sorts the whole table; index it so the order +
+        // LIMIT is index-served.
+        up: |c| {
+            c.execute_batch("CREATE INDEX IF NOT EXISTS idx_repos_created_at ON repos(created_at);")
+        },
+    },
+];
 
 crate::db_migrate::sqlite_store_boilerplate!(SqliteOwnershipStore, "ownership", MIGRATIONS);
 

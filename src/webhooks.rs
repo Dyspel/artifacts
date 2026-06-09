@@ -33,8 +33,9 @@
 //!   "show me failed deliveries" reads the `webhook_deliveries`
 //!   table directly (until a `/v1/admin/webhooks/deliveries`
 //!   endpoint lands).
-//! - Pruned. Finalized rows accumulate forever today; a retention
-//!   sweep (mirroring `audit::spawn_prune_task`) is a follow-up.
+//! - Pruned. `spawn_prune_task` (mirroring `audit::spawn_prune_task`)
+//!   runs an hourly retention sweep over finalized rows; the cutoff is
+//!   `--webhook-delivery-retention-days`.
 //!
 //! ## Threading
 //!
@@ -60,9 +61,12 @@ pub struct Subscription {
     /// keeps the trait small.
     pub repo_id: crate::ids::RepoId,
     pub url: String,
-    /// HMAC-SHA256 secret. Stored in plaintext today (no DB to hash
-    /// against); when the SQLite-backed registry lands it should be
-    /// stored hashed the same way TokenStore does.
+    /// HMAC-SHA256 signing secret. Unlike a token (which `TokenStore`
+    /// hashes, since it only ever compares), this must be recoverable
+    /// in plaintext to sign each delivery — so it's *sealed*, not
+    /// hashed: `SqliteWebhookRegistry` encrypts it at rest with
+    /// AES-256-GCM (see `secrets`); `MemRegistry` holds it in memory.
+    /// Never serialized out (`skip_serializing`).
     #[serde(skip_serializing)]
     pub secret: Option<String>,
     /// Subset of event kinds to fire on. Empty = all kinds. Typed as
@@ -304,7 +308,7 @@ pub struct SqliteWebhookRegistry {
     master_key: std::sync::RwLock<Arc<crate::secrets::MasterKey>>,
 }
 
-const MIGRATIONS: [crate::db_migrate::Migration; 3] = [
+const MIGRATIONS: [crate::db_migrate::Migration; 4] = [
     crate::db_migrate::Migration {
         version: 1,
         name: "init",
@@ -390,6 +394,22 @@ const MIGRATIONS: [crate::db_migrate::Migration; 3] = [
                  CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
                      ON webhook_deliveries(next_attempt_at)
                      WHERE finalized_at IS NULL;",
+            )
+        },
+    },
+    crate::db_migrate::Migration {
+        version: 4,
+        name: "index_finalized_deliveries",
+        // The hourly retention sweep deletes `WHERE finalized_at IS NOT
+        // NULL AND finalized_at < ?`. The pending index above is
+        // partial on `finalized_at IS NULL`, so the prune can't use it
+        // and scans the whole table. A complementary partial index on
+        // the finalized side keeps the prune O(rows-to-delete).
+        up: |c| {
+            c.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_finalized
+                     ON webhook_deliveries(finalized_at)
+                     WHERE finalized_at IS NOT NULL;",
             )
         },
     },

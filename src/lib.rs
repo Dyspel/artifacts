@@ -44,24 +44,23 @@
 //!    seven `Arc<dyn ...>` fields (storage / ownership / refs /
 //!    objects / tokens / audit / webhooks); cloning per request is
 //!    seven atomic-RMW operations, roughly 70ns. F4's measurement
-//:    pinned the bench p99 noise floor at ±40ms — three orders of
+//!    pinned the bench p99 noise floor at ±40ms — three orders of
 //!    magnitude larger. Keeping `Arc<dyn>` for the trait-object
 //!    dispatch flexibility; static dispatch via generics would
 //!    propagate concrete types through every signature in the REST
 //!    handler tree.
 //!
-//! One open concern documented (not fixed): `r2d2::Pool::get()` is
-//! synchronous and can block a tokio worker thread when the pool is
-//! exhausted. With the default pool sizing (10 connections) and
-//! typical control-plane load it's a non-issue; under a future
-//! receive-pack burst that funnels through the audit store, this
-//! could starve worker threads. The fix is either (a) sizing the
-//! pool against expected request concurrency or (b) wrapping every
-//! SQL call in `spawn_blocking`. (b) has its own cost (task spawn
-//! overhead vs. the ~microseconds a typical query takes), so the
-//! call is "leave the design as-is and revisit with a real
-//! measurement if pool-exhausted spikes show up in the
-//! `artifacts_sqlite_lock_wait_seconds` histogram".
+//! Partially-addressed concern: `r2d2::Pool::get()` is synchronous and
+//! can block a tokio worker thread when the pool (8 connections) is
+//! exhausted. The checkout is now bounded at 5s (down from r2d2's 30s
+//! default), so a burst fails fast rather than parking a worker for
+//! half a minute, and the heaviest blocking work (GC, repo delete, the
+//! per-repo byte-quota dir walk) runs on `spawn_blocking`. The
+//! remaining store calls (per-request token lookup, audit record,
+//! webhook enqueue) still run their rusqlite work inline on the worker;
+//! routing the whole store layer through `spawn_blocking` is the
+//! single-node-prototype debt to revisit if pool-exhausted spikes show
+//! up in the `artifacts_sqlite_lock_wait_seconds` histogram.
 
 // Lint policy (unused/unsafe discipline + curated `clippy::pedantic`)
 // lives in the `[lints]` table in Cargo.toml, so it applies uniformly

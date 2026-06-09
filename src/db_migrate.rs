@@ -132,10 +132,11 @@ pub fn open_with_migrations(
     Ok(conn)
 }
 
-/// Default max pool size. SQLite under WAL allows N readers + 1
-/// writer concurrently; 8 is generous for a single-node prototype
-/// and well below the per-process FD budget. Tune via the (unwritten)
-/// `ARTIFACTS_SQLITE_POOL_SIZE` env var if a benchmark needs it.
+/// Max pool size per store. SQLite under WAL allows N readers + 1
+/// writer concurrently; 8 is generous for a single-node prototype and
+/// well below the per-process FD budget. A compile-time constant —
+/// there is no runtime override knob today (change here + rebuild if a
+/// benchmark needs it).
 const DEFAULT_POOL_SIZE: u32 = 8;
 
 /// Open an `r2d2` connection pool backed by SQLite at `path`, with
